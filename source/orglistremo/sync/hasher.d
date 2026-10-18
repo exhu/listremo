@@ -58,7 +58,7 @@ void hashDirectory(
 }
 
 unittest {
-  import std.file : tempDir, write;
+  import std.file : exists, remove, tempDir, write;
   import std.path : buildPath;
 
   // Test empty file
@@ -67,6 +67,11 @@ unittest {
 
   // Test non-empty file
   const tmpFile = buildPath(tempDir(), "listremo_hasher_test.txt");
+  scope (exit) {
+    if (exists(tmpFile)) {
+      remove(tmpFile);
+    }
+  }
   write(tmpFile, "hello listremo\n");
   const computedHash = hashFile(tmpFile, 15);
   // SHA-256 of "hello listremo\n" is known

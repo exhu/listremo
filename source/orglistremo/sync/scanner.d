@@ -6,7 +6,8 @@ import orglistremo.model : Entry, Root;
 import orglistremo.sync.hasher : ChildRecord, hashDirectory, hashFile;
 import std.datetime.systime : Clock;
 import std.file :
-  dirEntries, exists, isDir, isFile, isSymlink, SpanMode, timeLastModified;
+  dirEntries, DirEntry, exists, isDir, isFile, isSymlink, SpanMode,
+  timeLastModified;
 import std.path : baseName, buildPath;
 
 struct SyncResult {
@@ -29,12 +30,30 @@ SyncResult syncRoot(
   }
 
   auto entryRepo = EntryRepository(db);
-  auto cachedMap = entryRepo.getFileEntriesMap(root.id);
+  const cachedMap = entryRepo.getFileEntriesMap(root.id);
 
+  ScannerContext ctx = ScannerContext(
+    root.id, root.name, forceHash, cachedMap
+  );
+  ctx.scanDir(root.path, ".");
+
+  const syncTimestamp = Clock.currTime.toUnixTime();
+  entryRepo.saveSyncEntries(root.id, ctx.allEntries, syncTimestamp);
+
+  return ctx.stats;
+}
+
+private:
+
+struct ScannerContext {
+  long rootId;
+  string rootName;
+  bool forceHash;
+  const(CachedFileEntry[string]) cachedMap;
   Entry[] allEntries;
   SyncResult stats;
 
-  ChildRecord scanDirRecursive(string diskPath, string relPath) {
+  ChildRecord scanDir(string diskPath, string relPath) {
     ChildRecord[] children;
 
     foreach (entry; dirEntries(diskPath, SpanMode.shallow)) {
@@ -46,48 +65,63 @@ SyncResult syncRoot(
       const childRelPath = (relPath == ".")
         ? childName
         : relPath ~ "/" ~ childName;
-      const childParentPath = relPath;
 
       if (entry.isFile) {
-        const size = entry.size;
-        const mtime = entry.timeLastModified.toUnixTime();
-        string fileHash;
-
-        if (!forceHash && (childRelPath in cachedMap)) {
-          const cached = cachedMap[childRelPath];
-          if (cached.size == size && cached.mtime == mtime) {
-            fileHash = cached.sha256;
-            stats.reusedHashes++;
-          } else {
-            fileHash = hashFile(entry.name, size);
-          }
-        } else {
-          fileHash = hashFile(entry.name, size);
-        }
-
-        Entry fileEntry;
-        fileEntry.rootId = root.id;
-        fileEntry.rootName = root.name;
-        fileEntry.relPath = childRelPath;
-        fileEntry.parentPath = childParentPath;
-        fileEntry.name = childName;
-        fileEntry.isDir = false;
-        fileEntry.size = size;
-        fileEntry.mtime = mtime;
-        fileEntry.sha256 = fileHash;
-
-        allEntries ~= fileEntry;
-        stats.fileCount++;
-
-        children ~= ChildRecord(childName, false, fileHash, size);
+        children ~= scanFile(entry, relPath, childName);
       } else if (entry.isDir) {
-        // Post-order bottom-up traversal
-        ChildRecord dirChild = scanDirRecursive(entry.name, childRelPath);
-        children ~= dirChild;
+        children ~= scanDir(entry.name, childRelPath);
       }
     }
 
-    // Bottom-up Merkle directory hash & recursive size
+    return buildDirEntry(diskPath, relPath, children);
+  }
+
+  ChildRecord scanFile(
+    DirEntry entry,
+    string relPath,
+    string childName
+  ) {
+    const childRelPath = (relPath == ".")
+      ? childName
+      : relPath ~ "/" ~ childName;
+    const size = entry.size;
+    const mtime = entry.timeLastModified.toUnixTime();
+    string fileHash;
+
+    if (!forceHash && (childRelPath in cachedMap)) {
+      const cached = cachedMap[childRelPath];
+      if (cached.size == size && cached.mtime == mtime) {
+        fileHash = cached.sha256;
+        stats.reusedHashes++;
+      } else {
+        fileHash = hashFile(entry.name, size);
+      }
+    } else {
+      fileHash = hashFile(entry.name, size);
+    }
+
+    Entry fileEntry;
+    fileEntry.rootId = rootId;
+    fileEntry.rootName = rootName;
+    fileEntry.relPath = childRelPath;
+    fileEntry.parentPath = relPath;
+    fileEntry.name = childName;
+    fileEntry.isDir = false;
+    fileEntry.size = size;
+    fileEntry.mtime = mtime;
+    fileEntry.sha256 = fileHash;
+
+    allEntries ~= fileEntry;
+    stats.fileCount++;
+
+    return ChildRecord(childName, false, fileHash, size);
+  }
+
+  ChildRecord buildDirEntry(
+    string diskPath,
+    string relPath,
+    ChildRecord[] children
+  ) {
     string dirHash;
     ulong dirSize;
     hashDirectory(children, dirHash, dirSize);
@@ -95,10 +129,9 @@ SyncResult syncRoot(
     const dirMtime = timeLastModified(diskPath).toUnixTime();
 
     Entry dirEntry;
-    dirEntry.rootId = root.id;
-    dirEntry.rootName = root.name;
+    dirEntry.rootId = rootId;
+    dirEntry.rootName = rootName;
     dirEntry.relPath = relPath;
-    dirEntry.parentPath = (relPath == ".") ? null : relPath;
     dirEntry.name = (relPath == ".") ? "." : baseName(diskPath);
     dirEntry.isDir = true;
     dirEntry.size = dirSize;
@@ -106,7 +139,6 @@ SyncResult syncRoot(
     dirEntry.sha256 = dirHash;
 
     if (relPath != ".") {
-      // Find parent path
       const lastSlash = findLastSlash(relPath);
       dirEntry.parentPath = (lastSlash == -1) ? "." : relPath[0 .. lastSlash];
       stats.dirCount++;
@@ -118,16 +150,7 @@ SyncResult syncRoot(
     allEntries ~= dirEntry;
     return ChildRecord(dirEntry.name, true, dirHash, dirSize);
   }
-
-  scanDirRecursive(root.path, ".");
-
-  const syncTimestamp = Clock.currTime.toUnixTime();
-  entryRepo.saveSyncEntries(root.id, allEntries, syncTimestamp);
-
-  return stats;
 }
-
-private:
 
 ptrdiff_t findLastSlash(string s) {
   for (ptrdiff_t i = cast(ptrdiff_t) s.length - 1; i >= 0; i--) {
@@ -182,7 +205,7 @@ unittest {
   assert(res1.reusedHashes == 0);
 
   // Verify empty.txt has hash "0"
-  auto entries = entryRepo.listEntries(rootId);
+  const entries = entryRepo.listEntries(rootId);
   bool foundEmptyFile = false;
   bool foundEmptyDir = false;
   foreach (ref e; entries) {
@@ -213,7 +236,7 @@ unittest {
 
   SyncResult res3 = syncRoot(db, root, false);
   assert(res3.fileCount == 2);
-  auto entriesAfterDel = entryRepo.listEntries(rootId);
+  const entriesAfterDel = entryRepo.listEntries(rootId);
   foreach (ref e; entriesAfterDel) {
     assert(e.relPath != "empty.txt");
   }

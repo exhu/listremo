@@ -2,59 +2,52 @@ module orglistremo.output.formatter;
 
 import orglistremo.model : DuplicateGroup, Entry, OutputFormat, RootSummary;
 import orglistremo.output.console :
-  printConsoleDuplicates, printConsoleEntries, printConsoleRoots,
-  printConsoleUnique, Styler;
+  OutputOptions, printConsoleDuplicates, printConsoleEntries,
+  printConsoleRoots, printConsoleUnique;
 import orglistremo.output.csv :
   printCsvDuplicates, printCsvEntries, printCsvRoots, printCsvUnique;
 import std.stdio : stdout;
 
 void outputRoots(
-  RootSummary[] roots,
-  OutputFormat format,
-  Styler styler
+  in RootSummary[] roots,
+  in OutputOptions options
 ) {
-  if (format == OutputFormat.csv) {
+  if (options.format == OutputFormat.csv) {
     printCsvRoots(roots, stdout);
   } else {
-    printConsoleRoots(roots, styler, stdout);
+    printConsoleRoots(roots, options, stdout);
   }
 }
 
 void outputEntries(
-  Entry[] entries,
-  OutputFormat format,
-  Styler styler,
-  bool fullHash = false
+  in Entry[] entries,
+  in OutputOptions options
 ) {
-  if (format == OutputFormat.csv) {
+  if (options.format == OutputFormat.csv) {
     printCsvEntries(entries, stdout);
   } else {
-    printConsoleEntries(entries, styler, fullHash, stdout);
+    printConsoleEntries(entries, options, stdout);
   }
 }
 
 void outputDuplicates(
-  DuplicateGroup[] groups,
-  OutputFormat format,
-  Styler styler,
-  bool fullHash = false
+  in DuplicateGroup[] groups,
+  in OutputOptions options
 ) {
-  if (format == OutputFormat.csv) {
+  if (options.format == OutputFormat.csv) {
     printCsvDuplicates(groups, stdout);
   } else {
-    printConsoleDuplicates(groups, styler, fullHash, stdout);
+    printConsoleDuplicates(groups, options, stdout);
   }
 }
 
 void outputUnique(
-  Entry[] entries,
-  OutputFormat format,
-  Styler styler,
-  bool fullHash = false
+  in Entry[] entries,
+  in OutputOptions options
 ) {
-  if (format == OutputFormat.csv) {
+  if (options.format == OutputFormat.csv) {
     printCsvUnique(entries, stdout);
   } else {
-    printConsoleUnique(entries, styler, fullHash, stdout);
+    printConsoleUnique(entries, options, stdout);
   }
 }

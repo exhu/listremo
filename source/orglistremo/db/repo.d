@@ -11,6 +11,20 @@ struct CachedFileEntry {
   string sha256;
 }
 
+struct ListEntriesFilter {
+  string subpath;
+  EntryType typeFilter = EntryType.all;
+  SortField sort = SortField.path;
+}
+
+struct HashQueryFilter {
+  bool hasRoot;
+  long rootId;
+  string subpath;
+  EntryType typeFilter = EntryType.file;
+  bool skipEmpty;
+}
+
 struct RootRepository {
   this(Database db) {
     this.db = db;
@@ -158,13 +172,118 @@ struct EntryRepository {
     return cache;
   }
 
-  void saveSyncEntries(long rootId, Entry[] newEntries, long syncTimestamp) {
+  void saveSyncEntries(
+    long rootId,
+    in Entry[] newEntries,
+    long syncTimestamp
+  ) {
     db.execute("BEGIN IMMEDIATE;");
     scope (failure) {
       db.execute("ROLLBACK;");
     }
 
-    // Collect all existing relative paths to identify deletions
+    deleteStaleEntries(rootId, newEntries);
+    upsertEntries(rootId, newEntries);
+
+    auto syncStmt = db.prepare(`
+      UPDATE roots SET last_sync = ? WHERE id = ?;
+    `);
+    syncStmt.bind(1, syncTimestamp);
+    syncStmt.bind(2, rootId);
+    syncStmt.execute();
+
+    db.execute("COMMIT;");
+  }
+
+  Entry[] listEntries(
+    long rootId,
+    in ListEntriesFilter filter = ListEntriesFilter.init
+  ) {
+    string sql = `
+      SELECT
+        e.id, e.root_id, r.name, e.rel_path, e.parent_path,
+        e.name, e.is_dir, e.size, e.mtime, e.sha256
+      FROM entries e
+      JOIN roots r ON r.id = e.root_id
+      WHERE e.root_id = ?
+    `;
+
+    if (filter.typeFilter == EntryType.file) {
+      sql ~= " AND e.is_dir = 0";
+    } else if (filter.typeFilter == EntryType.dir) {
+      sql ~= " AND e.is_dir = 1";
+    }
+
+    const hasSubpath = filter.subpath.length > 0;
+    if (hasSubpath) {
+      sql ~= " AND (e.rel_path = ? OR e.rel_path LIKE ? ESCAPE '\\')";
+    }
+
+    switch (filter.sort) {
+      case SortField.size:
+        sql ~= " ORDER BY e.size DESC, e.rel_path ASC";
+        break;
+      case SortField.mtime:
+        sql ~= " ORDER BY e.mtime DESC, e.rel_path ASC";
+        break;
+      case SortField.path:
+      default:
+        sql ~= " ORDER BY e.rel_path ASC";
+        break;
+    }
+
+    auto stmt = db.prepare(sql);
+    int paramIdx = 1;
+    stmt.bind(paramIdx++, rootId);
+    if (hasSubpath) {
+      stmt.bind(paramIdx++, filter.subpath);
+      stmt.bind(paramIdx++, escapeLike(filter.subpath) ~ "/%");
+    }
+
+    return readEntries(stmt);
+  }
+
+  Entry[] listDuplicates(in HashQueryFilter filter = HashQueryFilter.init) {
+    return queryGroupedEntries(filter, "COUNT(*) > 1");
+  }
+
+  Entry[] listUnique(in HashQueryFilter filter = HashQueryFilter.init) {
+    return queryGroupedEntries(filter, "COUNT(*) = 1");
+  }
+
+  DuplicateGroup[] groupDuplicates(in Entry[] entries) {
+    DuplicateGroup[] groups;
+    if (entries.length == 0) {
+      return groups;
+    }
+
+    DuplicateGroup currentGroup;
+    currentGroup.sha256 = entries[0].sha256;
+    currentGroup.size = entries[0].size;
+    currentGroup.isDir = entries[0].isDir;
+    currentGroup.entries ~= entries[0];
+
+    foreach (i; 1 .. entries.length) {
+      if (entries[i].sha256 == currentGroup.sha256 &&
+          entries[i].isDir == currentGroup.isDir) {
+        currentGroup.entries ~= entries[i];
+      } else {
+        groups ~= currentGroup;
+        currentGroup = DuplicateGroup();
+        currentGroup.sha256 = entries[i].sha256;
+        currentGroup.size = entries[i].size;
+        currentGroup.isDir = entries[i].isDir;
+        currentGroup.entries ~= entries[i];
+      }
+    }
+    groups ~= currentGroup;
+    return groups;
+  }
+
+private:
+  Database db;
+
+  void deleteStaleEntries(long rootId, in Entry[] newEntries) {
     bool[string] newPaths;
     foreach (ref e; newEntries) {
       newPaths[e.relPath] = true;
@@ -182,7 +301,6 @@ struct EntryRepository {
       }
     }
 
-    // Delete stale entries
     if (stalePaths.length > 0) {
       auto delStmt = db.prepare(`
         DELETE FROM entries WHERE root_id = ? AND rel_path = ?;
@@ -194,8 +312,9 @@ struct EntryRepository {
         delStmt.execute();
       }
     }
+  }
 
-    // Upsert new entries
+  void upsertEntries(long rootId, in Entry[] newEntries) {
     auto upsertStmt = db.prepare(`
       INSERT INTO entries (
         root_id, rel_path, parent_path, name, is_dir, size, mtime, sha256
@@ -225,229 +344,74 @@ struct EntryRepository {
       upsertStmt.bind(8, e.sha256);
       upsertStmt.execute();
     }
-
-    // Update root's last_sync timestamp
-    auto syncStmt = db.prepare(`
-      UPDATE roots SET last_sync = ? WHERE id = ?;
-    `);
-    syncStmt.bind(1, syncTimestamp);
-    syncStmt.bind(2, rootId);
-    syncStmt.execute();
-
-    db.execute("COMMIT;");
   }
 
-  Entry[] listEntries(
-    long rootId,
-    string subpath = null,
-    EntryType typeFilter = EntryType.all,
-    SortField sort = SortField.path
+  Entry[] queryGroupedEntries(
+    in HashQueryFilter filter,
+    string havingClause
   ) {
-    import std.format : format;
+    const outerFilters = buildFilterSql(filter, "e.");
+    const innerFilters = buildFilterSql(filter, "");
 
-    string sql = `
-      SELECT
-        e.id, e.root_id, r.name, e.rel_path, e.parent_path,
-        e.name, e.is_dir, e.size, e.mtime, e.sha256
-      FROM entries e
-      JOIN roots r ON r.id = e.root_id
-      WHERE e.root_id = ?
-    `;
-
-    if (typeFilter == EntryType.file) {
-      sql ~= " AND e.is_dir = 0";
-    } else if (typeFilter == EntryType.dir) {
-      sql ~= " AND e.is_dir = 1";
-    }
-
-    const hasSubpath = subpath.length > 0;
-    if (hasSubpath) {
-      sql ~= " AND (e.rel_path = ? OR e.rel_path LIKE ? ESCAPE '\\')";
-    }
-
-    switch (sort) {
-      case SortField.size:
-        sql ~= " ORDER BY e.size DESC, e.rel_path ASC";
-        break;
-      case SortField.mtime:
-        sql ~= " ORDER BY e.mtime DESC, e.rel_path ASC";
-        break;
-      case SortField.path:
-      default:
-        sql ~= " ORDER BY e.rel_path ASC";
-        break;
-    }
+    const sql = "SELECT " ~
+      "e.id, e.root_id, r.name, e.rel_path, e.parent_path, " ~
+      "e.name, e.is_dir, e.size, e.mtime, e.sha256 " ~
+      "FROM entries e " ~
+      "JOIN roots r ON r.id = e.root_id " ~
+      "WHERE " ~ outerFilters ~
+      " AND (e.is_dir, e.sha256) IN (" ~
+        "SELECT is_dir, sha256 FROM entries " ~
+        "WHERE " ~ innerFilters ~ " " ~
+        "GROUP BY is_dir, sha256 " ~
+        "HAVING " ~ havingClause ~
+      ") " ~
+      "ORDER BY e.size DESC, e.is_dir, e.sha256, r.name, e.rel_path ASC";
 
     auto stmt = db.prepare(sql);
-    int paramIdx = 1;
-    stmt.bind(paramIdx++, rootId);
-    if (hasSubpath) {
-      stmt.bind(paramIdx++, subpath);
-      stmt.bind(paramIdx++, escapeLike(subpath) ~ "/%");
-    }
-
+    bindDuplicateOrUniqueParams(stmt, filter);
     return readEntries(stmt);
   }
 
-  Entry[] listDuplicates(
-    bool hasRoot,
-    long rootId,
-    string subpath = null,
-    EntryType typeFilter = EntryType.file,
-    bool skipEmpty = false
-  ) {
-    string sql = `
-      SELECT
-        e.id, e.root_id, r.name, e.rel_path, e.parent_path,
-        e.name, e.is_dir, e.size, e.mtime, e.sha256
-      FROM entries e
-      JOIN roots r ON r.id = e.root_id
-      WHERE 1=1
-    `;
-
-    string innerSql = `
-      SELECT sha256 FROM entries WHERE 1=1
-    `;
-
-    string filters = "";
-    if (typeFilter == EntryType.file) {
-      filters ~= " AND is_dir = 0";
-    } else if (typeFilter == EntryType.dir) {
-      filters ~= " AND is_dir = 1";
+  static string buildFilterSql(in HashQueryFilter filter, string prefix) {
+    string s = prefix ~ "rel_path != '.'";
+    if (filter.typeFilter == EntryType.file) {
+      s ~= " AND " ~ prefix ~ "is_dir = 0";
+    } else if (filter.typeFilter == EntryType.dir) {
+      s ~= " AND " ~ prefix ~ "is_dir = 1";
     }
 
-    if (skipEmpty) {
-      filters ~= " AND size > 0 AND sha256 != '0'";
+    if (filter.skipEmpty) {
+      s ~= " AND " ~ prefix ~ "size > 0 AND " ~ prefix ~ "sha256 != '0'";
     }
 
-    if (hasRoot) {
-      filters ~= " AND root_id = ?";
-      if (subpath.length > 0) {
-        filters ~= " AND (rel_path = ? OR rel_path LIKE ? ESCAPE '\\')";
+    if (filter.hasRoot) {
+      s ~= " AND " ~ prefix ~ "root_id = ?";
+      if (filter.subpath.length > 0) {
+        s ~= " AND (" ~ prefix ~ "rel_path = ? OR " ~
+          prefix ~ "rel_path LIKE ? ESCAPE '\\')";
       }
     }
-
-    sql ~= replacePrefix(filters, "e.");
-    innerSql ~= filters ~ " GROUP BY sha256 HAVING COUNT(*) > 1";
-    sql ~= " AND e.sha256 IN (" ~ innerSql ~ ") ";
-    sql ~= " ORDER BY e.size DESC, e.sha256, r.name, e.rel_path ASC";
-
-    auto stmt = db.prepare(sql);
-    bindDuplicateOrUniqueParams(stmt, hasRoot, rootId, subpath);
-    return readEntries(stmt);
+    return s;
   }
-
-  Entry[] listUnique(
-    bool hasRoot,
-    long rootId,
-    string subpath = null,
-    EntryType typeFilter = EntryType.file,
-    bool skipEmpty = false
-  ) {
-    string sql = `
-      SELECT
-        e.id, e.root_id, r.name, e.rel_path, e.parent_path,
-        e.name, e.is_dir, e.size, e.mtime, e.sha256
-      FROM entries e
-      JOIN roots r ON r.id = e.root_id
-      WHERE 1=1
-    `;
-
-    string innerSql = `
-      SELECT sha256 FROM entries WHERE 1=1
-    `;
-
-    string filters = "";
-    if (typeFilter == EntryType.file) {
-      filters ~= " AND is_dir = 0";
-    } else if (typeFilter == EntryType.dir) {
-      filters ~= " AND is_dir = 1";
-    }
-
-    if (skipEmpty) {
-      filters ~= " AND size > 0 AND sha256 != '0'";
-    }
-
-    if (hasRoot) {
-      filters ~= " AND root_id = ?";
-      if (subpath.length > 0) {
-        filters ~= " AND (rel_path = ? OR rel_path LIKE ? ESCAPE '\\')";
-      }
-    }
-
-    sql ~= replacePrefix(filters, "e.");
-    innerSql ~= filters ~ " GROUP BY sha256 HAVING COUNT(*) = 1";
-    sql ~= " AND e.sha256 IN (" ~ innerSql ~ ") ";
-    sql ~= " ORDER BY e.size DESC, e.sha256, r.name, e.rel_path ASC";
-
-    auto stmt = db.prepare(sql);
-    bindDuplicateOrUniqueParams(stmt, hasRoot, rootId, subpath);
-    return readEntries(stmt);
-  }
-
-  DuplicateGroup[] groupDuplicates(Entry[] entries) {
-    DuplicateGroup[] groups;
-    if (entries.length == 0) {
-      return groups;
-    }
-
-    DuplicateGroup currentGroup;
-    currentGroup.sha256 = entries[0].sha256;
-    currentGroup.size = entries[0].size;
-    currentGroup.isDir = entries[0].isDir;
-    currentGroup.entries ~= entries[0];
-
-    foreach (i; 1 .. entries.length) {
-      if (entries[i].sha256 == currentGroup.sha256) {
-        currentGroup.entries ~= entries[i];
-      } else {
-        groups ~= currentGroup;
-        currentGroup = DuplicateGroup();
-        currentGroup.sha256 = entries[i].sha256;
-        currentGroup.size = entries[i].size;
-        currentGroup.isDir = entries[i].isDir;
-        currentGroup.entries ~= entries[i];
-      }
-    }
-    groups ~= currentGroup;
-    return groups;
-  }
-
-private:
-  Database db;
 
   static void bindDuplicateOrUniqueParams(
     ref Statement stmt,
-    bool hasRoot,
-    long rootId,
-    string subpath
+    in HashQueryFilter filter
   ) {
-    if (!hasRoot) {
+    if (!filter.hasRoot) {
       return;
     }
     int idx = 1;
-    // Outer query parameters
-    stmt.bind(idx++, rootId);
-    if (subpath.length > 0) {
-      stmt.bind(idx++, subpath);
-      stmt.bind(idx++, escapeLike(subpath) ~ "/%");
+    stmt.bind(idx++, filter.rootId);
+    if (filter.subpath.length > 0) {
+      stmt.bind(idx++, filter.subpath);
+      stmt.bind(idx++, escapeLike(filter.subpath) ~ "/%");
     }
-    // Subquery parameters
-    stmt.bind(idx++, rootId);
-    if (subpath.length > 0) {
-      stmt.bind(idx++, subpath);
-      stmt.bind(idx++, escapeLike(subpath) ~ "/%");
+    stmt.bind(idx++, filter.rootId);
+    if (filter.subpath.length > 0) {
+      stmt.bind(idx++, filter.subpath);
+      stmt.bind(idx++, escapeLike(filter.subpath) ~ "/%");
     }
-  }
-
-  static string replacePrefix(string sql, string prefix) {
-    import std.array : replace;
-    return sql
-      .replace("is_dir", prefix ~ "is_dir")
-      .replace("size", prefix ~ "size")
-      .replace("sha256", prefix ~ "sha256")
-      .replace("root_id", prefix ~ "root_id")
-      .replace("rel_path", prefix ~ "rel_path");
   }
 
   static string escapeLike(string s) {
@@ -487,9 +451,9 @@ private:
 unittest {
   import orglistremo.db.connection : openDatabase;
 
-  auto db = openDatabase(":memory:");
-  auto rootRepo = RootRepository(db);
-  auto entryRepo = EntryRepository(db);
+  Database db = openDatabase(":memory:");
+  RootRepository rootRepo = RootRepository(db);
+  EntryRepository entryRepo = EntryRepository(db);
 
   const r1 = rootRepo.addRoot("r1", "/mnt/r1");
   const r2 = rootRepo.addRoot("r2", "/mnt/r2");
@@ -509,30 +473,36 @@ unittest {
   entryRepo.saveSyncEntries(r2, entries2, 2000);
 
   // Test caching map
-  auto cache = entryRepo.getFileEntriesMap(r1);
+  const cache = entryRepo.getFileEntriesMap(r1);
   assert("f1.txt" in cache);
   assert(cache["f1.txt"].size == 60);
   assert(cache["f1.txt"].sha256 == "hash1");
 
   // Test listEntries
-  auto list = entryRepo.listEntries(r1, null, EntryType.all);
+  const list = entryRepo.listEntries(
+    r1, ListEntriesFilter(null, EntryType.all)
+  );
   assert(list.length == 4);
 
   // Test duplicates within r1 (none)
-  auto dupsR1 = entryRepo.listDuplicates(true, r1);
+  HashQueryFilter fR1;
+  fR1.hasRoot = true;
+  fR1.rootId = r1;
+  const dupsR1 = entryRepo.listDuplicates(fR1);
   assert(dupsR1.length == 0);
 
   // Test duplicates across all roots (hash_dup present in r1 and r2)
-  auto dupsAll = entryRepo.listDuplicates(false, 0);
+  HashQueryFilter fAll;
+  const dupsAll = entryRepo.listDuplicates(fAll);
   assert(dupsAll.length == 2);
   assert(dupsAll[0].sha256 == "hash_dup");
 
-  auto groups = entryRepo.groupDuplicates(dupsAll);
+  const groups = entryRepo.groupDuplicates(dupsAll);
   assert(groups.length == 1);
   assert(groups[0].entries.length == 2);
 
   // Test unique across all roots (f1.txt, f2.txt)
-  auto uniques = entryRepo.listUnique(false, 0);
+  const uniques = entryRepo.listUnique(fAll);
   assert(uniques.length == 2);
 
   // Test subtree queries
@@ -546,35 +516,56 @@ unittest {
     ),
     Entry(0, r1, "r1", "other/c.jpg", "other", "c.jpg", false, 15, 1000, "hC"),
     Entry(0, r1, "r1", "zero1.txt", ".", "zero1.txt", false, 0, 1000, "0"),
-    Entry(0, r1, "r1", "zero2.txt", ".", "zero2.txt", false, 0, 1000, "0")
+    Entry(0, r1, "r1", "zero2.txt", ".", "zero2.txt", false, 0, 1000, "0"),
+    Entry(0, r1, "r1", "empty_dir", ".", "empty_dir", true, 0, 1000, "0")
   ];
   entryRepo.saveSyncEntries(r1, subtreeEntries, 3000);
 
   // Subpath "photos" should only return photos, photos/a.jpg, photos/b.jpg
-  auto subList = entryRepo.listEntries(r1, "photos");
+  const subList = entryRepo.listEntries(r1, ListEntriesFilter("photos"));
   assert(subList.length == 3);
 
   // Subpath with file only
-  auto fileSub = entryRepo.listEntries(r1, "photos/a.jpg");
+  const fileSub = entryRepo.listEntries(r1, ListEntriesFilter("photos/a.jpg"));
   assert(fileSub.length == 1);
   assert(fileSub[0].name == "a.jpg");
 
   // Sorting by size descending
-  auto sortedSize = entryRepo.listEntries(
-    r1, null, EntryType.all, SortField.size
+  const sortedSize = entryRepo.listEntries(
+    r1, ListEntriesFilter(null, EntryType.all, SortField.size)
   );
   assert(sortedSize[0].size >= sortedSize[$ - 1].size);
 
   // Duplicates within r1 with skipEmpty
-  // zero1 and zero2 have sha256 = "0"
-  auto dupsWithZero = entryRepo.listDuplicates(
-    true, r1, null, EntryType.file, false
-  );
-  assert(dupsWithZero.length == 2);
-  assert(dupsWithZero[0].sha256 == "0");
+  // zero1 and zero2 have sha256 = "0" (files)
+  // empty_dir has sha256 = "0" (dir)
+  // When typeFilter == EntryType.all, empty file and empty dir
+  // must NOT collide!
+  HashQueryFilter fZeroAll;
+  fZeroAll.hasRoot = true;
+  fZeroAll.rootId = r1;
+  fZeroAll.typeFilter = EntryType.all;
+  fZeroAll.skipEmpty = false;
+  const dupsZeroAll = entryRepo.listDuplicates(fZeroAll);
+  // zero1.txt and zero2.txt duplicate each other (2 file entries),
+  // empty_dir is single (not duplicate)
+  assert(dupsZeroAll.length == 2);
+  assert(dupsZeroAll[0].sha256 == "0");
+  assert(!dupsZeroAll[0].isDir);
+  assert(!dupsZeroAll[1].isDir);
 
-  auto dupsSkipZero = entryRepo.listDuplicates(
-    true, r1, null, EntryType.file, true
-  );
+  // Verify groupDuplicates groups correctly
+  const zeroGroups = entryRepo.groupDuplicates(dupsZeroAll);
+  assert(zeroGroups.length == 1);
+  assert(zeroGroups[0].entries.length == 2);
+  assert(!zeroGroups[0].isDir);
+
+  // Duplicates within r1 with skipEmpty: zero1 and zero2 are skipped
+  HashQueryFilter fSkipZero;
+  fSkipZero.hasRoot = true;
+  fSkipZero.rootId = r1;
+  fSkipZero.typeFilter = EntryType.file;
+  fSkipZero.skipEmpty = true;
+  const dupsSkipZero = entryRepo.listDuplicates(fSkipZero);
   assert(dupsSkipZero.length == 0);
 }

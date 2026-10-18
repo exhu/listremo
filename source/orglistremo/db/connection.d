@@ -69,7 +69,7 @@ void initSchema(ref Database db) {
 }
 
 unittest {
-  auto db = openDatabase(":memory:");
+  Database db = openDatabase(":memory:");
 
   // Verify foreign key enforcement
   db.execute(`
@@ -87,7 +87,7 @@ unittest {
   `, rootId);
 
   // Verify entry exists
-  auto rowCount = db.execute("SELECT COUNT(*) FROM entries").oneValue!long;
+  long rowCount = db.execute("SELECT COUNT(*) FROM entries").oneValue!long;
   assert(rowCount == 1);
 
   // Verify cascade deletion

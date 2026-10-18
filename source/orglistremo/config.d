@@ -1,6 +1,6 @@
 module orglistremo.config;
 
-import std.file : exists, isDir, mkdirRecurse;
+import std.file : exists, mkdirRecurse;
 import std.path : buildPath, dirName, expandTilde;
 import std.process : environment;
 

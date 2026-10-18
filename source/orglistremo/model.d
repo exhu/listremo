@@ -1,6 +1,5 @@
 module orglistremo.model;
 
-import std.algorithm.searching : canFind;
 import std.string : strip;
 
 enum EntryType {
