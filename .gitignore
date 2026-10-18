@@ -13,6 +13,8 @@
 
 # Executables
 *.exe
+/listremo
+*-test-application
 
 # DUB
 .dub

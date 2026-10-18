@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 -c 'import json, re, sys; d = json.load(sys.stdin); cmd = d.get(\"toolCall\", {}).get(\"args\", {}).get(\"CommandLine\", \"\").strip(); ok = bool(re.match(r\"^(dub\\s+(build|test)(\\s+.*)?|\\./listremo(\\s+.*)?)$\", cmd)) and not any(x in cmd for x in (\";\", \"&&\", \"||\", \"|\", \"`\", \"$(\")); print(json.dumps({\"decision\": \"allow\" if ok else \"ask\"}))'",
+            "command": "python3 -c 'import json, re, sys; d = json.load(sys.stdin); cmd = d.get(\"toolCall\", {}).get(\"args\", {}).get(\"CommandLine\", \"\").strip(); ok = bool(re.match(r\"^(dub\\s+(build|test)(\\s+.*)?|\\./listremo(\\s+.*)?|rdmd(\\s+.*)?)$\", cmd)) and not any(x in cmd for x in (\";\", \"&&\", \"||\", \"|\", \"`\", \"$(\")); print(json.dumps({\"decision\": \"allow\" if ok else \"ask\"}))'",
             "timeout": 5
           }
         ]

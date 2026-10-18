@@ -6,7 +6,8 @@
       "command(dub test)",
       "command(dub test *)",
       "command(./listremo)",
-      "command(./listremo *)"
+      "command(./listremo *)",
+      "command(rdmd *)"
     ]
   }
 }
