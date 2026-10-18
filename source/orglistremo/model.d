@@ -1,0 +1,157 @@
+module orglistremo.model;
+
+import std.algorithm.searching : canFind;
+import std.string : strip;
+
+enum EntryType {
+  all,
+  file,
+  dir
+}
+
+enum SortField {
+  path,
+  size,
+  mtime
+}
+
+enum OutputFormat {
+  console,
+  csv
+}
+
+enum ColorMode {
+  autoMode,
+  always,
+  never
+}
+
+struct Root {
+  long id;
+  string name;
+  string path;
+  long createdAt;
+  long lastSync;
+  bool hasLastSync;
+}
+
+struct RootSummary {
+  Root root;
+  ulong fileCount;
+  ulong dirCount;
+  ulong totalSize;
+}
+
+struct Entry {
+  string fullPath() const {
+    if (rootName.length == 0) {
+      return relPath == "." ? "/" : relPath;
+    }
+    if (relPath == "." || relPath.length == 0) {
+      return rootName ~ ":/";
+    }
+    return rootName ~ ":/" ~ relPath;
+  }
+
+  long id;
+  long rootId;
+  string rootName;
+  string relPath;
+  string parentPath;
+  string name;
+  bool isDir;
+  ulong size;
+  long mtime;
+  string sha256;
+}
+
+struct TargetSpec {
+  static TargetSpec parse(string spec) {
+    TargetSpec result;
+    const trimmed = spec.strip();
+    if (trimmed.length == 0) {
+      return result;
+    }
+
+    const colonIdx = findColon(trimmed);
+    if (colonIdx == -1) {
+      result.rootName = trimmed;
+      result.hasSubpath = false;
+      return result;
+    }
+
+    result.rootName = trimmed[0 .. colonIdx];
+    string sub = trimmed[colonIdx + 1 .. $];
+    while (sub.length > 0 && sub[0] == '/') {
+      sub = sub[1 .. $];
+    }
+    while (sub.length > 0 && sub[$ - 1] == '/') {
+      sub = sub[0 .. $ - 1];
+    }
+
+    if (sub.length == 0 || sub == ".") {
+      result.subpath = "";
+      result.hasSubpath = false;
+    } else {
+      result.subpath = sub;
+      result.hasSubpath = true;
+    }
+    return result;
+  }
+
+  string rootName;
+  string subpath;
+  bool hasSubpath;
+
+private:
+  static ptrdiff_t findColon(string s) {
+    foreach (i, c; s) {
+      if (c == ':') {
+        return i;
+      }
+    }
+    return -1;
+  }
+}
+
+struct DuplicateGroup {
+  string sha256;
+  ulong size;
+  bool isDir;
+  Entry[] entries;
+}
+
+unittest {
+  // Test TargetSpec parsing
+  const t1 = TargetSpec.parse("backup");
+  assert(t1.rootName == "backup");
+  assert(!t1.hasSubpath);
+  assert(t1.subpath == "");
+
+  const t2 = TargetSpec.parse("backup:/");
+  assert(t2.rootName == "backup");
+  assert(!t2.hasSubpath);
+
+  const t3 = TargetSpec.parse("backup:");
+  assert(t3.rootName == "backup");
+  assert(!t3.hasSubpath);
+
+  const t4 = TargetSpec.parse("backup:/photos/2025/");
+  assert(t4.rootName == "backup");
+  assert(t4.hasSubpath);
+  assert(t4.subpath == "photos/2025");
+
+  const t5 = TargetSpec.parse("backup:photos/file.txt");
+  assert(t5.rootName == "backup");
+  assert(t5.hasSubpath);
+  assert(t5.subpath == "photos/file.txt");
+
+  // Test fullPath formatting
+  Entry e;
+  e.rootName = "drive1";
+  e.relPath = ".";
+  assert(e.fullPath() == "drive1:/");
+
+  e.relPath = "docs/readme.txt";
+  assert(e.fullPath() == "drive1:/docs/readme.txt");
+}
