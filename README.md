@@ -85,6 +85,88 @@ The application answers key questions about cataloged storage:
 - `listremo unique [<target>] [--type file|dir|all] [--skip-empty]`:
   Find unique files or directories across all roots or within `<target>`.
 
+## Example Use Case
+
+Here is a step-by-step walkthrough showing how to register a storage root,
+synchronize its contents, inspect cataloged subtrees, and find duplicate files
+and directory trees.
+
+### 1. Adding a Directory to Roots
+
+Register a storage directory under a descriptive root name:
+
+```bash
+listremo root add backup1 ./disks/backup1
+```
+
+You can view all registered roots and their current sync status:
+
+```bash
+listremo root list
+```
+
+### 2. Synchronizing the Root
+
+**Is synchronization required at once after adding a new root?**
+
+Yes. Registering a root (`root add`) only records its name and path mapping in
+the SQLite database. It does not scan the filesystem, index files, or calculate
+hashes. Until you synchronize, the root contains zero cataloged entries, and
+queries on it will return empty results.
+
+Run `sync` to scan the filesystem and populate the catalog:
+
+```bash
+# Synchronize the newly added root
+listremo sync backup1
+
+# Or synchronize all registered roots at once
+listremo sync --all
+```
+
+During synchronization, `listremo` scans files recursively, computes streaming
+SHA-256 hashes for files, computes Merkle hashes for directories, and saves the
+metadata to the catalog. Subsequent syncs run incrementally, reusing hashes for
+unchanged files based on size and modification timestamps.
+
+### 3. Listing Entries and Subtrees
+
+Once synchronized, browse cataloged contents without needing the original drive
+mounted or accessible:
+
+```bash
+# List all files and directories in the root
+listremo list backup1
+
+# List contents scoped to a specific subtree
+listremo list backup1:/photos/2023
+
+# Filter entries by type (files only or directories only) and sort by size
+listremo list backup1:/photos --type file --sort size
+```
+
+### 4. Detecting Duplicate Files and Subtrees
+
+Find duplicates across all roots or scoped to a specific root or subtree:
+
+```bash
+# Find duplicate files across all registered roots
+listremo duplicates
+
+# Find duplicate files within a specific subtree, ignoring empty files
+listremo duplicates backup1:/photos --skip-empty
+
+# Find identical directory subtrees across all roots
+listremo duplicates --type dir
+
+# Find identical directory subtrees within a specific root
+listremo duplicates backup1 --type dir
+```
+
+Because `listremo` computes deterministic Merkle hashes for directories,
+`--type dir` identifies identical folder hierarchies whose contents and names
+match, making it easy to spot redundant backup folders and subtrees.
+
 ## Building from Source
 
 ### Prerequisites
