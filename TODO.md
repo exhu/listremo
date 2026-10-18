@@ -1,2 +1,3 @@
 - review source code
 - manually test
+- display progress while syncing
