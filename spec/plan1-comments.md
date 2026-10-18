@@ -1,10 +1,10 @@
 # Notes & Explanations on `plan1.md`
 
-This document explains selected architectural and database design choices from [plan1.md](file:///home/yur/agy-projects/listremo/spec/plan1.md).
+This document explains selected architectural and database design choices from [plan1.md](plan1.md).
 
 ---
 
-## 1. SQLite Pragmas ([Section 4: Pragmas](file:///home/yur/agy-projects/listremo/spec/plan1.md#L61-L67))
+## 1. SQLite Pragmas ([Section 4: Pragmas](plan1.md#L61-L67)
 
 `PRAGMA` statements are SQLite-specific commands used to configure runtime behavior and storage engine properties on a database connection.
 
@@ -38,7 +38,7 @@ PRAGMA synchronous = NORMAL;
 
 ---
 
-## 2. Why Both `rel_path` and `parent_path` Are Needed ([Section 4: Tables](file:///home/yur/agy-projects/listremo/spec/plan1.md#L80-L91))
+## 2. Why Both `rel_path` and `parent_path` Are Needed ([Section 4: Tables](plan1.md#L80-L91))
 
 In the `entries` table:
 ```sql
@@ -51,8 +51,8 @@ At first glance, `parent_path` and `name` look redundant because `rel_path` is s
 
 ### What `rel_path` is used for:
 1. **Unique Identity & Fast Point Lookup (`UNIQUE(root_id, rel_path)`)**:
-   - During incremental `sync` ([Section 5.1](file:///home/yur/agy-projects/listremo/spec/plan1.md#L109-L112)), the scanner walks the filesystem and needs an $O(1)$ lookup by exact path (`"photos/2025/img.jpg"`) to check whether the file's `size` and `mtime` changed.
-2. **Recursive Subtree Queries ([Section 6.3](file:///home/yur/agy-projects/listremo/spec/plan1.md#L189-L196))**:
+   - During incremental `sync` ([Section 5.1](plan1.md#L109-L112)), the scanner walks the filesystem and needs an $O(1)$ lookup by exact path (`"photos/2025/img.jpg"`) to check whether the file's `size` and `mtime` changed.
+2. **Recursive Subtree Queries ([Section 6.3](plan1.md#L189-L196))**:
    - When querying a subtree at arbitrary depth (e.g., `listremo list backup:/photos`), SQL can filter all descendants at any depth (children, grandchildren, etc.) with a simple prefix match:
      ```sql
      WHERE rel_path = 'photos' OR rel_path LIKE 'photos/%'
@@ -70,7 +70,7 @@ At first glance, `parent_path` and `name` look redundant because `rel_path` is s
      WHERE root_id = :root_id AND parent_path = 'photos'
      ```
 2. **Bottom-Up Directory Hashing & Tree Rendering**:
-   - Computing a directory's Merkle hash and recursive size ([Section 5.2](file:///home/yur/agy-projects/listremo/spec/plan1.md#L114-L127))—or rendering a console directory tree—requires grouping entries by their immediate parent directory (`parent_path`) and sorting by `name`.
+   - Computing a directory's Merkle hash and recursive size ([Section 5.2](plan1.md#L114-L127))—or rendering a console directory tree—requires grouping entries by their immediate parent directory (`parent_path`) and sorting by `name`.
 
 | Example Entry | `rel_path` | `parent_path` | `name` |
 | :--- | :--- | :--- | :--- |
@@ -81,7 +81,7 @@ At first glance, `parent_path` and `name` look redundant because `rel_path` is s
 
 ---
 
-## 3. Merkle Tree for Directory Hashing ([Section 1: Overview](file:///home/yur/agy-projects/listremo/spec/plan1.md#L10) & [Section 5.2](file:///home/yur/agy-projects/listremo/spec/plan1.md#L114-L127))
+## 3. Merkle Tree for Directory Hashing ([Section 1: Overview](plan1.md#L10) & [Section 5.2](plan1.md#L114-L127))
 
 ### What is a Merkle Tree?
 A **Merkle tree** (or **hash tree**), invented by Ralph Merkle in 1979 and widely used in systems like **Git**, **ZFS/Btrfs**, **IPFS**, and **BitTorrent**, is a tree data structure in which:
