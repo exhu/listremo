@@ -1,4 +1,3 @@
-- should continue sync when fails to read file or access directory
 - review source code
 - manually test
 - forbid multiple processes from reusing the same database for write?

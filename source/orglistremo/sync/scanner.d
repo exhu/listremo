@@ -16,6 +16,14 @@ enum SyncPhase {
   saving
 }
 
+struct SyncIssue {
+  string path;
+  string message;
+  bool isDir;
+}
+
+alias SyncIssueCallback = void delegate(const ref SyncIssue issue);
+
 struct SyncProgress {
   SyncPhase phase;
   string currentPath;
@@ -33,13 +41,33 @@ struct SyncResult {
   ulong dirCount;
   ulong totalSize;
   ulong reusedHashes;
+  SyncIssue[] errors;
+}
+
+struct SyncOptions {
+  bool force;
+  bool forceHash;
+  SyncProgressCallback onProgress;
+  SyncIssueCallback onIssue;
+}
+
+bool isDiskDirEmpty(string path) {
+  try {
+    foreach (entry; dirEntries(path, SpanMode.shallow)) {
+      if (!entry.isSymlink) {
+        return false;
+      }
+    }
+    return true;
+  } catch (Exception) {
+    return false;
+  }
 }
 
 SyncResult syncRoot(
   ref Database db,
   const ref Root root,
-  bool forceHash = false,
-  SyncProgressCallback onProgress = null
+  in SyncOptions options = SyncOptions.init
 ) {
   if (!exists(root.path) || !isDir(root.path)) {
     import std.format : format;
@@ -49,20 +77,38 @@ SyncResult syncRoot(
   }
 
   auto entryRepo = EntryRepository(db);
+
+  if (!options.force && isDiskDirEmpty(root.path)
+      && entryRepo.hasCatalogedEntries(root.id)) {
+    import std.format : format;
+    throw new Exception(
+      format(
+        "Fatal error: Root path '%s' is empty while database is not. " ~
+        "Use --force to continue (and empty database root).",
+        root.path
+      )
+    );
+  }
+
   const cachedMap = entryRepo.getFileEntriesMap(root.id);
 
   ScannerContext ctx = ScannerContext(
-    root.id, root.name, forceHash, cachedMap, onProgress
+    root.id,
+    root.name,
+    options.forceHash,
+    cachedMap,
+    options.onProgress,
+    options.onIssue
   );
   ctx.scanDir(root.path, ".");
 
-  if (onProgress !is null) {
+  if (options.onProgress !is null) {
     SyncProgress p;
     p.phase = SyncPhase.saving;
     p.fileCount = ctx.stats.fileCount;
     p.dirCount = ctx.stats.dirCount;
     p.totalBytes = ctx.stats.totalSize;
-    onProgress(p);
+    options.onProgress(p);
   }
 
   const syncTimestamp = Clock.currTime.toUnixTime();
@@ -71,7 +117,24 @@ SyncResult syncRoot(
   return ctx.stats;
 }
 
+SyncResult syncRoot(
+  ref Database db,
+  const ref Root root,
+  bool forceHash,
+  SyncProgressCallback onProgress = null
+) {
+  SyncOptions options;
+  options.forceHash = forceHash;
+  options.onProgress = onProgress;
+  return syncRoot(db, root, options);
+}
+
 private:
+
+struct ScanDirResult {
+  bool success;
+  ChildRecord record;
+}
 
 struct ScannerContext {
   long rootId;
@@ -79,10 +142,19 @@ struct ScannerContext {
   bool forceHash;
   const(CachedFileEntry[string]) cachedMap;
   SyncProgressCallback onProgress;
+  SyncIssueCallback onIssue;
   Entry[] allEntries;
   SyncResult stats;
 
-  ChildRecord scanDir(string diskPath, string relPath) {
+  void recordIssue(string path, string message, bool isDir) {
+    SyncIssue issue = SyncIssue(path, message, isDir);
+    stats.errors ~= issue;
+    if (onIssue !is null) {
+      onIssue(issue);
+    }
+  }
+
+  ScanDirResult scanDir(string diskPath, string relPath) {
     if (onProgress !is null) {
       SyncProgress p;
       p.phase = SyncPhase.scanning;
@@ -95,24 +167,39 @@ struct ScannerContext {
 
     ChildRecord[] children;
 
-    foreach (entry; dirEntries(diskPath, SpanMode.shallow)) {
-      if (entry.isSymlink) {
-        continue;
-      }
+    try {
+      foreach (entry; dirEntries(diskPath, SpanMode.shallow)) {
+        if (entry.isSymlink) {
+          continue;
+        }
 
-      const childName = baseName(entry.name);
-      const childRelPath = (relPath == ".")
-        ? childName
-        : relPath ~ "/" ~ childName;
+        const childName = baseName(entry.name);
+        const childRelPath = (relPath == ".")
+          ? childName
+          : relPath ~ "/" ~ childName;
 
-      if (entry.isFile) {
-        children ~= scanFile(entry, relPath, childName);
-      } else if (entry.isDir) {
-        children ~= scanDir(entry.name, childRelPath);
+        if (entry.isFile) {
+          try {
+            children ~= scanFile(entry, relPath, childName);
+          } catch (Exception e) {
+            recordIssue(entry.name, e.msg, false);
+          }
+        } else if (entry.isDir) {
+          const childRes = scanDir(entry.name, childRelPath);
+          if (childRes.success) {
+            children ~= childRes.record;
+          }
+        }
       }
+    } catch (Exception e) {
+      if (relPath == ".") {
+        throw e;
+      }
+      recordIssue(diskPath, e.msg, true);
+      return ScanDirResult(false, ChildRecord.init);
     }
 
-    return buildDirEntry(diskPath, relPath, children);
+    return ScanDirResult(true, buildDirEntry(diskPath, relPath, children));
   }
 
   ChildRecord scanFile(
@@ -206,7 +293,12 @@ struct ScannerContext {
     ulong dirSize;
     hashDirectory(children, dirHash, dirSize);
 
-    const dirMtime = timeLastModified(diskPath).toUnixTime();
+    long dirMtime = 0;
+    try {
+      dirMtime = timeLastModified(diskPath).toUnixTime();
+    } catch (Exception) {
+      dirMtime = Clock.currTime.toUnixTime();
+    }
 
     Entry dirEntry;
     dirEntry.rootId = rootId;
@@ -341,4 +433,112 @@ unittest {
   assert(scanEvents > 0);
   assert(hashEvents > 0);
   assert(saveEvents == 1);
+
+  // Test empty root path safety check
+  const emptyBase = buildPath(tempDir(), "listremo_empty_test");
+  if (exists(emptyBase)) {
+    rmdirRecurse(emptyBase);
+  }
+  mkdirRecurse(emptyBase);
+  scope (exit) {
+    if (exists(emptyBase)) {
+      rmdirRecurse(emptyBase);
+    }
+  }
+
+  // 1. Initial sync of empty directory when DB has 0 entries -> succeeds
+  const emptyRootId = rootRepo.addRoot("empty_root", emptyBase);
+  Root emptyRoot;
+  assert(rootRepo.findById(emptyRootId, emptyRoot));
+  SyncResult emptyRes = syncRoot(db, emptyRoot, false);
+  assert(emptyRes.fileCount == 0);
+
+  // 2. Add an entry to DB so DB is non-empty
+  Entry dummyEntry;
+  dummyEntry.rootId = emptyRootId;
+  dummyEntry.rootName = "empty_root";
+  dummyEntry.relPath = "file.txt";
+  dummyEntry.name = "file.txt";
+  dummyEntry.isDir = false;
+  dummyEntry.size = 10;
+  dummyEntry.mtime = 1000;
+  dummyEntry.sha256 = "dummy";
+  entryRepo.saveSyncEntries(emptyRootId, [dummyEntry], 1000);
+  assert(entryRepo.hasCatalogedEntries(emptyRootId));
+
+  // 3. Syncing empty directory when DB is not empty -> throws fatal error
+  bool threwFatal = false;
+  try {
+    syncRoot(db, emptyRoot, SyncOptions.init);
+  } catch (Exception e) {
+    threwFatal = true;
+    import std.algorithm.searching : canFind;
+    assert(canFind(e.msg, "Fatal error"));
+  }
+  assert(threwFatal);
+  // Verify DB entries were NOT emptied
+  assert(entryRepo.hasCatalogedEntries(emptyRootId));
+
+  // 4. Syncing with force = true -> empties database root
+  SyncOptions forceOpts;
+  forceOpts.force = true;
+  SyncResult forcedRes = syncRoot(db, emptyRoot, forceOpts);
+  assert(forcedRes.fileCount == 0);
+  assert(!entryRepo.hasCatalogedEntries(emptyRootId));
+
+  // Test continuation on unreadable file and directory
+  import std.process : execute;
+  const permBase = buildPath(tempDir(), "listremo_perm_test");
+  if (exists(permBase)) {
+    execute(["chmod", "755", permBase]);
+    rmdirRecurse(permBase);
+  }
+  mkdirRecurse(permBase);
+  write(buildPath(permBase, "good.txt"), "hello");
+  write(buildPath(permBase, "bad.txt"), "secret");
+  const badDir = buildPath(permBase, "bad_dir");
+  mkdirRecurse(badDir);
+  write(buildPath(badDir, "inner.txt"), "inner");
+
+  execute(["chmod", "000", buildPath(permBase, "bad.txt")]);
+  execute(["chmod", "000", badDir]);
+
+  scope (exit) {
+    execute(["chmod", "755", badDir]);
+    execute(["chmod", "644", buildPath(permBase, "bad.txt")]);
+    if (exists(permBase)) {
+      rmdirRecurse(permBase);
+    }
+  }
+
+  const permRootId = rootRepo.addRoot("perm_root", permBase);
+  Root permRoot;
+  assert(rootRepo.findById(permRootId, permRoot));
+
+  SyncIssue[] reportedIssues;
+  SyncOptions permOpts;
+  permOpts.onIssue = (const ref SyncIssue issue) {
+    reportedIssues ~= issue;
+  };
+
+  SyncResult permRes = syncRoot(db, permRoot, permOpts);
+  // good.txt should be synced
+  assert(permRes.fileCount == 1);
+  // bad.txt and bad_dir should be in errors
+  assert(permRes.errors.length == 2);
+  assert(reportedIssues.length == 2);
+
+  const permEntries = entryRepo.listEntries(permRootId);
+  bool foundGood = false;
+  bool foundBad = false;
+  foreach (ref e; permEntries) {
+    if (e.relPath == "good.txt") {
+      foundGood = true;
+    }
+    if (e.relPath == "bad.txt") {
+      foundBad = true;
+    }
+  }
+  assert(foundGood);
+  assert(!foundBad);
 }

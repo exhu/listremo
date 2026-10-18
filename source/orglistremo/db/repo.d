@@ -172,6 +172,16 @@ struct EntryRepository {
     return cache;
   }
 
+  bool hasCatalogedEntries(long rootId) {
+    auto stmt = db.prepare(`
+      SELECT 1 FROM entries
+      WHERE root_id = ? AND rel_path != '.'
+      LIMIT 1;
+    `);
+    stmt.bind(1, rootId);
+    return !stmt.execute().empty;
+  }
+
   void saveSyncEntries(
     long rootId,
     in Entry[] newEntries,
@@ -568,4 +578,14 @@ unittest {
   fSkipZero.skipEmpty = true;
   const dupsSkipZero = entryRepo.listDuplicates(fSkipZero);
   assert(dupsSkipZero.length == 0);
+
+  // Test hasCatalogedEntries
+  assert(entryRepo.hasCatalogedEntries(r1));
+  const rEmpty = rootRepo.addRoot("r_empty", "/mnt/empty");
+  assert(!entryRepo.hasCatalogedEntries(rEmpty));
+  Entry[] dotOnly = [
+    Entry(0, rEmpty, "r_empty", ".", null, ".", true, 0, 1000, "0")
+  ];
+  entryRepo.saveSyncEntries(rEmpty, dotOnly, 4000);
+  assert(!entryRepo.hasCatalogedEntries(rEmpty));
 }

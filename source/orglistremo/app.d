@@ -13,7 +13,7 @@ import orglistremo.output.console :
 import orglistremo.output.formatter :
   outputDuplicates, outputEntries, outputRoots, outputUnique;
 import orglistremo.sync.scanner :
-  syncRoot, SyncProgressCallback;
+  syncRoot, SyncIssue, SyncOptions, SyncProgressCallback;
 import std.getopt : config, getopt;
 import std.stdio : stderr, writefln, writeln;
 
@@ -69,6 +69,7 @@ struct CliGlobalOptions {
 
 struct SyncArgs {
   bool allFlag;
+  bool forceFlag;
   bool forceHash;
   bool noProgress;
   uint progressIntervalMs = 1000;
@@ -156,6 +157,10 @@ void printUsage() {
   writeln("  duplicates [<target>] [opts] Find duplicate files/dirs");
   writeln("  unique [<target>] [options]  Find unique files/dirs\n");
   writeln("Sync Options:");
+  writeln(
+    "  --force                      Sync when root path is empty but " ~
+    "database is not"
+  );
   writeln("  --force-hash                 Recompute SHA-256 for all files");
   writeln("  --no-progress                Disable in-place progress display");
   writeln(
@@ -292,6 +297,8 @@ bool parseSyncArgs(string[] args, out SyncArgs parsed) {
     const arg = args[i];
     if (arg == "--all") {
       parsed.allFlag = true;
+    } else if (arg == "--force") {
+      parsed.forceFlag = true;
     } else if (arg == "--force-hash") {
       parsed.forceHash = true;
     } else if (arg == "--no-progress") {
@@ -374,10 +381,25 @@ int handleSyncCommand(
       writefln("Syncing root '%s' (%s)...", root.name, root.path);
     }
     try {
-      SyncProgressCallback cb = (reporter !is null)
-        ? &reporter.onProgress
-        : null;
-      const stats = syncRoot(db, root, syncArgs.forceHash, cb);
+      SyncOptions syncOpts;
+      syncOpts.force = syncArgs.forceFlag;
+      syncOpts.forceHash = syncArgs.forceHash;
+      if (reporter !is null) {
+        syncOpts.onProgress = &reporter.onProgress;
+      }
+      syncOpts.onIssue = (const ref SyncIssue issue) {
+        if (reporter !is null) {
+          reporter.clear();
+        }
+        stderr.writefln(
+          "Warning: Failed to %s '%s': %s",
+          issue.isDir ? "access directory" : "read file",
+          issue.path,
+          issue.message
+        );
+      };
+
+      const stats = syncRoot(db, root, syncOpts);
       if (reporter !is null) {
         reporter.clear();
       }
@@ -388,6 +410,20 @@ int handleSyncCommand(
           stats.dirCount,
           stats.reusedHashes
         );
+      }
+      if (stats.errors.length > 0) {
+        hadError = true;
+        stderr.writefln(
+          "  Completed with %d error(s):", stats.errors.length
+        );
+        foreach (ref err; stats.errors) {
+          stderr.writefln(
+            "    - Failed to %s '%s': %s",
+            err.isDir ? "access directory" : "read file",
+            err.path,
+            err.message
+          );
+        }
       }
     } catch (Exception e) {
       if (reporter !is null) {
@@ -638,11 +674,24 @@ unittest {
   assert(parseSyncArgs(["sync", "myroot", "--force-hash"], syncArgs));
   assert(syncArgs.targetRoot == "myroot");
   assert(syncArgs.forceHash);
+  assert(!syncArgs.forceFlag);
   assert(!syncArgs.allFlag);
 
+  SyncArgs syncForce;
+  assert(parseSyncArgs(["sync", "myroot", "--force"], syncForce));
+  assert(syncForce.targetRoot == "myroot");
+  assert(syncForce.forceFlag);
+  assert(!syncForce.forceHash);
+
   SyncArgs syncAll;
-  assert(parseSyncArgs(["sync", "--all"], syncAll));
+  assert(
+    parseSyncArgs(
+      ["sync", "--all", "--force", "--force-hash"], syncAll
+    )
+  );
   assert(syncAll.allFlag);
+  assert(syncAll.forceFlag);
+  assert(syncAll.forceHash);
 
   // Conflicting sync arguments
   SyncArgs conflictArgs;
@@ -730,4 +779,89 @@ unittest {
     ) == 0
   );
   assert(handleRootCommand(db, ["root", "remove", "r1"], testOpts) == 0);
+
+  // Sync commands with empty root and --force
+  import std.file : exists, mkdirRecurse, rmdirRecurse, tempDir;
+  import std.path : buildPath;
+  const syncTempDir = buildPath(tempDir(), "listremo_app_sync_test");
+  if (exists(syncTempDir)) {
+    rmdirRecurse(syncTempDir);
+  }
+  mkdirRecurse(syncTempDir);
+  scope (exit) {
+    if (exists(syncTempDir)) {
+      rmdirRecurse(syncTempDir);
+    }
+  }
+
+  assert(
+    handleRootCommand(
+      db, ["root", "add", "r_temp", syncTempDir], testOpts
+    ) == 0
+  );
+  // Initially empty directory and empty DB -> returns 0
+  assert(
+    handleSyncCommand(
+      db, ["sync", "r_temp", "--no-progress"], testOpts
+    ) == 0
+  );
+
+  // Inject entry into DB
+  RootRepository rootRepo = RootRepository(db);
+  Root rTemp;
+  assert(rootRepo.findByName("r_temp", rTemp));
+  EntryRepository entryRepo = EntryRepository(db);
+  Entry dummy;
+  dummy.rootId = rTemp.id;
+  dummy.rootName = rTemp.name;
+  dummy.relPath = "f.txt";
+  dummy.name = "f.txt";
+  dummy.isDir = false;
+  dummy.size = 5;
+  dummy.mtime = 1000;
+  dummy.sha256 = "abc";
+  entryRepo.saveSyncEntries(rTemp.id, [dummy], 1000);
+  assert(entryRepo.hasCatalogedEntries(rTemp.id));
+
+  // Sync without --force -> fatal error, returns 1
+  assert(
+    handleSyncCommand(
+      db, ["sync", "r_temp", "--no-progress"], testOpts
+    ) == 1
+  );
+  assert(entryRepo.hasCatalogedEntries(rTemp.id));
+
+  // Sync with --force -> succeeds, returns 0
+  assert(
+    handleSyncCommand(
+      db, ["sync", "r_temp", "--force", "--no-progress"], testOpts
+    ) == 0
+  );
+  assert(!entryRepo.hasCatalogedEntries(rTemp.id));
+
+  // Test sync continues on unreadable file and returns 1
+  import std.file : write;
+  import std.process : execute;
+  write(buildPath(syncTempDir, "ok.txt"), "good content");
+  write(buildPath(syncTempDir, "bad.txt"), "secret content");
+  execute(["chmod", "000", buildPath(syncTempDir, "bad.txt")]);
+  scope (exit) {
+    execute(["chmod", "644", buildPath(syncTempDir, "bad.txt")]);
+  }
+
+  // Returns 1 because errors occurred during sync
+  assert(
+    handleSyncCommand(
+      db, ["sync", "r_temp", "--no-progress"], testOpts
+    ) == 1
+  );
+  // Verify ok.txt was cataloged
+  const rEntries = entryRepo.listEntries(rTemp.id);
+  bool foundOk = false;
+  foreach (ref e; rEntries) {
+    if (e.relPath == "ok.txt") {
+      foundOk = true;
+    }
+  }
+  assert(foundOk);
 }
