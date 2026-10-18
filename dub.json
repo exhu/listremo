@@ -1,12 +1,28 @@
 {
   "name": "listremo",
   "description": "Catalog and query files across storage roots",
-  "targetType": "executable",
-  "targetName": "listremo",
   "dependencies": {
     "d2sqlite3": "~>1.0.0"
   },
-  "sourcePaths": ["source"],
-  "importPaths": ["source"],
-  "mainSourceFile": "source/orglistremo/app.d"
+  "sourcePaths": [
+    "source"
+  ],
+  "importPaths": [
+    "source"
+  ],
+  "configurations": [
+    {
+      "name": "application",
+      "targetType": "executable",
+      "targetName": "listremo",
+      "mainSourceFile": "source/orglistremo/app.d"
+    },
+    {
+      "name": "unittest",
+      "targetType": "library",
+      "sourceFiles": [
+        "source/orglistremo/app.d"
+      ]
+    }
+  ]
 }

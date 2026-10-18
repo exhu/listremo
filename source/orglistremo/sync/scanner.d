@@ -162,13 +162,14 @@ ptrdiff_t findLastSlash(string s) {
 }
 
 unittest {
+  import d2sqlite3 : Database;
   import orglistremo.db.connection : openDatabase;
   import orglistremo.db.repo : RootRepository;
   import std.file : mkdir, mkdirRecurse, rmdirRecurse, tempDir, write;
 
-  auto db = openDatabase(":memory:");
-  auto rootRepo = RootRepository(db);
-  auto entryRepo = EntryRepository(db);
+  Database db = openDatabase(":memory:");
+  RootRepository rootRepo = RootRepository(db);
+  EntryRepository entryRepo = EntryRepository(db);
 
   // Setup temporary directory structure:
   // temp_fixture/

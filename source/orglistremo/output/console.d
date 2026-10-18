@@ -322,11 +322,13 @@ unittest {
   File tmpOutColor = File.tmpfile();
   printConsoleRoots(roots, optsColor, tmpOutColor);
 
-  // Test printConsoleEntries
+  // Test printConsoleEntries (uncolored and colored)
   File tmpEntries = File.tmpfile();
   printConsoleEntries([e1, e2], optsNoColor, tmpEntries);
+  File tmpEntriesColor = File.tmpfile();
+  printConsoleEntries([e1, e2], optsColor, tmpEntriesColor);
 
-  // Test printConsoleDuplicates
+  // Test printConsoleDuplicates (uncolored and colored)
   DuplicateGroup dg;
   dg.sha256 = "abc123456789";
   dg.size = 100;
@@ -334,8 +336,12 @@ unittest {
   dg.entries = [e1];
   File tmpDups = File.tmpfile();
   printConsoleDuplicates([dg], optsNoColor, tmpDups);
+  File tmpDupsColor = File.tmpfile();
+  printConsoleDuplicates([dg], optsColor, tmpDupsColor);
 
-  // Test printConsoleUnique
+  // Test printConsoleUnique (uncolored and colored)
   File tmpUniq = File.tmpfile();
   printConsoleUnique([e1], optsNoColor, tmpUniq);
+  File tmpUniqColor = File.tmpfile();
+  printConsoleUnique([e1], optsColor, tmpUniqColor);
 }

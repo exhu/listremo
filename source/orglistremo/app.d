@@ -356,6 +356,44 @@ int handleSyncCommand(
   return hadError ? 1 : 0;
 }
 
+bool parseTypeFilter(string val, out EntryType filter) {
+  if (val == "all") {
+    filter = EntryType.all;
+    return true;
+  }
+  if (val == "file") {
+    filter = EntryType.file;
+    return true;
+  }
+  if (val == "dir") {
+    filter = EntryType.dir;
+    return true;
+  }
+  stderr.writefln(
+    "Invalid --type '%s'. Valid values: all, file, dir.", val
+  );
+  return false;
+}
+
+bool parseSortField(string val, out SortField field) {
+  if (val == "path") {
+    field = SortField.path;
+    return true;
+  }
+  if (val == "size") {
+    field = SortField.size;
+    return true;
+  }
+  if (val == "mtime") {
+    field = SortField.mtime;
+    return true;
+  }
+  stderr.writefln(
+    "Invalid --sort '%s'. Valid values: path, size, mtime.", val
+  );
+  return false;
+}
+
 bool parseListArgs(string[] args, out ListArgs parsed) {
   for (size_t i = 1; i < args.length; i++) {
     const arg = args[i];
@@ -364,17 +402,7 @@ bool parseListArgs(string[] args, out ListArgs parsed) {
         stderr.writeln("Error: Missing value for --type option.");
         return false;
       }
-      i++;
-      if (args[i] == "all") {
-        parsed.typeFilter = EntryType.all;
-      } else if (args[i] == "file") {
-        parsed.typeFilter = EntryType.file;
-      } else if (args[i] == "dir") {
-        parsed.typeFilter = EntryType.dir;
-      } else {
-        stderr.writefln(
-          "Invalid --type '%s'. Valid values: all, file, dir.", args[i]
-        );
+      if (!parseTypeFilter(args[++i], parsed.typeFilter)) {
         return false;
       }
     } else if (arg == "--sort") {
@@ -382,17 +410,7 @@ bool parseListArgs(string[] args, out ListArgs parsed) {
         stderr.writeln("Error: Missing value for --sort option.");
         return false;
       }
-      i++;
-      if (args[i] == "path") {
-        parsed.sortField = SortField.path;
-      } else if (args[i] == "size") {
-        parsed.sortField = SortField.size;
-      } else if (args[i] == "mtime") {
-        parsed.sortField = SortField.mtime;
-      } else {
-        stderr.writefln(
-          "Invalid --sort '%s'. Valid values: path, size, mtime.", args[i]
-        );
+      if (!parseSortField(args[++i], parsed.sortField)) {
         return false;
       }
     } else if (arg.length > 0 && arg[0] == '-') {
@@ -458,17 +476,7 @@ bool parseDuplicateOrUniqueArgs(
         stderr.writeln("Error: Missing value for --type option.");
         return false;
       }
-      i++;
-      if (args[i] == "file") {
-        parsed.typeFilter = EntryType.file;
-      } else if (args[i] == "dir") {
-        parsed.typeFilter = EntryType.dir;
-      } else if (args[i] == "all") {
-        parsed.typeFilter = EntryType.all;
-      } else {
-        stderr.writefln(
-          "Invalid --type '%s'. Valid values: file, dir, all.", args[i]
-        );
+      if (!parseTypeFilter(args[++i], parsed.typeFilter)) {
         return false;
       }
     } else if (arg == "--skip-empty") {

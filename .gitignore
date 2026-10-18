@@ -15,6 +15,7 @@
 *.exe
 /listremo
 *-test-application
+*-test-unittest
 
 # DUB
 .dub

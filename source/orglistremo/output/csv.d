@@ -44,7 +44,7 @@ void printCsvDuplicates(
   writeHashQueryHeader(outStream);
   foreach (ref g; groups) {
     foreach (ref e; g.entries) {
-      writeHashQueryRow(g.sha256, g.size, g.isDir, e, outStream);
+      writeHashQueryRow(e, outStream);
     }
   }
 }
@@ -52,7 +52,7 @@ void printCsvDuplicates(
 void printCsvUnique(in Entry[] entries, File outStream = stdout) {
   writeHashQueryHeader(outStream);
   foreach (ref e; entries) {
-    writeHashQueryRow(e.sha256, e.size, e.isDir, e, outStream);
+    writeHashQueryRow(e, outStream);
   }
 }
 
@@ -62,18 +62,12 @@ void writeHashQueryHeader(File outStream) {
   outStream.writeln("sha256,size,type,root,full_path,rel_path,mtime");
 }
 
-void writeHashQueryRow(
-  string sha256,
-  ulong size,
-  bool isDir,
-  in Entry e,
-  File outStream
-) {
-  const typeStr = isDir ? "D" : "F";
+void writeHashQueryRow(in Entry e, File outStream) {
+  const typeStr = e.isDir ? "D" : "F";
   outStream.writefln(
     "%s,%d,%s,%s,%s,%s,%s",
-    escapeCsvField(sha256),
-    size,
+    escapeCsvField(e.sha256),
+    e.size,
     typeStr,
     escapeCsvField(e.rootName),
     escapeCsvField(e.fullPath()),
