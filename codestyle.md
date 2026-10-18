@@ -5,6 +5,18 @@ struct/class/function/if/while etc. declaration.
 
 Line length is 80 columns max both in D and documentation files.
 
+Example:
+```
+module org.app;
+class Abc {
+  this(int a) {
+    this.a = a;
+  }
+private:
+  int a;
+}
+```
+
 ## Directories and file location
 D source files go to "source".
 Assets/resources go to "assets".
@@ -45,6 +57,15 @@ E.g. "source/org/app/internal/assets.d"
 
 ## Variables and constants
 Prefer declaring local variables and fields const if they are not meant to change.
+
+Use `auto` when declaring types only when it's required by the language (e.g. templates,
+voldemort types) or the type is obvious, e.g.
+```
+// good
+auto myInstance = new MyClass()
+// bad
+auto myVar = calculate(x, y)
+```
 
 ## Architecture & Module Visibility (D)
 To preserve API stability, prevent encapsulation leaks, and protect compiler
@@ -105,6 +126,14 @@ private void myPrivateFunction() {}
 ## Function size
 Split long (>50 lines) or complex functions (which have different sematic
 blocks) into smaller.
+
+## Classes and structs
+Use structs for plain old data. When the need for pointers to structs arises
+consider using classes instead.
+
+Declare classes final by default.
+
+Declare methods first, then fields.
 
 ## Function parameters
 Put the main semantic paramter first, e.g. in drawText function put string type
