@@ -18,7 +18,7 @@ It allows users to:
 - **Compiler**: `ldc2` (D language, standard Phobos library).
 - **Build Configuration**: `dub.json` (using `dub build --compiler=ldc2`).
 - **External Libraries**:
-  - **SQLite3**: Use Phobos built-in C bindings (`etc.c.sqlite3`) linked against system `libsqlite3` (`"libs": ["sqlite3"]` in `dub.json`), wrapped in a lightweight, safe RAII D struct layer (`Database`, `Statement`). No third-party DUB dependencies required, keeping builds fast, offline-friendly, and reproducible.
+  - **SQLite3**: `d2sqlite3` DUB package (`"d2sqlite3": "~>1.0.0"` in `dub.json`), providing idiomatic D RAII types (`Database`, `Statement`, `ResultRange`, `Row`) linked against system `libsqlite3`.
   - **SHA-256**: Phobos `std.digest.sha` (`SHA256`).
   - **CLI Parsing**: Phobos `std.getopt`.
   - **Filesystem Traversal**: Phobos `std.file`, `std.path`, `std.datetime`.
@@ -37,7 +37,7 @@ listremo/
     ├── app.d               # Entry point, subcommand routing, global CLI flags
     ├── config.d            # DB path resolution (--db, LISTREMO_DB, XDG default)
     ├── db/
-    │   ├── connection.d    # RAII wrapper over etc.c.sqlite3 + schema migrations
+    │   ├── connection.d    # d2sqlite3 Database initialization, pragmas & schema migrations
     │   └── repo.d          # Typed queries for roots, entries, duplicates, uniques
     ├── model.d             # Domain structs: Root, Entry, EntryType, DuplicateGroup
     ├── sync/
@@ -280,8 +280,8 @@ listremo unique <root_name>[:/<relative-path>] [--type <file|dir|all>] [--skip-e
 ## 8. Implementation Milestones
 
 1. **Milestone 1: Project Scaffolding & SQLite Layer**
-   - Create `dub.json` targeting `ldc2`.
-   - Implement `source/db/connection.d` (RAII SQLite3 wrapper + schema creation) and `source/model.d`.
+   - Create `dub.json` targeting `ldc2` with dependency `"d2sqlite3": "~>1.0.0"`.
+   - Implement `source/db/connection.d` (`d2sqlite3` `Database` initialization + schema creation) and `source/model.d`.
    - Unit test database initialization and CRUD operations using in-memory SQLite (`:memory:`).
 2. **Milestone 2: Root Management & Sync Engine**
    - Implement `root add`, `root remove`, `root set-path`, `root list`.
