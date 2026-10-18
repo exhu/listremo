@@ -1,0 +1,1 @@
+read @[README.md] and make a detailed plan on how to implement that app in @[spec] plan1.md  . Ask me about confusing or uncertain details.
