@@ -10,6 +10,24 @@ import std.file :
   timeLastModified;
 import std.path : baseName, buildPath;
 
+enum SyncPhase {
+  scanning,
+  hashing,
+  saving
+}
+
+struct SyncProgress {
+  SyncPhase phase;
+  string currentPath;
+  ulong fileCount;
+  ulong dirCount;
+  ulong totalBytes;
+  ulong fileBytesHashed;
+  ulong fileBytesTotal;
+}
+
+alias SyncProgressCallback = void delegate(const ref SyncProgress progress);
+
 struct SyncResult {
   ulong fileCount;
   ulong dirCount;
@@ -20,7 +38,8 @@ struct SyncResult {
 SyncResult syncRoot(
   ref Database db,
   const ref Root root,
-  bool forceHash = false
+  bool forceHash = false,
+  SyncProgressCallback onProgress = null
 ) {
   if (!exists(root.path) || !isDir(root.path)) {
     import std.format : format;
@@ -33,9 +52,18 @@ SyncResult syncRoot(
   const cachedMap = entryRepo.getFileEntriesMap(root.id);
 
   ScannerContext ctx = ScannerContext(
-    root.id, root.name, forceHash, cachedMap
+    root.id, root.name, forceHash, cachedMap, onProgress
   );
   ctx.scanDir(root.path, ".");
+
+  if (onProgress !is null) {
+    SyncProgress p;
+    p.phase = SyncPhase.saving;
+    p.fileCount = ctx.stats.fileCount;
+    p.dirCount = ctx.stats.dirCount;
+    p.totalBytes = ctx.stats.totalSize;
+    onProgress(p);
+  }
 
   const syncTimestamp = Clock.currTime.toUnixTime();
   entryRepo.saveSyncEntries(root.id, ctx.allEntries, syncTimestamp);
@@ -50,10 +78,21 @@ struct ScannerContext {
   string rootName;
   bool forceHash;
   const(CachedFileEntry[string]) cachedMap;
+  SyncProgressCallback onProgress;
   Entry[] allEntries;
   SyncResult stats;
 
   ChildRecord scanDir(string diskPath, string relPath) {
+    if (onProgress !is null) {
+      SyncProgress p;
+      p.phase = SyncPhase.scanning;
+      p.currentPath = relPath;
+      p.fileCount = stats.fileCount;
+      p.dirCount = stats.dirCount;
+      p.totalBytes = stats.totalSize;
+      onProgress(p);
+    }
+
     ChildRecord[] children;
 
     foreach (entry; dirEntries(diskPath, SpanMode.shallow)) {
@@ -88,16 +127,18 @@ struct ScannerContext {
     const mtime = entry.timeLastModified.toUnixTime();
     string fileHash;
 
+    reportFileScan(childRelPath, size);
+
     if (!forceHash && (childRelPath in cachedMap)) {
       const cached = cachedMap[childRelPath];
       if (cached.size == size && cached.mtime == mtime) {
         fileHash = cached.sha256;
         stats.reusedHashes++;
       } else {
-        fileHash = hashFile(entry.name, size);
+        fileHash = computeFileHash(entry.name, childRelPath, size);
       }
     } else {
-      fileHash = hashFile(entry.name, size);
+      fileHash = computeFileHash(entry.name, childRelPath, size);
     }
 
     Entry fileEntry;
@@ -113,8 +154,47 @@ struct ScannerContext {
 
     allEntries ~= fileEntry;
     stats.fileCount++;
+    stats.totalSize += size;
 
     return ChildRecord(childName, false, fileHash, size);
+  }
+
+  void reportFileScan(string childRelPath, ulong size) {
+    if (onProgress !is null) {
+      SyncProgress p;
+      p.phase = SyncPhase.scanning;
+      p.currentPath = childRelPath;
+      p.fileCount = stats.fileCount;
+      p.dirCount = stats.dirCount;
+      p.totalBytes = stats.totalSize;
+      p.fileBytesTotal = size;
+      onProgress(p);
+    }
+  }
+
+  string computeFileHash(
+    string diskPath,
+    string childRelPath,
+    ulong size
+  ) {
+    void onChunk(ulong bytesHashed, ulong totalBytes) {
+      if (onProgress !is null) {
+        SyncProgress p;
+        p.phase = SyncPhase.hashing;
+        p.currentPath = childRelPath;
+        p.fileCount = stats.fileCount;
+        p.dirCount = stats.dirCount;
+        p.totalBytes = stats.totalSize + bytesHashed;
+        p.fileBytesHashed = bytesHashed;
+        p.fileBytesTotal = totalBytes;
+        onProgress(p);
+      }
+    }
+
+    if (onProgress !is null) {
+      onChunk(0, size);
+    }
+    return hashFile(diskPath, size, &onChunk);
   }
 
   ChildRecord buildDirEntry(
@@ -241,4 +321,24 @@ unittest {
   foreach (ref e; entriesAfterDel) {
     assert(e.relPath != "empty.txt");
   }
+
+  // Test syncRoot with progress callback
+  int scanEvents = 0;
+  int hashEvents = 0;
+  int saveEvents = 0;
+  void testProgress(const ref SyncProgress p) {
+    if (p.phase == SyncPhase.scanning) {
+      scanEvents++;
+    } else if (p.phase == SyncPhase.hashing) {
+      hashEvents++;
+    } else if (p.phase == SyncPhase.saving) {
+      saveEvents++;
+    }
+  }
+
+  SyncResult resProgress = syncRoot(db, root, true, &testProgress);
+  assert(resProgress.fileCount == 2);
+  assert(scanEvents > 0);
+  assert(hashEvents > 0);
+  assert(saveEvents == 1);
 }

@@ -1,3 +1,4 @@
 - review source code
 - manually test
-- display progress while syncing
+- forbid multiple processes from reusing the same database for write?
+- [x] display progress while syncing

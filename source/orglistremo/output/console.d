@@ -1,7 +1,10 @@
 module orglistremo.output.console;
 
+import core.time : dur, Duration, MonoTime;
 import orglistremo.model :
   ColorMode, DuplicateGroup, Entry, OutputFormat, RootSummary;
+import orglistremo.sync.scanner :
+  SyncPhase, SyncProgress, SyncProgressCallback;
 import std.format : format;
 import std.stdio : File, stdout;
 
@@ -45,6 +48,138 @@ struct OutputOptions {
   OutputFormat format = OutputFormat.console;
   Styler styler;
   bool fullHash = false;
+}
+
+final class ConsoleProgressReporter {
+public:
+  this(
+    in OutputOptions opts,
+    uint intervalMs = 1000,
+    File stream = stdout
+  ) {
+    this.styler = opts.styler;
+    this.interval = dur!"msecs"(intervalMs);
+    this.stream = stream;
+    import core.sys.posix.unistd : isatty;
+    this.isTty = (opts.format == OutputFormat.console)
+      && (isatty(stream.fileno) != 0);
+  }
+
+  this(
+    in OutputOptions opts,
+    uint intervalMs,
+    File stream,
+    bool forceTty
+  ) {
+    this.styler = opts.styler;
+    this.interval = dur!"msecs"(intervalMs);
+    this.stream = stream;
+    this.isTty = forceTty;
+  }
+
+  void onProgress(const ref SyncProgress progress) {
+    update(progress);
+  }
+
+  void update(const ref SyncProgress progress) {
+    if (!isTty) {
+      return;
+    }
+    const now = MonoTime.currTime;
+    const phaseChanged = !hasOutput || (progress.phase != lastPhase);
+    if (!phaseChanged && (now - lastUpdateTime) < interval) {
+      return;
+    }
+    lastUpdateTime = now;
+    lastPhase = progress.phase;
+    hasOutput = true;
+
+    size_t visibleLen;
+    const line = formatProgressLine(progress, visibleLen);
+    renderLine(line, visibleLen);
+  }
+
+  void clear() {
+    if (!isTty || lastVisibleLen == 0) {
+      return;
+    }
+    import std.array : replicate;
+    stream.writef("\r%s\r", " ".replicate(lastVisibleLen));
+    stream.flush();
+    lastVisibleLen = 0;
+  }
+
+  void finish() {
+    clear();
+  }
+
+  size_t currentVisibleLength() const {
+    return lastVisibleLen;
+  }
+
+private:
+  Styler styler;
+  Duration interval;
+  File stream;
+  bool isTty;
+  MonoTime lastUpdateTime;
+  SyncPhase lastPhase;
+  bool hasOutput;
+  size_t lastVisibleLen;
+
+  void renderLine(string line, size_t visibleLen) {
+    string spaces = "";
+    if (lastVisibleLen > visibleLen) {
+      import std.array : replicate;
+      spaces = " ".replicate(lastVisibleLen - visibleLen);
+    }
+    stream.writef("\r%s%s", line, spaces);
+    stream.flush();
+    lastVisibleLen = visibleLen;
+  }
+
+  string formatProgressLine(
+    const ref SyncProgress progress,
+    out size_t visibleLen
+  ) const {
+    if (progress.phase == SyncPhase.saving) {
+      const msg = "  Saving database entries...";
+      visibleLen = msg.length;
+      return styler.enabled ? styler.header(msg) : msg;
+    }
+
+    const isHash = (progress.phase == SyncPhase.hashing);
+    const tag = isHash ? "[hash]" : "[scan]";
+    const styledTag = isHash ? styler.size(tag) : styler.header(tag);
+
+    const sizeStr = formatSizeHuman(progress.totalBytes);
+    const unstyledPrefix = format(
+      "  %s %d files, %d dirs (%s) | ",
+      tag, progress.fileCount, progress.dirCount, sizeStr
+    );
+    const styledPrefix = format(
+      "  %s %d files, %d dirs (%s) | ",
+      styledTag, progress.fileCount, progress.dirCount, sizeStr
+    );
+
+    string rawPath = progress.currentPath;
+    if (isHash && progress.fileBytesTotal > 0) {
+      const pct = cast(int)(
+        (progress.fileBytesHashed * 100) / progress.fileBytesTotal
+      );
+      rawPath = format("%s (%d%%)", progress.currentPath, pct);
+    }
+
+    const termWidth = getTerminalWidth(stream.fileno);
+    const visiblePrefixLen = unstyledPrefix.length;
+    const avail = (termWidth > visiblePrefixLen + 1)
+      ? termWidth - visiblePrefixLen - 1
+      : 0;
+    const truncatedPath = truncatePathLeft(rawPath, avail);
+
+    visibleLen = visiblePrefixLen + truncatedPath.length;
+    return styledPrefix ~ truncatedPath;
+  }
 }
 
 bool shouldColorize(ColorMode mode) {
@@ -265,6 +400,25 @@ string formatHash(string h, bool fullHash) {
   return h[0 .. 12];
 }
 
+string truncatePathLeft(string path, size_t maxLen) {
+  if (path.length <= maxLen) {
+    return path;
+  }
+  if (maxLen <= 3) {
+    return path[$ - maxLen .. $];
+  }
+  return "..." ~ path[$ - (maxLen - 3) .. $];
+}
+
+size_t getTerminalWidth(int fd) {
+  import core.sys.posix.sys.ioctl : ioctl, winsize, TIOCGWINSZ;
+  winsize ws;
+  if (ioctl(fd, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0) {
+    return cast(size_t) ws.ws_col;
+  }
+  return 80;
+}
+
 unittest {
   import orglistremo.model : Root;
 
@@ -344,4 +498,59 @@ unittest {
   printConsoleUnique([e1], optsNoColor, tmpUniq);
   File tmpUniqColor = File.tmpfile();
   printConsoleUnique([e1], optsColor, tmpUniqColor);
+
+  // Test truncatePathLeft
+  assert(truncatePathLeft("short.txt", 20) == "short.txt");
+  assert(truncatePathLeft("abcdefghij", 5) == "...ij");
+  assert(truncatePathLeft("abcdefghij", 2) == "ij");
+
+  // Test ConsoleProgressReporter with forceTty = true
+  File progOut = File.tmpfile();
+  auto reporter = new ConsoleProgressReporter(
+    optsNoColor, 1000, progOut, true
+  );
+
+  SyncProgress sp1;
+  sp1.phase = SyncPhase.scanning;
+  sp1.currentPath = "dir/file.txt";
+  sp1.fileCount = 5;
+  sp1.dirCount = 2;
+  sp1.totalBytes = 1024;
+  reporter.update(sp1);
+  assert(reporter.currentVisibleLength > 0);
+
+  // Immediate update with same phase should be throttled by interval
+  const lenAfterFirst = reporter.currentVisibleLength;
+  sp1.fileCount = 6;
+  reporter.update(sp1);
+  assert(reporter.currentVisibleLength == lenAfterFirst);
+
+  // Phase change bypasses throttling
+  SyncProgress sp2;
+  sp2.phase = SyncPhase.hashing;
+  sp2.currentPath = "big.bin";
+  sp2.fileCount = 6;
+  sp2.dirCount = 2;
+  sp2.totalBytes = 2048;
+  sp2.fileBytesHashed = 500;
+  sp2.fileBytesTotal = 1000;
+  reporter.update(sp2);
+  assert(reporter.currentVisibleLength > 0);
+
+  // Saving phase
+  SyncProgress sp3;
+  sp3.phase = SyncPhase.saving;
+  reporter.update(sp3);
+
+  // Clear resets visible length to 0
+  reporter.clear();
+  assert(reporter.currentVisibleLength == 0);
+
+  // Test ConsoleProgressReporter with forceTty = false -> does not write
+  File nonTtyOut = File.tmpfile();
+  auto nonTtyReporter = new ConsoleProgressReporter(
+    optsNoColor, 1000, nonTtyOut, false
+  );
+  nonTtyReporter.update(sp1);
+  assert(nonTtyReporter.currentVisibleLength == 0);
 }

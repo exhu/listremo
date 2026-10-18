@@ -8,10 +8,12 @@ import orglistremo.db.repo :
 import orglistremo.model :
   ColorMode, Entry, EntryType, OutputFormat, Root, RootSummary, SortField,
   TargetSpec;
-import orglistremo.output.console : OutputOptions, shouldColorize, Styler;
+import orglistremo.output.console :
+  ConsoleProgressReporter, OutputOptions, shouldColorize, Styler;
 import orglistremo.output.formatter :
   outputDuplicates, outputEntries, outputRoots, outputUnique;
-import orglistremo.sync.scanner : syncRoot;
+import orglistremo.sync.scanner :
+  syncRoot, SyncProgressCallback;
 import std.getopt : config, getopt;
 import std.stdio : stderr, writefln, writeln;
 
@@ -68,6 +70,8 @@ struct CliGlobalOptions {
 struct SyncArgs {
   bool allFlag;
   bool forceHash;
+  bool noProgress;
+  uint progressIntervalMs = 1000;
   string targetRoot;
 }
 
@@ -146,11 +150,18 @@ void printUsage() {
   writeln("  root remove <name>           Remove a root and entries");
   writeln("  root set-path <name> <path>  Update mount path of a root");
   writeln("  root list                    List all registered storage roots");
-  writeln("  sync <name> [--force-hash]   Synchronize a storage root");
-  writeln("  sync --all [--force-hash]    Synchronize all storage roots");
+  writeln("  sync <name> [options]        Synchronize a storage root");
+  writeln("  sync --all [options]         Synchronize all storage roots");
   writeln("  list <target> [options]      List files & dirs (alias: files)");
   writeln("  duplicates [<target>] [opts] Find duplicate files/dirs");
   writeln("  unique [<target>] [options]  Find unique files/dirs\n");
+  writeln("Sync Options:");
+  writeln("  --force-hash                 Recompute SHA-256 for all files");
+  writeln("  --no-progress                Disable in-place progress display");
+  writeln(
+    "  --progress-interval <ms>     Progress refresh interval " ~
+    "(ms, def: 1000)\n"
+  );
   writeln("Global Options:");
   writeln("  --db <path>                  SQLite database path");
   writeln("  --format <console|csv>       Output format (default: console)");
@@ -283,6 +294,24 @@ bool parseSyncArgs(string[] args, out SyncArgs parsed) {
       parsed.allFlag = true;
     } else if (arg == "--force-hash") {
       parsed.forceHash = true;
+    } else if (arg == "--no-progress") {
+      parsed.noProgress = true;
+    } else if (arg == "--progress-interval") {
+      if (i + 1 >= args.length) {
+        stderr.writeln("Error: Missing value for --progress-interval option.");
+        return false;
+      }
+      const valStr = args[++i];
+      try {
+        import std.conv : to;
+        parsed.progressIntervalMs = to!uint(valStr);
+      } catch (Exception) {
+        stderr.writefln(
+          "Invalid --progress-interval value '%s'. Expected positive integer.",
+          valStr
+        );
+        return false;
+      }
     } else if (arg.length > 0 && arg[0] == '-') {
       stderr.writefln("Unknown flag '%s' for sync.", arg);
       return false;
@@ -300,7 +329,7 @@ bool parseSyncArgs(string[] args, out SyncArgs parsed) {
     return false;
   }
   if (!parsed.allFlag && parsed.targetRoot.length == 0) {
-    stderr.writeln("Usage: listremo sync <name> [--force-hash] OR --all");
+    stderr.writeln("Usage: listremo sync <name> [options] OR --all");
     return false;
   }
   return true;
@@ -332,13 +361,26 @@ int handleSyncCommand(
     toSync ~= r;
   }
 
+  ConsoleProgressReporter reporter = null;
+  if (opts.format == OutputFormat.console && !syncArgs.noProgress) {
+    reporter = new ConsoleProgressReporter(
+      opts, syncArgs.progressIntervalMs
+    );
+  }
+
   bool hadError = false;
   foreach (ref root; toSync) {
     if (opts.format == OutputFormat.console) {
       writefln("Syncing root '%s' (%s)...", root.name, root.path);
     }
     try {
-      const stats = syncRoot(db, root, syncArgs.forceHash);
+      SyncProgressCallback cb = (reporter !is null)
+        ? &reporter.onProgress
+        : null;
+      const stats = syncRoot(db, root, syncArgs.forceHash, cb);
+      if (reporter !is null) {
+        reporter.clear();
+      }
       if (opts.format == OutputFormat.console) {
         writefln(
           "  Done: %d files, %d dirs, %d reused hashes.",
@@ -348,6 +390,9 @@ int handleSyncCommand(
         );
       }
     } catch (Exception e) {
+      if (reporter !is null) {
+        reporter.clear();
+      }
       stderr.writefln("Error syncing root '%s': %s", root.name, e.msg);
       hadError = true;
     }
@@ -606,6 +651,34 @@ unittest {
   // Unknown sync flag
   SyncArgs unknownFlagArgs;
   assert(!parseSyncArgs(["sync", "--bogus"], unknownFlagArgs));
+
+  // Sync progress options
+  SyncArgs syncProgArgs;
+  assert(
+    parseSyncArgs(
+      ["sync", "myroot", "--no-progress", "--progress-interval", "500"],
+      syncProgArgs
+    )
+  );
+  assert(syncProgArgs.targetRoot == "myroot");
+  assert(syncProgArgs.noProgress);
+  assert(syncProgArgs.progressIntervalMs == 500);
+
+  SyncArgs syncInvalidInterval;
+  assert(
+    !parseSyncArgs(
+      ["sync", "myroot", "--progress-interval", "notanumber"],
+      syncInvalidInterval
+    )
+  );
+
+  SyncArgs syncMissingInterval;
+  assert(
+    !parseSyncArgs(
+      ["sync", "myroot", "--progress-interval"],
+      syncMissingInterval
+    )
+  );
 
   // Test list args parsing & validation
   ListArgs listArgs;

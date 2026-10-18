@@ -12,7 +12,13 @@ struct ChildRecord {
   ulong size;
 }
 
-string hashFile(string filePath, ulong fileSize) {
+alias HashChunkCallback = void delegate(ulong bytesHashed, ulong totalBytes);
+
+string hashFile(
+  string filePath,
+  ulong fileSize,
+  HashChunkCallback onChunk = null
+) {
   if (fileSize == 0) {
     return "0";
   }
@@ -21,8 +27,13 @@ string hashFile(string filePath, ulong fileSize) {
   SHA256 sha;
   sha.start();
 
+  ulong bytesHashed = 0;
   foreach (ubyte[] chunk; file.byChunk(1024 * 1024)) {
     sha.put(chunk);
+    bytesHashed += chunk.length;
+    if (onChunk !is null) {
+      onChunk(bytesHashed, fileSize);
+    }
   }
 
   return sha.finish().toHexString!(LetterCase.lower).idup;
@@ -73,9 +84,20 @@ unittest {
     }
   }
   write(tmpFile, "hello listremo\n");
-  const computedHash = hashFile(tmpFile, 15);
-  // SHA-256 of "hello listremo\n" is known
+  ulong callbackBytesHashed = 0;
+  ulong callbackTotalBytes = 0;
+  int chunkCallCount = 0;
+  void onChunkTest(ulong hashed, ulong total) {
+    callbackBytesHashed = hashed;
+    callbackTotalBytes = total;
+    chunkCallCount++;
+  }
+
+  const computedHash = hashFile(tmpFile, 15, &onChunkTest);
   assert(computedHash.length == 64);
+  assert(chunkCallCount == 1);
+  assert(callbackBytesHashed == 15);
+  assert(callbackTotalBytes == 15);
 
   // Test empty directory
   ChildRecord[] emptyChildren;
