@@ -1,4 +1,5 @@
 - review source code
 - manually test
 - forbid multiple processes from reusing the same database for write?
+- schema version into db, migration options (sync disk takes a lot of time to waste already collected sha)
 - [x] display progress while syncing
