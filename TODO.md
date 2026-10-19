@@ -1,5 +1,3 @@
-- add free_space column to root data
-- display total time in the end
 - display tree list, xml, html with collapsible tree
 - review source code
 - manually test

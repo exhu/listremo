@@ -5,8 +5,8 @@ import orglistremo.app_version : appVersion;
 import orglistremo.config : ensureDbDirectory;
 public import orglistremo.db.repo_migration : migrateDatabase;
 import orglistremo.db.repo_migration :
-  createCoreTablesV1, createSyncLocksTable, insertVersionRow,
-  resolveDbCreationDate;
+  addFreeSpaceColumn, createCoreTablesV1, createSyncLocksTable,
+  insertVersionRow, resolveDbCreationDate;
 import orglistremo.db.schema_version : schemaVersion;
 import std.datetime.systime : Clock;
 
@@ -99,6 +99,7 @@ void initSchema(ref Database db) {
 void createCoreTables(ref Database db) {
   createCoreTablesV1(db);
   createSyncLocksTable(db);
+  addFreeSpaceColumn(db);
 }
 
 void insertCurrentVersionRow(
@@ -113,7 +114,7 @@ unittest {
   DbOpenResult openRes = openDatabaseChecked(":memory:");
   assert(!openRes.isReadOnly);
   assert(openRes.dbSchemaVersion == schemaVersion);
-  assert(schemaVersion == 2);
+  assert(schemaVersion == 3);
 
   Database db = openRes.db;
   assert(readDbSchemaVersion(db) == schemaVersion);

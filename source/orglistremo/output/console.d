@@ -3,6 +3,8 @@ module orglistremo.output.console;
 import core.time : dur, Duration, MonoTime;
 import orglistremo.model :
   ColorMode, DuplicateGroup, Entry, OutputFormat, RootSummary;
+import orglistremo.output.units :
+  formatDuration, formatSizeHuman, formatUnixTime;
 import orglistremo.sync.scanner :
   SyncPhase, SyncProgress, SyncProgressCallback;
 import std.format : format;
@@ -238,13 +240,14 @@ void printConsoleRoots(
   }
 
   outStream.writefln(
-    "%s %s %s %s %s %s",
+    "%s %s %s %s %s %s %s",
     options.styler.header(format("%-18s", "NAME")),
     options.styler.header(format("%-25s", "PATH")),
     options.styler.header(format("%-19s", "LAST SYNC")),
     options.styler.header(format("%8s", "FILES")),
     options.styler.header(format("%8s", "DIRS")),
-    options.styler.header(format("%12s", "SIZE"))
+    options.styler.header(format("%12s", "SIZE")),
+    options.styler.header(format("%12s", "FREE SPACE"))
   );
 
   foreach (ref s; summaries) {
@@ -252,14 +255,18 @@ void printConsoleRoots(
     const syncTimeStr = s.root.hasLastSync
       ? formatUnixTime(s.root.lastSync)
       : "never";
+    const freeStr = s.root.hasFreeSpace
+      ? formatSizeHuman(s.root.freeSpace)
+      : "-";
     outStream.writefln(
-      "%s %s %s %s %s %s",
+      "%s %s %s %s %s %s %s",
       options.styler.root(format("%-18s", s.root.name)),
       format("%-25s", s.root.path),
       options.styler.date(format("%-19s", syncTimeStr)),
       format("%8d", s.fileCount),
       format("%8d", s.dirCount),
-      options.styler.size(format("%12s", rawSize))
+      options.styler.size(format("%12s", rawSize)),
+      options.styler.size(format("%12s", freeStr))
     );
   }
 }
@@ -366,40 +373,6 @@ void printConsoleUnique(
 }
 
 private:
-
-string formatSizeHuman(ulong bytes) {
-  if (bytes < 1024) {
-    return format("%d B", bytes);
-  }
-  static immutable string[] units = ["KiB", "MiB", "GiB", "TiB", "PiB"];
-  double d = (cast(double) bytes) / 1024.0;
-  size_t u = 0;
-  while (d >= 1024.0 && u + 1 < units.length) {
-    d /= 1024.0;
-    u++;
-  }
-  return format("%.2f %s", d, units[u]);
-}
-
-package(orglistremo) string formatUnixTime(long ts) {
-  if (ts <= 0) {
-    return "never";
-  }
-  import std.datetime.systime : SysTime;
-  const s = SysTime.fromUnixTime(ts).toISOString();
-  if (s.length >= 15) {
-    return format(
-      "%s-%s-%s %s:%s:%s",
-      s[0 .. 4],
-      s[4 .. 6],
-      s[6 .. 8],
-      s[9 .. 11],
-      s[11 .. 13],
-      s[13 .. 15]
-    );
-  }
-  return s;
-}
 
 string formatHash(string h, bool fullHash) {
   if (fullHash || h == "0" || h.length <= 12) {

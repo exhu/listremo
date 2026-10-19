@@ -34,6 +34,9 @@ void migrateDatabase(ref Database db, int fromVersion) {
       case 1:
         migrateFrom1to2(db, now);
         break;
+      case 2:
+        migrateFrom2to3(db, now);
+        break;
       default:
         import std.format : format;
         throw new Exception(
@@ -54,6 +57,16 @@ void migrateFrom1to2(ref Database db, long now) {
   createSyncLocksTable(db);
   const creationDate = resolveDbCreationDate(db, now);
   insertVersionRow(db, 2, creationDate, now);
+}
+
+void migrateFrom2to3(ref Database db, long now) {
+  addFreeSpaceColumn(db);
+  const creationDate = resolveDbCreationDate(db, now);
+  insertVersionRow(db, 3, creationDate, now);
+}
+
+void addFreeSpaceColumn(ref Database db) {
+  db.execute("ALTER TABLE roots ADD COLUMN free_space INTEGER;");
 }
 
 void createSyncLocksTable(ref Database db) {
@@ -220,16 +233,44 @@ unittest {
   createCoreTablesV1(db);
   insertVersionRow(db, 1, 1600000000, 1600000000);
 
-  // Migrate from 1 to 2
+  // Migrate from 1 to 3
   migrateDatabase(db, 1);
 
   const ver = db.execute(
     "SELECT schema_version FROM version ORDER BY id DESC LIMIT 1"
   ).oneValue!int;
-  assert(ver == 2);
+  assert(ver == schemaVersion);
 
   const versionCount = db.execute(
     "SELECT COUNT(*) FROM version"
   ).oneValue!long;
-  assert(versionCount == 2);
+  assert(versionCount == 3);
+}
+
+unittest {
+  auto db = Database(":memory:");
+  // Create v2 database
+  createCoreTablesV1(db);
+  createSyncLocksTable(db);
+  insertVersionRow(db, 2, 1600000000, 1600000000);
+
+  db.execute(`
+    INSERT INTO roots (name, path, created_at)
+    VALUES ('r_v2', '/mnt/v2', 1600000000);
+  `);
+
+  // Migrate from 2 to 3
+  migrateDatabase(db, 2);
+
+  const ver = db.execute(
+    "SELECT schema_version FROM version ORDER BY id DESC LIMIT 1"
+  ).oneValue!int;
+  assert(ver == 3);
+
+  // Verify free_space column is present and usable
+  db.execute("UPDATE roots SET free_space = 5000000000 WHERE name = 'r_v2';");
+  const freeVal = db.execute(
+    "SELECT free_space FROM roots WHERE name = 'r_v2';"
+  ).oneValue!long;
+  assert(freeVal == 5000000000);
 }

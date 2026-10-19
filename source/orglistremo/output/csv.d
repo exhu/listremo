@@ -1,21 +1,26 @@
 module orglistremo.output.csv;
 
 import orglistremo.model : DuplicateGroup, Entry, RootSummary;
+import orglistremo.output.units : formatIso8601;
 import std.format : format;
 import std.stdio : File, stdout;
 
 void printCsvRoots(in RootSummary[] summaries, File outStream = stdout) {
-  outStream.writeln("name,path,last_sync,file_count,dir_count,total_size");
+  outStream.writeln(
+    "name,path,last_sync,file_count,dir_count,total_size,free_space"
+  );
   foreach (ref s; summaries) {
     const syncStr = s.root.hasLastSync ? formatIso8601(s.root.lastSync) : "";
+    const freeStr = s.root.hasFreeSpace ? format("%d", s.root.freeSpace) : "";
     outStream.writefln(
-      "%s,%s,%s,%d,%d,%d",
+      "%s,%s,%s,%d,%d,%d,%s",
       escapeCsvField(s.root.name),
       escapeCsvField(s.root.path),
       escapeCsvField(syncStr),
       s.fileCount,
       s.dirCount,
-      s.totalSize
+      s.totalSize,
+      escapeCsvField(freeStr)
     );
   }
 }
@@ -101,26 +106,6 @@ string escapeCsvField(string val) {
   return escaped;
 }
 
-string formatIso8601(long unixTs) {
-  if (unixTs <= 0) {
-    return "";
-  }
-  import std.datetime.systime : SysTime;
-  const s = SysTime.fromUnixTime(unixTs).toISOString();
-  if (s.length >= 15) {
-    return format(
-      "%s-%s-%sT%s:%s:%s",
-      s[0 .. 4],
-      s[4 .. 6],
-      s[6 .. 8],
-      s[9 .. 11],
-      s[11 .. 13],
-      s[13 .. 15]
-    );
-  }
-  return s;
-}
-
 unittest {
   import orglistremo.model : Root;
 
@@ -134,9 +119,9 @@ unittest {
   assert(iso.length == 19);
   assert(iso[10] == 'T');
 
-  // Test printCsvRoots with and without lastSync
-  Root r1 = Root(1, "r1", "/mnt/r1", 1000, 1700000000, true);
-  Root r2 = Root(2, "r2", "/mnt/r2", 1000, 0, false);
+  // Test printCsvRoots with and without lastSync and freeSpace
+  Root r1 = Root(1, "r1", "/mnt/r1", 1000, 1700000000, true, 5000, true);
+  Root r2 = Root(2, "r2", "/mnt/r2", 1000, 0, false, 0, false);
   RootSummary[] roots = [
     RootSummary(r1, 5, 1, 100),
     RootSummary(r2, 0, 0, 0)
@@ -147,12 +132,15 @@ unittest {
   tmpRoots.rewind();
   assert(
     tmpRoots.readln() ==
-    "name,path,last_sync,file_count,dir_count,total_size\n"
+    "name,path,last_sync,file_count,dir_count,total_size,free_space\n"
   );
   const lineR1 = tmpRoots.readln();
   assert(lineR1.length > 0);
+  import std.string : endsWith, strip;
+  assert(lineR1.strip().endsWith(",5000"));
   const lineR2 = tmpRoots.readln();
   assert(lineR2.length > 0);
+  assert(lineR2.strip().endsWith(","));
 
   // Test printCsvEntries
   Entry e = Entry(

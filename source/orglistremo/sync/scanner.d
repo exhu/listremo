@@ -52,6 +52,31 @@ struct SyncOptions {
   SyncIssueCallback onIssue;
 }
 
+version (Posix) {
+  import core.sys.posix.sys.statvfs : statvfs_t, statvfs;
+  import std.string : toStringz;
+
+  package(orglistremo) bool getDeviceFreeSpace(
+    string path,
+    out ulong freeBytes
+  ) {
+    statvfs_t st;
+    if (statvfs(path.toStringz, &st) != 0) {
+      return false;
+    }
+    const ulong blockSize = st.f_frsize ? st.f_frsize : st.f_bsize;
+    freeBytes = cast(ulong) st.f_bavail * blockSize;
+    return true;
+  }
+} else {
+  package(orglistremo) bool getDeviceFreeSpace(
+    string path,
+    out ulong freeBytes
+  ) {
+    return false;
+  }
+}
+
 bool isDiskDirEmpty(string path) {
   try {
     foreach (entry; dirEntries(path, SpanMode.shallow)) {
@@ -114,9 +139,17 @@ SyncResult syncRoot(
     options.onProgress(p);
   }
 
+  ulong freeSpace = 0;
+  const hasFreeSpace = getDeviceFreeSpace(root.path, freeSpace);
+
   const syncTimestamp = Clock.currTime.toUnixTime();
   entryRepo.saveSyncEntries(
-    root.id, ctx.allEntries, ctx.pendingBatch, syncTimestamp
+    root.id,
+    ctx.allEntries,
+    ctx.pendingBatch,
+    syncTimestamp,
+    freeSpace,
+    hasFreeSpace
   );
 
   return ctx.stats;
@@ -408,6 +441,13 @@ unittest {
   assert(res1.totalSize == 6);
   assert(res1.reusedHashes == 0);
 
+  Root syncedRoot;
+  assert(rootRepo.findById(rootId, syncedRoot));
+  version (Posix) {
+    assert(syncedRoot.hasFreeSpace);
+    assert(syncedRoot.freeSpace > 0);
+  }
+
   // Verify empty.txt has hash "0"
   const entries = entryRepo.listEntries(rootId);
   bool foundEmptyFile = false;
@@ -579,4 +619,15 @@ unittest {
   SyncResult batchRes = syncRoot(db, root, batchOpts);
   assert(batchRes.fileCount == 2);
   assert(entryRepo.listEntries(rootId).length > 0);
+}
+
+unittest {
+  ulong freeBytes;
+  version (Posix) {
+    import std.file : tempDir;
+
+    assert(getDeviceFreeSpace(tempDir(), freeBytes));
+    assert(freeBytes > 0);
+    assert(!getDeviceFreeSpace("/nonexistent_path_987654", freeBytes));
+  }
 }

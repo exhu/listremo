@@ -1,3 +1,3 @@
 module orglistremo.db.schema_version;
 
-enum schemaVersion = 2;
+enum schemaVersion = 3;

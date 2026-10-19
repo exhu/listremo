@@ -63,11 +63,16 @@ struct RootRepository {
   }
 
   bool findByName(string name, out Root root) {
-    auto stmt = db.prepare(`
-      SELECT id, name, path, created_at, last_sync
+    import std.format : format;
+
+    const freeCol = hasFreeSpaceColumn()
+      ? "free_space"
+      : "NULL AS free_space";
+    auto stmt = db.prepare(format(`
+      SELECT id, name, path, created_at, last_sync, %s
       FROM roots
       WHERE name = ?;
-    `);
+    `, freeCol));
     stmt.bind(1, name);
     auto results = stmt.execute();
     if (results.empty) {
@@ -78,11 +83,16 @@ struct RootRepository {
   }
 
   bool findById(long id, out Root root) {
-    auto stmt = db.prepare(`
-      SELECT id, name, path, created_at, last_sync
+    import std.format : format;
+
+    const freeCol = hasFreeSpaceColumn()
+      ? "free_space"
+      : "NULL AS free_space";
+    auto stmt = db.prepare(format(`
+      SELECT id, name, path, created_at, last_sync, %s
       FROM roots
       WHERE id = ?;
-    `);
+    `, freeCol));
     stmt.bind(1, id);
     auto results = stmt.execute();
     if (results.empty) {
@@ -92,18 +102,40 @@ struct RootRepository {
     return true;
   }
 
-  void updateLastSync(long rootId, long timestamp) {
-    auto stmt = db.prepare("UPDATE roots SET last_sync = ? WHERE id = ?;");
-    stmt.bind(1, timestamp);
-    stmt.bind(2, rootId);
-    stmt.execute();
+  void updateLastSync(
+    long rootId,
+    long timestamp,
+    ulong freeSpace = 0,
+    bool hasFreeSpace = false
+  ) {
+    if (hasFreeSpace) {
+      auto stmt = db.prepare(
+        "UPDATE roots SET last_sync = ?, free_space = ? WHERE id = ?;"
+      );
+      stmt.bind(1, timestamp);
+      stmt.bind(2, freeSpace);
+      stmt.bind(3, rootId);
+      stmt.execute();
+    } else {
+      auto stmt = db.prepare(
+        "UPDATE roots SET last_sync = ? WHERE id = ?;"
+      );
+      stmt.bind(1, timestamp);
+      stmt.bind(2, rootId);
+      stmt.execute();
+    }
   }
 
   RootSummary[] listRoots() {
+    import std.format : format;
+
+    const freeCol = hasFreeSpaceColumn()
+      ? "r.free_space"
+      : "NULL AS free_space";
     RootSummary[] summaries;
-    auto stmt = db.prepare(`
+    auto stmt = db.prepare(format(`
       SELECT
-        r.id, r.name, r.path, r.created_at, r.last_sync,
+        r.id, r.name, r.path, r.created_at, r.last_sync, %s,
         COALESCE(SUM(CASE WHEN e.is_dir = 0 THEN 1 ELSE 0 END), 0)
           AS file_count,
         COALESCE(SUM(
@@ -115,14 +147,14 @@ struct RootRepository {
       LEFT JOIN entries e ON e.root_id = r.id
       GROUP BY r.id
       ORDER BY r.name;
-    `);
+    `, freeCol));
     auto results = stmt.execute();
     foreach (row; results) {
       RootSummary summary;
       summary.root = readRootRow(row);
-      summary.fileCount = row.peek!ulong(5);
-      summary.dirCount = row.peek!ulong(6);
-      summary.totalSize = row.peek!ulong(7);
+      summary.fileCount = row.peek!ulong(6);
+      summary.dirCount = row.peek!ulong(7);
+      summary.totalSize = row.peek!ulong(8);
       summaries ~= summary;
     }
     return summaries;
@@ -130,6 +162,16 @@ struct RootRepository {
 
 private:
   Database db;
+
+  bool hasFreeSpaceColumn() {
+    auto stmt = db.prepare("PRAGMA table_info(roots);");
+    foreach (row; stmt.execute()) {
+      if (row.peek!string(1) == "free_space") {
+        return true;
+      }
+    }
+    return false;
+  }
 
   static Root readRootRow(Row row) {
     Root r;
@@ -143,6 +185,13 @@ private:
     } else {
       r.lastSync = 0;
       r.hasLastSync = false;
+    }
+    if (row.length > 5 && row[5].type != SqliteType.NULL) {
+      r.freeSpace = row[5].as!ulong;
+      r.hasFreeSpace = true;
+    } else {
+      r.freeSpace = 0;
+      r.hasFreeSpace = false;
     }
     return r;
   }
@@ -197,16 +246,22 @@ struct EntryRepository {
   void saveSyncEntries(
     long rootId,
     in Entry[] allEntries,
-    long syncTimestamp
+    long syncTimestamp,
+    ulong freeSpace = 0,
+    bool hasFreeSpace = false
   ) {
-    saveSyncEntries(rootId, allEntries, allEntries, syncTimestamp);
+    saveSyncEntries(
+      rootId, allEntries, allEntries, syncTimestamp, freeSpace, hasFreeSpace
+    );
   }
 
   void saveSyncEntries(
     long rootId,
     in Entry[] allEntries,
     in Entry[] remainingEntries,
-    long syncTimestamp
+    long syncTimestamp,
+    ulong freeSpace = 0,
+    bool hasFreeSpace = false
   ) {
     db.execute("BEGIN IMMEDIATE;");
     scope (failure) {
@@ -218,12 +273,22 @@ struct EntryRepository {
       upsertEntries(rootId, remainingEntries);
     }
 
-    auto syncStmt = db.prepare(`
-      UPDATE roots SET last_sync = ? WHERE id = ?;
-    `);
-    syncStmt.bind(1, syncTimestamp);
-    syncStmt.bind(2, rootId);
-    syncStmt.execute();
+    if (hasFreeSpace) {
+      auto syncStmt = db.prepare(`
+        UPDATE roots SET last_sync = ?, free_space = ? WHERE id = ?;
+      `);
+      syncStmt.bind(1, syncTimestamp);
+      syncStmt.bind(2, freeSpace);
+      syncStmt.bind(3, rootId);
+      syncStmt.execute();
+    } else {
+      auto syncStmt = db.prepare(`
+        UPDATE roots SET last_sync = ? WHERE id = ?;
+      `);
+      syncStmt.bind(1, syncTimestamp);
+      syncStmt.bind(2, rootId);
+      syncStmt.execute();
+    }
 
     db.execute("COMMIT;");
   }
@@ -627,4 +692,33 @@ unittest {
   Entry[] remaining = [allBatch[$ - 1]];
   entryRepo.saveSyncEntries(rBatch, allBatch, remaining, 5000);
   assert(entryRepo.listEntries(rBatch).length == 3);
+
+  // Test free_space in RootRepository
+  Root rCheck;
+  assert(rootRepo.findByName("r_batch", rCheck));
+  assert(!rCheck.hasFreeSpace);
+  assert(rCheck.freeSpace == 0);
+
+  rootRepo.updateLastSync(rBatch, 6000, 1024 * 1024 * 50, true);
+  assert(rootRepo.findByName("r_batch", rCheck));
+  assert(rCheck.hasFreeSpace);
+  assert(rCheck.freeSpace == 1024 * 1024 * 50);
+
+  entryRepo.saveSyncEntries(
+    rBatch, allBatch, 7000, 1024 * 1024 * 80, true
+  );
+  assert(rootRepo.findByName("r_batch", rCheck));
+  assert(rCheck.hasFreeSpace);
+  assert(rCheck.freeSpace == 1024 * 1024 * 80);
+
+  const rootSummaries = rootRepo.listRoots();
+  bool foundBatch = false;
+  foreach (ref s; rootSummaries) {
+    if (s.root.name == "r_batch") {
+      foundBatch = true;
+      assert(s.root.hasFreeSpace);
+      assert(s.root.freeSpace == 1024 * 1024 * 80);
+    }
+  }
+  assert(foundBatch);
 }

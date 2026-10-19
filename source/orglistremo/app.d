@@ -13,10 +13,10 @@ import orglistremo.model :
   ColorMode, Entry, EntryType, OutputFormat, Root, RootSummary, SortField,
   TargetSpec;
 import orglistremo.output.console :
-  ConsoleProgressReporter, formatUnixTime, OutputOptions, shouldColorize,
-  Styler;
+  ConsoleProgressReporter, OutputOptions, shouldColorize, Styler;
 import orglistremo.output.formatter :
   outputDuplicates, outputEntries, outputRoots, outputUnique;
+import orglistremo.output.units : formatDuration, formatUnixTime;
 import orglistremo.sync.scanner :
   syncRoot, SyncIssue, SyncOptions, SyncProgressCallback;
 import std.datetime.systime : Clock;
@@ -447,6 +447,7 @@ struct SyncRunContext {
   SyncArgs syncArgs;
   OutputOptions opts;
   ConsoleProgressReporter reporter;
+  bool syncStarted = false;
 }
 
 int handleSyncCommand(
@@ -480,40 +481,80 @@ int handleSyncCommand(
     toSync ~= r;
   }
 
+  import core.time : MonoTime;
+
+  const startMono = MonoTime.currTime;
+  bool hadError = false;
+  bool syncStarted = false;
+
   if (syncArgs.allFlag && syncArgs.jobs != 1 && toSync.length > 1) {
-    import core.sync.mutex : Mutex;
-    import std.parallelism : TaskPool, totalCPUs;
-
-    const numWorkers = (syncArgs.jobs == 0)
-      ? totalCPUs
-      : syncArgs.jobs;
-    auto pool = new TaskPool(numWorkers);
-    scope (exit) {
-      pool.finish(true);
-    }
-
-    auto mtx = new Mutex();
-    bool hadError = false;
-
-    foreach (root; pool.parallel(toSync)) {
-      auto threadDb = openDatabaseChecked(
-        ctx.dbPath, ctx.busyTimeoutMs
-      ).db;
-      scope (exit) {
-        threadDb.close();
-      }
-
-      SyncRunContext threadCtx = SyncRunContext(syncArgs, opts, null);
-      if (!syncSingleRoot(threadDb, root, threadCtx)) {
-        synchronized (mtx) {
-          hadError = true;
-        }
-      }
-    }
-
-    return hadError ? 1 : 0;
+    hadError = runParallelSync(ctx, toSync, syncArgs, opts, syncStarted);
+  } else {
+    hadError = runSequentialSync(ctx, toSync, syncArgs, opts, syncStarted);
   }
 
+  if (syncStarted && opts.format == OutputFormat.console) {
+    const elapsed = MonoTime.currTime - startMono;
+    writefln("Total time: %s", formatDuration(elapsed));
+  }
+
+  return hadError ? 1 : 0;
+}
+
+bool runParallelSync(
+  ref DbContext ctx,
+  in Root[] toSync,
+  in SyncArgs syncArgs,
+  in OutputOptions opts,
+  out bool syncStarted
+) {
+  import core.sync.mutex : Mutex;
+  import std.parallelism : TaskPool, totalCPUs;
+
+  const numWorkers = (syncArgs.jobs == 0)
+    ? totalCPUs
+    : syncArgs.jobs;
+  auto pool = new TaskPool(numWorkers);
+  scope (exit) {
+    pool.finish(true);
+  }
+
+  auto mtx = new Mutex();
+  bool hadError = false;
+  bool anyStarted = false;
+
+  foreach (root; pool.parallel(toSync)) {
+    auto threadDb = openDatabaseChecked(
+      ctx.dbPath, ctx.busyTimeoutMs
+    ).db;
+    scope (exit) {
+      threadDb.close();
+    }
+
+    SyncRunContext threadCtx = SyncRunContext(syncArgs, opts, null);
+    if (!syncSingleRoot(threadDb, root, threadCtx)) {
+      synchronized (mtx) {
+        hadError = true;
+      }
+    }
+    if (threadCtx.syncStarted) {
+      synchronized (mtx) {
+        anyStarted = true;
+      }
+    }
+  }
+
+  syncStarted = anyStarted;
+  return hadError;
+}
+
+bool runSequentialSync(
+  ref DbContext ctx,
+  ref Root[] toSync,
+  in SyncArgs syncArgs,
+  in OutputOptions opts,
+  out bool syncStarted
+) {
   ConsoleProgressReporter reporter = null;
   if (opts.format == OutputFormat.console && !syncArgs.noProgress) {
     reporter = new ConsoleProgressReporter(
@@ -529,7 +570,8 @@ int handleSyncCommand(
     }
   }
 
-  return hadError ? 1 : 0;
+  syncStarted = runCtx.syncStarted;
+  return hadError;
 }
 
 bool syncSingleRoot(
@@ -586,6 +628,8 @@ bool syncSingleRoot(
   scope (exit) {
     lockRepo.releaseLock(root.id);
   }
+
+  runCtx.syncStarted = true;
 
   if (runCtx.opts.format == OutputFormat.console) {
     writefln("Syncing root '%s' (%s)...", root.name, root.path);

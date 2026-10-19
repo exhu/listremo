@@ -4,6 +4,8 @@ A command-line tool to catalog and query offline files split across multiple
 drives (referred to as storage roots, which may also be network or cloud
 storage mounts).
 
+Tested on Linux only.
+
 `listremo` maintains a persistent SQLite catalog of indexed files and
 directories, computes cryptographic hashes, detects duplicate and unique
 entries across drives or within subtrees, and formats output as readable

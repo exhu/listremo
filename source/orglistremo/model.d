@@ -32,6 +32,8 @@ struct Root {
   long createdAt;
   long lastSync;
   bool hasLastSync;
+  ulong freeSpace = 0;
+  bool hasFreeSpace = false;
 }
 
 struct RootSummary {
