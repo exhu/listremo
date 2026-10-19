@@ -25,6 +25,10 @@ Database openDatabase(string dbPath) {
 private:
 
 void initSchema(ref Database db) {
+  // TODO add version table, store schemaVersion, appVersion, creationDate, modificationDate in columns
+  // name columns in snake_case style as the rest of the tables.
+  // after migration old entries in the table are preserved, current schema version is the last row
+
   db.execute(`
     CREATE TABLE IF NOT EXISTS roots (
       id          INTEGER PRIMARY KEY AUTOINCREMENT,
