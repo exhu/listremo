@@ -6,17 +6,23 @@ import orglistremo.db.connection :
   DbOpenResult, migrateDatabase, openDatabase, openDatabaseChecked;
 import orglistremo.db.repo :
   EntryRepository, HashQueryFilter, ListEntriesFilter, RootRepository;
+import orglistremo.db.repo_locks :
+  isPidAlive, SyncLockInfo, SyncLockRepository;
 import orglistremo.db.schema_version : schemaVersion;
 import orglistremo.model :
   ColorMode, Entry, EntryType, OutputFormat, Root, RootSummary, SortField,
   TargetSpec;
 import orglistremo.output.console :
-  ConsoleProgressReporter, OutputOptions, shouldColorize, Styler;
+  ConsoleProgressReporter, formatUnixTime, OutputOptions, shouldColorize,
+  Styler;
 import orglistremo.output.formatter :
   outputDuplicates, outputEntries, outputRoots, outputUnique;
 import orglistremo.sync.scanner :
   syncRoot, SyncIssue, SyncOptions, SyncProgressCallback;
+import std.datetime.systime : Clock;
 import std.getopt : config, getopt;
+import std.process : thisProcessID;
+import std.socket : Socket;
 import std.stdio : stderr, writefln, writeln;
 
 version (unittest) {
@@ -48,7 +54,7 @@ version (unittest) {
     const dbPath = resolveDbPath(globals.cliDb);
     DbOpenResult openRes;
     try {
-      openRes = openDatabaseChecked(dbPath);
+      openRes = openDatabaseChecked(dbPath, globals.busyTimeoutMs);
     } catch (Exception e) {
       stderr.writefln("Failed to open database '%s': %s", dbPath, e.msg);
       return 1;
@@ -59,7 +65,11 @@ version (unittest) {
     }
 
     DbContext ctx = DbContext(
-      openRes.db, dbPath, openRes.dbSchemaVersion, openRes.isReadOnly
+      openRes.db,
+      dbPath,
+      openRes.dbSchemaVersion,
+      openRes.isReadOnly,
+      globals.busyTimeoutMs
     );
     return dispatchCommand(ctx, args[1 .. $], opts);
   }
@@ -72,6 +82,7 @@ struct DbContext {
   string dbPath;
   int dbSchemaVersion;
   bool isReadOnly;
+  uint busyTimeoutMs = 60_000;
 }
 
 struct CliGlobalOptions {
@@ -81,6 +92,7 @@ struct CliGlobalOptions {
   string colorStr = "auto";
   bool fullHash;
   bool showHelp;
+  uint busyTimeoutMs = 60_000;
 }
 
 struct SyncArgs {
@@ -88,6 +100,8 @@ struct SyncArgs {
   bool forceFlag;
   bool forceHash;
   bool noProgress;
+  bool breakLock;
+  uint jobs = 1;
   uint progressIntervalMs = 1000;
   string targetRoot;
 }
@@ -142,6 +156,8 @@ bool parseGlobalOptions(ref string[] args, out CliGlobalOptions globals) {
       "csv", "Shortcut for --format csv", &globals.csvFlag,
       "color", "Color mode (auto, always, never)", &globals.colorStr,
       "full-hash", "Display full 64-char SHA256 in console", &globals.fullHash,
+      "busy-timeout", "SQLite busy timeout in ms (default 60000)",
+      &globals.busyTimeoutMs,
       "help|h", "Display this help message", &globals.showHelp
     );
     return true;
@@ -207,6 +223,10 @@ void printUsage() {
   );
   writeln("  --force-hash                 Recompute SHA-256 for all files");
   writeln("  --no-progress                Disable in-place progress display");
+  writeln("  --break-lock                 Break active sync lock if present");
+  writeln(
+    "  -j, --jobs <N>               Parallel sync jobs for --all (def: 1)"
+  );
   writeln(
     "  --progress-interval <ms>     Progress refresh interval " ~
     "(ms, def: 1000)\n"
@@ -219,6 +239,9 @@ void printUsage() {
   writeln("  --csv                        Shorthand for --format csv");
   writeln("  --color <auto|always|never>  Control ANSI colors");
   writeln("  --full-hash                  Show full 64-char hashes");
+  writeln(
+    "  --busy-timeout <ms>          SQLite busy timeout in ms (def: 60000)"
+  );
 }
 
 int dispatchCommand(
@@ -363,6 +386,24 @@ bool parseSyncArgs(string[] args, out SyncArgs parsed) {
       parsed.forceHash = true;
     } else if (arg == "--no-progress") {
       parsed.noProgress = true;
+    } else if (arg == "--break-lock") {
+      parsed.breakLock = true;
+    } else if (arg == "--jobs" || arg == "-j") {
+      if (i + 1 >= args.length) {
+        stderr.writeln("Error: Missing value for --jobs option.");
+        return false;
+      }
+      const valStr = args[++i];
+      try {
+        import std.conv : to;
+        parsed.jobs = to!uint(valStr);
+      } catch (Exception) {
+        stderr.writefln(
+          "Invalid --jobs value '%s'. Expected non-negative integer.",
+          valStr
+        );
+        return false;
+      }
     } else if (arg == "--progress-interval") {
       if (i + 1 >= args.length) {
         stderr.writeln("Error: Missing value for --progress-interval option.");
@@ -439,6 +480,40 @@ int handleSyncCommand(
     toSync ~= r;
   }
 
+  if (syncArgs.allFlag && syncArgs.jobs != 1 && toSync.length > 1) {
+    import core.sync.mutex : Mutex;
+    import std.parallelism : TaskPool, totalCPUs;
+
+    const numWorkers = (syncArgs.jobs == 0)
+      ? totalCPUs
+      : syncArgs.jobs;
+    auto pool = new TaskPool(numWorkers);
+    scope (exit) {
+      pool.finish(true);
+    }
+
+    auto mtx = new Mutex();
+    bool hadError = false;
+
+    foreach (root; pool.parallel(toSync)) {
+      auto threadDb = openDatabaseChecked(
+        ctx.dbPath, ctx.busyTimeoutMs
+      ).db;
+      scope (exit) {
+        threadDb.close();
+      }
+
+      SyncRunContext threadCtx = SyncRunContext(syncArgs, opts, null);
+      if (!syncSingleRoot(threadDb, root, threadCtx)) {
+        synchronized (mtx) {
+          hadError = true;
+        }
+      }
+    }
+
+    return hadError ? 1 : 0;
+  }
+
   ConsoleProgressReporter reporter = null;
   if (opts.format == OutputFormat.console && !syncArgs.noProgress) {
     reporter = new ConsoleProgressReporter(
@@ -462,6 +537,56 @@ bool syncSingleRoot(
   const ref Root root,
   ref SyncRunContext runCtx
 ) {
+  SyncLockRepository lockRepo = SyncLockRepository(db);
+  const myPid = thisProcessID;
+  const myHost = Socket.hostName;
+  const now = Clock.currTime.toUnixTime();
+  SyncLockInfo existingLock;
+
+  bool acquired = lockRepo.acquireLock(
+    root.id, myPid, myHost, now, existingLock
+  );
+  if (!acquired) {
+    if (runCtx.syncArgs.breakLock) {
+      lockRepo.breakLock(root.id);
+      acquired = lockRepo.acquireLock(
+        root.id, myPid, myHost, now, existingLock
+      );
+    } else if (existingLock.hostname == myHost
+               && !isPidAlive(existingLock.pid)) {
+      stderr.writefln(
+        "Warning: Clearing stale sync lock on root '%s' " ~
+        "(PID %d on %s is no longer active).",
+        root.name,
+        existingLock.pid,
+        existingLock.hostname
+      );
+      lockRepo.breakLock(root.id);
+      acquired = lockRepo.acquireLock(
+        root.id, myPid, myHost, now, existingLock
+      );
+    }
+  }
+
+  if (!acquired) {
+    stderr.writefln(
+      "Error: Root '%s' is currently being synced by PID %d on host '%s' " ~
+      "(started %s).",
+      root.name,
+      existingLock.pid,
+      existingLock.hostname,
+      formatUnixTime(existingLock.startedAt)
+    );
+    stderr.writeln(
+      "Use 'listremo sync <name> --break-lock' if the process was terminated."
+    );
+    return false;
+  }
+
+  scope (exit) {
+    lockRepo.releaseLock(root.id);
+  }
+
   if (runCtx.opts.format == OutputFormat.console) {
     writefln("Syncing root '%s' (%s)...", root.name, root.path);
   }
@@ -932,6 +1057,16 @@ unittest {
   SyncArgs unknownFlagArgs;
   assert(!parseSyncArgs(["sync", "--bogus"], unknownFlagArgs));
 
+  // Break-lock flag
+  SyncArgs syncBreakLockArgs;
+  assert(parseSyncArgs(["sync", "myroot", "--break-lock"], syncBreakLockArgs));
+  assert(syncBreakLockArgs.breakLock);
+
+  // Jobs flag
+  SyncArgs syncJobsArgs;
+  assert(parseSyncArgs(["sync", "--all", "-j", "4"], syncJobsArgs));
+  assert(syncJobsArgs.jobs == 4);
+
   // Sync progress options
   SyncArgs syncProgArgs;
   assert(
@@ -1219,5 +1354,49 @@ unittest {
 
   // Editing command now works
   assert(dispatchCommand(roCtx, ["root", "add", "r2", "/mnt/r2"], opts) == 0);
+
+  // Test root sync lock, stale lock auto-break, and --break-lock
+  const testRootPath = buildPath(migDir, "sync_lock_test_dir");
+  mkdirRecurse(testRootPath);
+  assert(
+    dispatchCommand(
+      roCtx, ["root", "add", "lock_root", testRootPath], opts
+    ) == 0
+  );
+
+  Root lockRoot;
+  assert(RootRepository(roCtx.db).findByName("lock_root", lockRoot));
+
+  SyncLockRepository lockRepo = SyncLockRepository(roCtx.db);
+  SyncLockInfo existing;
+
+  // 1. Artificially acquire lock by thisProcessID (active process)
+  assert(
+    lockRepo.acquireLock(
+      lockRoot.id, thisProcessID, Socket.hostName, 1700000000, existing
+    )
+  );
+
+  // Sync should fail because root is locked
+  assert(dispatchCommand(roCtx, ["sync", "lock_root"], opts) == 1);
+
+  // Sync with --break-lock should succeed
+  assert(
+    dispatchCommand(
+      roCtx, ["sync", "lock_root", "--break-lock"], opts
+    ) == 0
+  );
+
+  // 2. Artificially acquire lock with a dead PID (stale lock)
+  version (Posix) {
+    assert(
+      lockRepo.acquireLock(
+        lockRoot.id, 99_999_999, Socket.hostName, 1700000000, existing
+      )
+    );
+    // Sync without --break-lock should auto-clear stale lock and succeed
+    assert(dispatchCommand(roCtx, ["sync", "lock_root"], opts) == 0);
+  }
+
   roCtx.db.close();
 }

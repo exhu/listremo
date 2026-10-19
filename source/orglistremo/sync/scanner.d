@@ -47,6 +47,7 @@ struct SyncResult {
 struct SyncOptions {
   bool force;
   bool forceHash;
+  size_t batchSize = 1000;
   SyncProgressCallback onProgress;
   SyncIssueCallback onIssue;
 }
@@ -98,7 +99,9 @@ SyncResult syncRoot(
     options.forceHash,
     cachedMap,
     options.onProgress,
-    options.onIssue
+    options.onIssue,
+    &entryRepo,
+    options.batchSize
   );
   ctx.scanDir(root.path, ".");
 
@@ -112,7 +115,9 @@ SyncResult syncRoot(
   }
 
   const syncTimestamp = Clock.currTime.toUnixTime();
-  entryRepo.saveSyncEntries(root.id, ctx.allEntries, syncTimestamp);
+  entryRepo.saveSyncEntries(
+    root.id, ctx.allEntries, ctx.pendingBatch, syncTimestamp
+  );
 
   return ctx.stats;
 }
@@ -143,8 +148,23 @@ struct ScannerContext {
   const(CachedFileEntry[string]) cachedMap;
   SyncProgressCallback onProgress;
   SyncIssueCallback onIssue;
+  EntryRepository* entryRepo;
+  size_t batchSize = 1000;
   Entry[] allEntries;
+  Entry[] pendingBatch;
   SyncResult stats;
+
+  void flushBatch() {
+    if (pendingBatch.length == 0 || entryRepo is null) {
+      return;
+    }
+    try {
+      entryRepo.upsertEntriesBatch(rootId, pendingBatch);
+      pendingBatch = null;
+    } catch (Exception) {
+      // Retain pendingBatch to retry later
+    }
+  }
 
   void recordIssue(string path, string message, bool isDir) {
     SyncIssue issue = SyncIssue(path, message, isDir);
@@ -240,8 +260,14 @@ struct ScannerContext {
     fileEntry.sha256 = fileHash;
 
     allEntries ~= fileEntry;
+    pendingBatch ~= fileEntry;
     stats.fileCount++;
     stats.totalSize += size;
+
+    if (entryRepo !is null && batchSize > 0
+        && pendingBatch.length >= batchSize) {
+      flushBatch();
+    }
 
     return ChildRecord(childName, false, fileHash, size);
   }
@@ -320,6 +346,11 @@ struct ScannerContext {
     }
 
     allEntries ~= dirEntry;
+    pendingBatch ~= dirEntry;
+    if (entryRepo !is null && batchSize > 0
+        && pendingBatch.length >= batchSize) {
+      flushBatch();
+    }
     return ChildRecord(dirEntry.name, true, dirHash, dirSize);
   }
 }
@@ -541,4 +572,11 @@ unittest {
   }
   assert(foundGood);
   assert(!foundBad);
+
+  // Test sync with small batchSize (batchSize = 1)
+  SyncOptions batchOpts;
+  batchOpts.batchSize = 1;
+  SyncResult batchRes = syncRoot(db, root, batchOpts);
+  assert(batchRes.fileCount == 2);
+  assert(entryRepo.listEntries(rootId).length > 0);
 }

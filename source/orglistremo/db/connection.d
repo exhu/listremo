@@ -3,6 +3,10 @@ module orglistremo.db.connection;
 import d2sqlite3 : Database, SqliteType;
 import orglistremo.app_version : appVersion;
 import orglistremo.config : ensureDbDirectory;
+public import orglistremo.db.repo_migration : migrateDatabase;
+import orglistremo.db.repo_migration :
+  createCoreTablesV1, createSyncLocksTable, insertVersionRow,
+  resolveDbCreationDate;
 import orglistremo.db.schema_version : schemaVersion;
 import std.datetime.systime : Clock;
 
@@ -12,16 +16,21 @@ struct DbOpenResult {
   bool isReadOnly;
 }
 
-Database openDatabase(string dbPath) {
-  return openDatabaseChecked(dbPath).db;
+Database openDatabase(string dbPath, uint busyTimeoutMs = 60_000) {
+  return openDatabaseChecked(dbPath, busyTimeoutMs).db;
 }
 
-DbOpenResult openDatabaseChecked(string dbPath) {
+DbOpenResult openDatabaseChecked(
+  string dbPath,
+  uint busyTimeoutMs = 60_000
+) {
   assert(dbPath.length > 0, "dbPath cannot be empty");
   ensureDbDirectory(dbPath);
 
   auto db = Database(dbPath);
   db.execute("PRAGMA foreign_keys = ON;");
+  import std.format : format;
+  db.execute(format("PRAGMA busy_timeout = %d;", busyTimeoutMs));
 
   if (!hasExistingTables(db)) {
     applyWritePragmas(db, dbPath);
@@ -61,34 +70,6 @@ int readDbSchemaVersion(ref Database db) {
   return results.front.peek!int(0);
 }
 
-void migrateDatabase(ref Database db, int fromVersion) {
-  if (fromVersion < 0 || fromVersion >= schemaVersion) {
-    import std.format : format;
-    throw new Exception(
-      format(
-        "Unsupported schema migration from version %d to %d",
-        fromVersion,
-        schemaVersion
-      )
-    );
-  }
-
-  db.execute("PRAGMA query_only = OFF;");
-  db.execute("BEGIN IMMEDIATE;");
-  scope (failure) {
-    db.execute("ROLLBACK;");
-  }
-
-  const now = Clock.currTime.toUnixTime();
-  const creationDate = resolveDbCreationDate(db, now);
-
-  // Migration 0 -> 1: ensure core tables and version table exist
-  createCoreTables(db);
-  insertCurrentVersionRow(db, creationDate, now);
-
-  db.execute("COMMIT;");
-}
-
 private:
 
 void applyWritePragmas(ref Database db, string dbPath) {
@@ -116,90 +97,8 @@ void initSchema(ref Database db) {
 }
 
 void createCoreTables(ref Database db) {
-  db.execute(`
-    CREATE TABLE IF NOT EXISTS version (
-      id                INTEGER PRIMARY KEY AUTOINCREMENT,
-      schema_version    INTEGER NOT NULL,
-      app_version       TEXT NOT NULL,
-      creation_date     INTEGER NOT NULL,
-      modification_date INTEGER NOT NULL
-    );
-  `);
-
-  db.execute(`
-    CREATE TABLE IF NOT EXISTS roots (
-      id          INTEGER PRIMARY KEY AUTOINCREMENT,
-      name        TEXT NOT NULL UNIQUE,
-      path        TEXT NOT NULL,
-      created_at  INTEGER NOT NULL,
-      last_sync   INTEGER
-    );
-  `);
-
-  db.execute(`
-    CREATE TABLE IF NOT EXISTS entries (
-      id          INTEGER PRIMARY KEY AUTOINCREMENT,
-      root_id     INTEGER NOT NULL REFERENCES roots(id) ON DELETE CASCADE,
-      rel_path    TEXT NOT NULL,
-      parent_path TEXT,
-      name        TEXT NOT NULL,
-      is_dir      INTEGER NOT NULL,
-      size        INTEGER NOT NULL,
-      mtime       INTEGER NOT NULL,
-      sha256      TEXT NOT NULL,
-      UNIQUE(root_id, rel_path)
-    );
-  `);
-
-  createCoreIndexes(db);
-}
-
-void createCoreIndexes(ref Database db) {
-  db.execute(`
-    CREATE INDEX IF NOT EXISTS idx_entries_root_id
-    ON entries(root_id);
-  `);
-  db.execute(`
-    CREATE INDEX IF NOT EXISTS idx_entries_sha256
-    ON entries(sha256);
-  `);
-  db.execute(`
-    CREATE INDEX IF NOT EXISTS idx_entries_root_sha256
-    ON entries(root_id, sha256);
-  `);
-  db.execute(`
-    CREATE INDEX IF NOT EXISTS idx_entries_is_dir_sha256
-    ON entries(is_dir, sha256);
-  `);
-}
-
-long resolveDbCreationDate(ref Database db, long fallbackNow) {
-  if (readDbSchemaVersion(db) > 0) {
-    auto verStmt = db.prepare(`
-      SELECT creation_date FROM version
-      ORDER BY id ASC
-      LIMIT 1;
-    `);
-    auto verRes = verStmt.execute();
-    if (!verRes.empty) {
-      return verRes.front.peek!long(0);
-    }
-  }
-
-  auto rootTableStmt = db.prepare(`
-    SELECT 1 FROM sqlite_master
-    WHERE type = 'table' AND name = 'roots'
-    LIMIT 1;
-  `);
-  if (!rootTableStmt.execute().empty) {
-    auto minStmt = db.prepare("SELECT MIN(created_at) FROM roots;");
-    auto minRes = minStmt.execute();
-    if (!minRes.empty && minRes.front[0].type != SqliteType.NULL) {
-      return minRes.front[0].as!long;
-    }
-  }
-
-  return fallbackNow;
+  createCoreTablesV1(db);
+  createSyncLocksTable(db);
 }
 
 void insertCurrentVersionRow(
@@ -207,25 +106,20 @@ void insertCurrentVersionRow(
   long creationDate,
   long modificationDate
 ) {
-  auto stmt = db.prepare(`
-    INSERT INTO version (
-      schema_version, app_version, creation_date, modification_date
-    ) VALUES (?, ?, ?, ?);
-  `);
-  stmt.bind(1, schemaVersion);
-  stmt.bind(2, appVersion);
-  stmt.bind(3, creationDate);
-  stmt.bind(4, modificationDate);
-  stmt.execute();
+  insertVersionRow(db, schemaVersion, creationDate, modificationDate);
 }
 
 unittest {
   DbOpenResult openRes = openDatabaseChecked(":memory:");
   assert(!openRes.isReadOnly);
   assert(openRes.dbSchemaVersion == schemaVersion);
+  assert(schemaVersion == 2);
 
   Database db = openRes.db;
   assert(readDbSchemaVersion(db) == schemaVersion);
+
+  const timeoutVal = db.execute("PRAGMA busy_timeout;").oneValue!int;
+  assert(timeoutVal == 60_000);
 
   const verCount = db.execute("SELECT COUNT(*) FROM version").oneValue!long;
   assert(verCount == 1);
@@ -249,14 +143,20 @@ unittest {
     );
   `, rootId);
 
-  // Verify entry exists
-  long rowCount = db.execute("SELECT COUNT(*) FROM entries").oneValue!long;
-  assert(rowCount == 1);
+  // Verify sync_locks table exists
+  db.execute(`
+    INSERT INTO sync_locks (root_id, pid, started_at, hostname)
+    VALUES (?, 1234, 1700000000, 'myhost');
+  `, rootId);
+
+  // Verify entry and lock exist
+  assert(db.execute("SELECT COUNT(*) FROM entries").oneValue!long == 1);
+  assert(db.execute("SELECT COUNT(*) FROM sync_locks").oneValue!long == 1);
 
   // Verify cascade deletion
   db.execute("DELETE FROM roots WHERE id = ?", rootId);
-  rowCount = db.execute("SELECT COUNT(*) FROM entries").oneValue!long;
-  assert(rowCount == 0);
+  assert(db.execute("SELECT COUNT(*) FROM entries").oneValue!long == 0);
+  assert(db.execute("SELECT COUNT(*) FROM sync_locks").oneValue!long == 0);
 }
 
 unittest {

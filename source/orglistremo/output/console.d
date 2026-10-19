@@ -381,7 +381,7 @@ string formatSizeHuman(ulong bytes) {
   return format("%.2f %s", d, units[u]);
 }
 
-string formatUnixTime(long ts) {
+package(orglistremo) string formatUnixTime(long ts) {
   if (ts <= 0) {
     return "never";
   }

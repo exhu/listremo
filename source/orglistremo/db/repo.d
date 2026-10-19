@@ -182,9 +182,30 @@ struct EntryRepository {
     return !stmt.execute().empty;
   }
 
+  void upsertEntriesBatch(long rootId, in Entry[] batch) {
+    if (batch.length == 0) {
+      return;
+    }
+    db.execute("BEGIN IMMEDIATE;");
+    scope (failure) {
+      db.execute("ROLLBACK;");
+    }
+    upsertEntries(rootId, batch);
+    db.execute("COMMIT;");
+  }
+
   void saveSyncEntries(
     long rootId,
-    in Entry[] newEntries,
+    in Entry[] allEntries,
+    long syncTimestamp
+  ) {
+    saveSyncEntries(rootId, allEntries, allEntries, syncTimestamp);
+  }
+
+  void saveSyncEntries(
+    long rootId,
+    in Entry[] allEntries,
+    in Entry[] remainingEntries,
     long syncTimestamp
   ) {
     db.execute("BEGIN IMMEDIATE;");
@@ -192,8 +213,10 @@ struct EntryRepository {
       db.execute("ROLLBACK;");
     }
 
-    deleteStaleEntries(rootId, newEntries);
-    upsertEntries(rootId, newEntries);
+    deleteStaleEntries(rootId, allEntries);
+    if (remainingEntries.length > 0) {
+      upsertEntries(rootId, remainingEntries);
+    }
 
     auto syncStmt = db.prepare(`
       UPDATE roots SET last_sync = ? WHERE id = ?;
@@ -588,4 +611,20 @@ unittest {
   ];
   entryRepo.saveSyncEntries(rEmpty, dotOnly, 4000);
   assert(!entryRepo.hasCatalogedEntries(rEmpty));
+
+  // Test upsertEntriesBatch and remainingEntries saveSyncEntries
+  const rBatch = rootRepo.addRoot("r_batch", "/mnt/batch");
+  Entry[] batch1 = [
+    Entry(0, rBatch, "r_batch", "f1.txt", ".", "f1.txt", false, 10, 1000, "h1"),
+    Entry(0, rBatch, "r_batch", "f2.txt", ".", "f2.txt", false, 20, 1000, "h2")
+  ];
+  entryRepo.upsertEntriesBatch(rBatch, batch1);
+  assert(entryRepo.getFileEntriesMap(rBatch).length == 2);
+
+  Entry[] allBatch = batch1 ~ [
+    Entry(0, rBatch, "r_batch", ".", null, ".", true, 0, 1000, "hdir")
+  ];
+  Entry[] remaining = [allBatch[$ - 1]];
+  entryRepo.saveSyncEntries(rBatch, allBatch, remaining, 5000);
+  assert(entryRepo.listEntries(rBatch).length == 3);
 }

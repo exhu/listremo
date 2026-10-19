@@ -1,6 +1,5 @@
-- review source code
-- manually test
 - add free_space column to root data
 - display total time in the end
-- forbid multiple processes from reusing the same database for write?
 - display tree list, xml, html with collapsible tree
+- review source code
+- manually test

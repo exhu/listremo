@@ -7,3 +7,5 @@
 - Increment schemaVersion in source/orglistremo/db/schema_version.d and update
   migrateDatabase in source/orglistremo/db/connection.d when changing sql
   tables.
+- Increment appVersion in source/orglistremo/app_version.d after introducing
+changes or bug fixes.
