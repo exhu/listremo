@@ -103,8 +103,12 @@ public:
     if (!isTty || lastVisibleLen == 0) {
       return;
     }
-    import std.array : replicate;
-    stream.writef("\r%s\r", " ".replicate(lastVisibleLen));
+    if (styler.enabled) {
+      stream.writef("\r\033[K");
+    } else {
+      import std.array : replicate;
+      stream.writef("\r%s\r", " ".replicate(lastVisibleLen));
+    }
     stream.flush();
     lastVisibleLen = 0;
   }
@@ -128,12 +132,16 @@ private:
   size_t lastVisibleLen;
 
   void renderLine(string line, size_t visibleLen) {
-    string spaces = "";
-    if (lastVisibleLen > visibleLen) {
-      import std.array : replicate;
-      spaces = " ".replicate(lastVisibleLen - visibleLen);
+    if (styler.enabled) {
+      stream.writef("\r%s\033[K", line);
+    } else {
+      string spaces = "";
+      if (lastVisibleLen > visibleLen) {
+        import std.array : replicate;
+        spaces = " ".replicate(lastVisibleLen - visibleLen);
+      }
+      stream.writef("\r%s%s", line, spaces);
     }
-    stream.writef("\r%s%s", line, spaces);
     stream.flush();
     lastVisibleLen = visibleLen;
   }
@@ -553,4 +561,53 @@ unittest {
   );
   nonTtyReporter.update(sp1);
   assert(nonTtyReporter.currentVisibleLength == 0);
+
+  // Test ConsoleProgressReporter with optsColor: emits \033[K on line overwrite
+  File colorProgOut = File.tmpfile();
+  auto colorReporter = new ConsoleProgressReporter(
+    optsColor, 0, colorProgOut, true
+  );
+
+  SyncProgress longSp;
+  longSp.phase = SyncPhase.hashing;
+  longSp.currentPath = "long_path_name.bin";
+  longSp.fileCount = 1;
+  longSp.dirCount = 0;
+  longSp.totalBytes = 1000;
+  longSp.fileBytesHashed = 230;
+  longSp.fileBytesTotal = 1000;
+  colorReporter.update(longSp);
+
+  SyncProgress shortSp;
+  shortSp.phase = SyncPhase.hashing;
+  shortSp.currentPath = "short.bin";
+  shortSp.fileCount = 1;
+  shortSp.dirCount = 0;
+  shortSp.totalBytes = 1000;
+  shortSp.fileBytesHashed = 230;
+  shortSp.fileBytesTotal = 1000;
+  colorReporter.update(shortSp);
+
+  colorProgOut.rewind();
+  ubyte[] colorBytes = new ubyte[cast(size_t) colorProgOut.size];
+  colorProgOut.rawRead(colorBytes);
+  import std.algorithm.searching : canFind;
+  assert(canFind(cast(string) colorBytes, "\033[K"));
+
+  // Test clear with optsColor emits \033[K
+  colorReporter.clear();
+  assert(colorReporter.currentVisibleLength == 0);
+
+  // Test ConsoleProgressReporter with optsNoColor emits spaces on shorter line
+  File noColorProgOut = File.tmpfile();
+  auto noColorReporter = new ConsoleProgressReporter(
+    optsNoColor, 0, noColorProgOut, true
+  );
+  noColorReporter.update(longSp);
+  noColorReporter.update(shortSp);
+
+  noColorProgOut.rewind();
+  ubyte[] noColorBytes = new ubyte[cast(size_t) noColorProgOut.size];
+  noColorProgOut.rawRead(noColorBytes);
+  assert(canFind(cast(string) noColorBytes, "   "));
 }
