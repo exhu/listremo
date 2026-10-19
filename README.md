@@ -84,6 +84,9 @@ The application answers key questions about cataloged storage:
   Find duplicate files or directories across all roots or within `<target>`.
 - `listremo unique [<target>] [--type file|dir|all] [--skip-empty]`:
   Find unique files or directories across all roots or within `<target>`.
+- `listremo migrate [--no-backup]`:
+  Migrate database schema to the current application version (prompts to save a
+  backup file unless `--no-backup` is specified).
 
 ## Example Use Case
 

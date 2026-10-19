@@ -1,10 +1,12 @@
 module orglistremo.app;
 
 import d2sqlite3 : Database;
-import orglistremo.config : resolveDbPath;
-import orglistremo.db.connection : openDatabase;
+import orglistremo.config : ensureDbDirectory, resolveDbPath;
+import orglistremo.db.connection :
+  DbOpenResult, migrateDatabase, openDatabase, openDatabaseChecked;
 import orglistremo.db.repo :
   EntryRepository, HashQueryFilter, ListEntriesFilter, RootRepository;
+import orglistremo.db.schema_version : schemaVersion;
 import orglistremo.model :
   ColorMode, Entry, EntryType, OutputFormat, Root, RootSummary, SortField,
   TargetSpec;
@@ -44,19 +46,33 @@ version (unittest) {
     }
 
     const dbPath = resolveDbPath(globals.cliDb);
-    Database db;
+    DbOpenResult openRes;
     try {
-      db = openDatabase(dbPath);
+      openRes = openDatabaseChecked(dbPath);
     } catch (Exception e) {
       stderr.writefln("Failed to open database '%s': %s", dbPath, e.msg);
       return 1;
     }
 
-    return dispatchCommand(db, args[1 .. $], opts);
+    if (openRes.isReadOnly) {
+      printSchemaMismatchWarning(openRes.dbSchemaVersion);
+    }
+
+    DbContext ctx = DbContext(
+      openRes.db, dbPath, openRes.dbSchemaVersion, openRes.isReadOnly
+    );
+    return dispatchCommand(ctx, args[1 .. $], opts);
   }
 }
 
 private:
+
+struct DbContext {
+  Database db;
+  string dbPath;
+  int dbSchemaVersion;
+  bool isReadOnly;
+}
 
 struct CliGlobalOptions {
   string cliDb;
@@ -76,6 +92,10 @@ struct SyncArgs {
   string targetRoot;
 }
 
+struct MigrateArgs {
+  bool noBackup;
+}
+
 struct ListArgs {
   string target;
   EntryType typeFilter = EntryType.all;
@@ -86,6 +106,29 @@ struct DuplicateOrUniqueArgs {
   string target;
   EntryType typeFilter = EntryType.file;
   bool skipEmpty;
+}
+
+void printSchemaMismatchWarning(int dbSchemaVer) {
+  stderr.writefln(
+    "Warning: Database schema version (%d) does not match " ~
+    "application schema version (%d).",
+    dbSchemaVer,
+    schemaVersion
+  );
+  stderr.writeln(
+    "Working in read-only mode. " ~
+    "Run 'listremo migrate' to update the database."
+  );
+}
+
+void printReadOnlyError(int dbSchemaVer) {
+  stderr.writefln(
+    "Error: Command is not available in read-only mode " ~
+    "(database schema version %d, application schema version %d). " ~
+    "Run 'listremo migrate' first.",
+    dbSchemaVer,
+    schemaVersion
+  );
 }
 
 bool parseGlobalOptions(ref string[] args, out CliGlobalOptions globals) {
@@ -155,7 +198,8 @@ void printUsage() {
   writeln("  sync --all [options]         Synchronize all storage roots");
   writeln("  list <target> [options]      List files & dirs (alias: files)");
   writeln("  duplicates [<target>] [opts] Find duplicate files/dirs");
-  writeln("  unique [<target>] [options]  Find unique files/dirs\n");
+  writeln("  unique [<target>] [options]  Find unique files/dirs");
+  writeln("  migrate [--no-backup]        Migrate database schema\n");
   writeln("Sync Options:");
   writeln(
     "  --force                      Sync when root path is empty but " ~
@@ -167,6 +211,8 @@ void printUsage() {
     "  --progress-interval <ms>     Progress refresh interval " ~
     "(ms, def: 1000)\n"
   );
+  writeln("Migrate Options:");
+  writeln("  --no-backup                  Skip saving a database backup\n");
   writeln("Global Options:");
   writeln("  --db <path>                  SQLite database path");
   writeln("  --format <console|csv>       Output format (default: console)");
@@ -176,23 +222,25 @@ void printUsage() {
 }
 
 int dispatchCommand(
-  ref Database db,
+  ref DbContext ctx,
   string[] subArgs,
   in OutputOptions opts
 ) {
   const subcmd = subArgs[0];
   switch (subcmd) {
     case "root":
-      return handleRootCommand(db, subArgs, opts);
+      return handleRootCommand(ctx, subArgs, opts);
     case "sync":
-      return handleSyncCommand(db, subArgs, opts);
+      return handleSyncCommand(ctx, subArgs, opts);
+    case "migrate":
+      return handleMigrateCommand(ctx, subArgs, opts);
     case "list":
     case "files":
-      return handleListCommand(db, subArgs, opts);
+      return handleListCommand(ctx.db, subArgs, opts);
     case "duplicates":
-      return handleDuplicatesCommand(db, subArgs, opts);
+      return handleDuplicatesCommand(ctx.db, subArgs, opts);
     case "unique":
-      return handleUniqueCommand(db, subArgs, opts);
+      return handleUniqueCommand(ctx.db, subArgs, opts);
     case "help":
       printUsage();
       return 0;
@@ -205,7 +253,7 @@ int dispatchCommand(
 }
 
 int handleRootCommand(
-  ref Database db,
+  ref DbContext ctx,
   string[] args,
   in OutputOptions opts
 ) {
@@ -213,15 +261,27 @@ int handleRootCommand(
     stderr.writeln("Usage: listremo root <add|remove|set-path|list>");
     return 1;
   }
-  RootRepository rootRepo = RootRepository(db);
+  RootRepository rootRepo = RootRepository(ctx.db);
   const action = args[1];
 
   switch (action) {
     case "add":
+      if (ctx.isReadOnly) {
+        printReadOnlyError(ctx.dbSchemaVersion);
+        return 1;
+      }
       return handleRootAdd(rootRepo, args, opts);
     case "remove":
+      if (ctx.isReadOnly) {
+        printReadOnlyError(ctx.dbSchemaVersion);
+        return 1;
+      }
       return handleRootRemove(rootRepo, args, opts);
     case "set-path":
+      if (ctx.isReadOnly) {
+        printReadOnlyError(ctx.dbSchemaVersion);
+        return 1;
+      }
       return handleRootSetPath(rootRepo, args, opts);
     case "list":
       const summaries = rootRepo.listRoots();
@@ -342,17 +402,28 @@ bool parseSyncArgs(string[] args, out SyncArgs parsed) {
   return true;
 }
 
+struct SyncRunContext {
+  SyncArgs syncArgs;
+  OutputOptions opts;
+  ConsoleProgressReporter reporter;
+}
+
 int handleSyncCommand(
-  ref Database db,
+  ref DbContext ctx,
   string[] args,
   in OutputOptions opts
 ) {
+  if (ctx.isReadOnly) {
+    printReadOnlyError(ctx.dbSchemaVersion);
+    return 1;
+  }
+
   SyncArgs syncArgs;
   if (!parseSyncArgs(args, syncArgs)) {
     return 1;
   }
 
-  RootRepository rootRepo = RootRepository(db);
+  RootRepository rootRepo = RootRepository(ctx.db);
   Root[] toSync;
   if (syncArgs.allFlag) {
     const summaries = rootRepo.listRoots();
@@ -375,66 +446,226 @@ int handleSyncCommand(
     );
   }
 
+  SyncRunContext runCtx = SyncRunContext(syncArgs, opts, reporter);
   bool hadError = false;
   foreach (ref root; toSync) {
-    if (opts.format == OutputFormat.console) {
-      writefln("Syncing root '%s' (%s)...", root.name, root.path);
-    }
-    try {
-      SyncOptions syncOpts;
-      syncOpts.force = syncArgs.forceFlag;
-      syncOpts.forceHash = syncArgs.forceHash;
-      if (reporter !is null) {
-        syncOpts.onProgress = &reporter.onProgress;
-      }
-      syncOpts.onIssue = (const ref SyncIssue issue) {
-        if (reporter !is null) {
-          reporter.clear();
-        }
-        stderr.writefln(
-          "Warning: Failed to %s '%s': %s",
-          issue.isDir ? "access directory" : "read file",
-          issue.path,
-          issue.message
-        );
-      };
-
-      const stats = syncRoot(db, root, syncOpts);
-      if (reporter !is null) {
-        reporter.clear();
-      }
-      if (opts.format == OutputFormat.console) {
-        writefln(
-          "  Done: %d files, %d dirs, %d reused hashes.",
-          stats.fileCount,
-          stats.dirCount,
-          stats.reusedHashes
-        );
-      }
-      if (stats.errors.length > 0) {
-        hadError = true;
-        stderr.writefln(
-          "  Completed with %d error(s):", stats.errors.length
-        );
-        foreach (ref err; stats.errors) {
-          stderr.writefln(
-            "    - Failed to %s '%s': %s",
-            err.isDir ? "access directory" : "read file",
-            err.path,
-            err.message
-          );
-        }
-      }
-    } catch (Exception e) {
-      if (reporter !is null) {
-        reporter.clear();
-      }
-      stderr.writefln("Error syncing root '%s': %s", root.name, e.msg);
+    if (!syncSingleRoot(ctx.db, root, runCtx)) {
       hadError = true;
     }
   }
 
   return hadError ? 1 : 0;
+}
+
+bool syncSingleRoot(
+  ref Database db,
+  const ref Root root,
+  ref SyncRunContext runCtx
+) {
+  if (runCtx.opts.format == OutputFormat.console) {
+    writefln("Syncing root '%s' (%s)...", root.name, root.path);
+  }
+  try {
+    SyncOptions syncOpts;
+    syncOpts.force = runCtx.syncArgs.forceFlag;
+    syncOpts.forceHash = runCtx.syncArgs.forceHash;
+    if (runCtx.reporter !is null) {
+      syncOpts.onProgress = &runCtx.reporter.onProgress;
+    }
+    syncOpts.onIssue = (const ref SyncIssue issue) {
+      if (runCtx.reporter !is null) {
+        runCtx.reporter.clear();
+      }
+      stderr.writefln(
+        "Warning: Failed to %s '%s': %s",
+        issue.isDir ? "access directory" : "read file",
+        issue.path,
+        issue.message
+      );
+    };
+
+    const stats = syncRoot(db, root, syncOpts);
+    if (runCtx.reporter !is null) {
+      runCtx.reporter.clear();
+    }
+    if (runCtx.opts.format == OutputFormat.console) {
+      writefln(
+        "  Done: %d files, %d dirs, %d reused hashes.",
+        stats.fileCount,
+        stats.dirCount,
+        stats.reusedHashes
+      );
+    }
+    if (stats.errors.length > 0) {
+      stderr.writefln("  Completed with %d error(s):", stats.errors.length);
+      foreach (ref err; stats.errors) {
+        stderr.writefln(
+          "    - Failed to %s '%s': %s",
+          err.isDir ? "access directory" : "read file",
+          err.path,
+          err.message
+        );
+      }
+      return false;
+    }
+    return true;
+  } catch (Exception e) {
+    if (runCtx.reporter !is null) {
+      runCtx.reporter.clear();
+    }
+    stderr.writefln("Error syncing root '%s': %s", root.name, e.msg);
+    return false;
+  }
+}
+
+bool parseMigrateArgs(string[] args, out MigrateArgs parsed) {
+  for (size_t i = 1; i < args.length; i++) {
+    const arg = args[i];
+    if (arg == "--no-backup") {
+      parsed.noBackup = true;
+    } else if (arg.length > 0 && arg[0] == '-') {
+      stderr.writefln("Unknown flag '%s' for migrate.", arg);
+      return false;
+    } else {
+      stderr.writefln("Unexpected argument '%s' for migrate.", arg);
+      return false;
+    }
+  }
+  return true;
+}
+
+string proposeBackupPath(string dbPath) {
+  import std.algorithm.searching : endsWith;
+  import std.file : exists;
+  import std.format : format;
+
+  const prefix = dbPath.endsWith(".db")
+    ? dbPath[0 .. $ - 3]
+    : dbPath;
+  ulong idx = 1;
+  while (true) {
+    const candidate = format("%s-backup-%d.db", prefix, idx);
+    if (!exists(candidate)) {
+      return candidate;
+    }
+    idx++;
+  }
+}
+
+bool promptBackupPath(string dbPath, out string chosenPath) {
+  import std.file : exists;
+  import std.stdio : readln, stdout, writef;
+  import std.string : strip;
+
+  while (true) {
+    const proposed = proposeBackupPath(dbPath);
+    writef(
+      "Backup file path [%s] (Enter to accept, Ctrl-C to abort): ",
+      proposed
+    );
+    stdout.flush();
+
+    const line = readln();
+    if (line is null) {
+      stderr.writeln("\nMigration aborted.");
+      return false;
+    }
+
+    const trimmed = line.strip();
+    const candidate = trimmed.length > 0 ? trimmed : proposed;
+    if (exists(candidate)) {
+      stderr.writefln(
+        "File '%s' already exists and will not be overwritten.",
+        candidate
+      );
+      continue;
+    }
+
+    chosenPath = candidate;
+    return true;
+  }
+}
+
+bool writeDatabaseBackup(
+  string dbPath,
+  string backupPath,
+  in OutputOptions opts
+) {
+  import std.file : copy;
+
+  try {
+    ensureDbDirectory(backupPath);
+    copy(dbPath, backupPath);
+    if (opts.format == OutputFormat.console) {
+      writefln("Saved database backup to '%s'.", backupPath);
+    }
+    return true;
+  } catch (Exception e) {
+    stderr.writefln(
+      "Error: Failed to write backup file '%s': %s",
+      backupPath,
+      e.msg
+    );
+    return false;
+  }
+}
+
+int handleMigrateCommand(
+  ref DbContext ctx,
+  string[] args,
+  in OutputOptions opts
+) {
+  MigrateArgs migrateArgs;
+  if (!parseMigrateArgs(args, migrateArgs)) {
+    return 1;
+  }
+
+  if (ctx.dbSchemaVersion == schemaVersion) {
+    if (opts.format == OutputFormat.console) {
+      writefln(
+        "Database schema is already up to date (version %d).",
+        schemaVersion
+      );
+    }
+    return 0;
+  }
+
+  if (ctx.dbSchemaVersion < 0 || ctx.dbSchemaVersion > schemaVersion) {
+    stderr.writefln(
+      "Error: Cannot migrate database from schema version %d to %d.",
+      ctx.dbSchemaVersion,
+      schemaVersion
+    );
+    return 1;
+  }
+
+  if (!migrateArgs.noBackup && ctx.dbPath != ":memory:") {
+    string backupPath;
+    if (!promptBackupPath(ctx.dbPath, backupPath)) {
+      return 1;
+    }
+    if (!writeDatabaseBackup(ctx.dbPath, backupPath, opts)) {
+      return 1;
+    }
+  }
+
+  try {
+    const prevVersion = ctx.dbSchemaVersion;
+    migrateDatabase(ctx.db, prevVersion);
+    ctx.dbSchemaVersion = schemaVersion;
+    ctx.isReadOnly = false;
+    if (opts.format == OutputFormat.console) {
+      writefln(
+        "Migrated database schema from version %d to %d.",
+        prevVersion,
+        schemaVersion
+      );
+    }
+    return 0;
+  } catch (Exception e) {
+    stderr.writefln("Error migrating database: %s", e.msg);
+    return 1;
+  }
 }
 
 bool parseTypeFilter(string val, out EntryType filter) {
@@ -765,20 +996,21 @@ unittest {
 
   // Test command execution on memory db
   Database db = openDatabase(":memory:");
+  DbContext ctx = DbContext(db, ":memory:", schemaVersion, false);
   OutputOptions testOpts;
   testOpts.styler.enabled = false;
 
   // Root commands
   assert(
-    handleRootCommand(db, ["root", "add", "r1", "/mnt/r1"], testOpts) == 0
+    handleRootCommand(ctx, ["root", "add", "r1", "/mnt/r1"], testOpts) == 0
   );
-  assert(handleRootCommand(db, ["root", "list"], testOpts) == 0);
+  assert(handleRootCommand(ctx, ["root", "list"], testOpts) == 0);
   assert(
     handleRootCommand(
-      db, ["root", "set-path", "r1", "/mnt/new"], testOpts
+      ctx, ["root", "set-path", "r1", "/mnt/new"], testOpts
     ) == 0
   );
-  assert(handleRootCommand(db, ["root", "remove", "r1"], testOpts) == 0);
+  assert(handleRootCommand(ctx, ["root", "remove", "r1"], testOpts) == 0);
 
   // Sync commands with empty root and --force
   import std.file : exists, mkdirRecurse, rmdirRecurse, tempDir;
@@ -796,13 +1028,13 @@ unittest {
 
   assert(
     handleRootCommand(
-      db, ["root", "add", "r_temp", syncTempDir], testOpts
+      ctx, ["root", "add", "r_temp", syncTempDir], testOpts
     ) == 0
   );
   // Initially empty directory and empty DB -> returns 0
   assert(
     handleSyncCommand(
-      db, ["sync", "r_temp", "--no-progress"], testOpts
+      ctx, ["sync", "r_temp", "--no-progress"], testOpts
     ) == 0
   );
 
@@ -826,7 +1058,7 @@ unittest {
   // Sync without --force -> fatal error, returns 1
   assert(
     handleSyncCommand(
-      db, ["sync", "r_temp", "--no-progress"], testOpts
+      ctx, ["sync", "r_temp", "--no-progress"], testOpts
     ) == 1
   );
   assert(entryRepo.hasCatalogedEntries(rTemp.id));
@@ -834,7 +1066,7 @@ unittest {
   // Sync with --force -> succeeds, returns 0
   assert(
     handleSyncCommand(
-      db, ["sync", "r_temp", "--force", "--no-progress"], testOpts
+      ctx, ["sync", "r_temp", "--force", "--no-progress"], testOpts
     ) == 0
   );
   assert(!entryRepo.hasCatalogedEntries(rTemp.id));
@@ -852,7 +1084,7 @@ unittest {
   // Returns 1 because errors occurred during sync
   assert(
     handleSyncCommand(
-      db, ["sync", "r_temp", "--no-progress"], testOpts
+      ctx, ["sync", "r_temp", "--no-progress"], testOpts
     ) == 1
   );
   // Verify ok.txt was cataloged
@@ -864,4 +1096,128 @@ unittest {
     }
   }
   assert(foundOk);
+}
+
+unittest {
+  import orglistremo.db.connection : readDbSchemaVersion;
+  import std.file : exists, mkdirRecurse, rmdirRecurse, tempDir, write;
+  import std.path : buildPath;
+  import std.process : execute;
+
+  // Test migrate args parsing
+  MigrateArgs migDefault;
+  assert(parseMigrateArgs(["migrate"], migDefault));
+  assert(!migDefault.noBackup);
+
+  MigrateArgs migNoBackup;
+  assert(parseMigrateArgs(["migrate", "--no-backup"], migNoBackup));
+  assert(migNoBackup.noBackup);
+
+  MigrateArgs migInvalidFlag;
+  assert(!parseMigrateArgs(["migrate", "--unknown"], migInvalidFlag));
+
+  MigrateArgs migInvalidPos;
+  assert(!parseMigrateArgs(["migrate", "extra"], migInvalidPos));
+
+  // Test backup path proposal and read-only / migration workflow
+  const migDir = buildPath(tempDir(), "listremo_app_migrate_test");
+  if (exists(migDir)) {
+    execute(["chmod", "-R", "755", migDir]);
+    rmdirRecurse(migDir);
+  }
+  mkdirRecurse(migDir);
+  scope (exit) {
+    if (exists(migDir)) {
+      execute(["chmod", "-R", "755", migDir]);
+      rmdirRecurse(migDir);
+    }
+  }
+
+  const dbFile = buildPath(migDir, "catalog.db");
+  const backup1 = buildPath(migDir, "catalog-backup-1.db");
+  const backup2 = buildPath(migDir, "catalog-backup-2.db");
+
+  assert(proposeBackupPath(dbFile) == backup1);
+  write(backup1, "existing backup");
+  assert(proposeBackupPath(dbFile) == backup2);
+
+  // Create legacy v0 database with roots and entries
+  {
+    auto rawDb = Database(dbFile);
+    rawDb.execute(`
+      CREATE TABLE roots (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        name        TEXT NOT NULL UNIQUE,
+        path        TEXT NOT NULL,
+        created_at  INTEGER NOT NULL,
+        last_sync   INTEGER
+      );
+    `);
+    rawDb.execute(`
+      CREATE TABLE entries (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        root_id     INTEGER NOT NULL REFERENCES roots(id) ON DELETE CASCADE,
+        rel_path    TEXT NOT NULL,
+        parent_path TEXT,
+        name        TEXT NOT NULL,
+        is_dir      INTEGER NOT NULL,
+        size        INTEGER NOT NULL,
+        mtime       INTEGER NOT NULL,
+        sha256      TEXT NOT NULL,
+        UNIQUE(root_id, rel_path)
+      );
+    `);
+    rawDb.execute(`
+      INSERT INTO roots (name, path, created_at)
+      VALUES ('old_root', '/mnt/old', 1650000000);
+    `);
+    rawDb.close();
+  }
+
+  DbOpenResult openRes = openDatabaseChecked(dbFile);
+  assert(openRes.isReadOnly);
+  assert(openRes.dbSchemaVersion == 0);
+
+  DbContext roCtx = DbContext(
+    openRes.db, dbFile, openRes.dbSchemaVersion, openRes.isReadOnly
+  );
+  OutputOptions opts;
+  opts.styler.enabled = false;
+
+  // Read-only commands succeed
+  assert(dispatchCommand(roCtx, ["root", "list"], opts) == 0);
+  assert(dispatchCommand(roCtx, ["list", "old_root"], opts) == 0);
+  assert(dispatchCommand(roCtx, ["duplicates"], opts) == 0);
+  assert(dispatchCommand(roCtx, ["unique"], opts) == 0);
+
+  // Editing commands are blocked in read-only mode
+  assert(dispatchCommand(roCtx, ["root", "add", "r2", "/mnt/r2"], opts) == 1);
+  assert(dispatchCommand(roCtx, ["root", "remove", "old_root"], opts) == 1);
+  assert(
+    dispatchCommand(
+      roCtx, ["root", "set-path", "old_root", "/mnt/new"], opts
+    ) == 1
+  );
+  assert(dispatchCommand(roCtx, ["sync", "old_root"], opts) == 1);
+
+  // Test writeDatabaseBackup failure preserves original database intact
+  const roBackupDir = buildPath(migDir, "unwritable_dir");
+  mkdirRecurse(roBackupDir);
+  execute(["chmod", "500", roBackupDir]);
+  const badBackupPath = buildPath(roBackupDir, "backup.db");
+  assert(!writeDatabaseBackup(dbFile, badBackupPath, opts));
+  assert(readDbSchemaVersion(roCtx.db) == 0);
+
+  // Migrate with --no-backup upgrades schema and unlocks write commands
+  assert(dispatchCommand(roCtx, ["migrate", "--no-backup"], opts) == 0);
+  assert(!roCtx.isReadOnly);
+  assert(roCtx.dbSchemaVersion == schemaVersion);
+  assert(readDbSchemaVersion(roCtx.db) == schemaVersion);
+
+  // Calling migrate again when already up to date succeeds as no-op
+  assert(dispatchCommand(roCtx, ["migrate", "--no-backup"], opts) == 0);
+
+  // Editing command now works
+  assert(dispatchCommand(roCtx, ["root", "add", "r2", "/mnt/r2"], opts) == 0);
+  roCtx.db.close();
 }

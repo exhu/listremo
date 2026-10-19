@@ -4,5 +4,6 @@
 - Follow custom D code style in codestyle.md
 - In documentation (e.g. *.md) files keep line length 80 columns max.
 - Write agent skills in D and run them with rdmd.
-- Increment schemaVersion in source/orglistremo/db/schema_version.d when
-changing sql tables.
+- Increment schemaVersion in source/orglistremo/db/schema_version.d and update
+  migrateDatabase in source/orglistremo/db/connection.d when changing sql
+  tables.
