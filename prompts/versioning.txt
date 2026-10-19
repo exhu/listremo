@@ -1,0 +1,11 @@
+Implement schema version support into db with migration options (sync disk takes a lot of time to
+waste already collected sha), see related TODO comment in source/orglistremo/db/connection.d
+
+Read schema version when opening an existing database, if the table is missing or the read version differs from app's one (stored as integer value in source/orglistremo/db/schema_version.d) then work in read-only mode only, display a warning message that the schema version does not match the app's one, hint to use migration command, display current
+app's schemaVersion and the one in the db (0 if no version in db). All db editing commands are not available and display an error message when schema versions mismatch.
+
+Add migration command (`migrate`), save a copy of old db before migration (do not overwrite existing
+files, keep asking user to provide a name of a backup file until the file with
+proposed name does not exist, or Ctrl-C to abort. Proposed name pattern:
+"\<old-db-name\>-backup-\<integer-number\>.db", where integer-number is
+incremented until there's no such file in the proposed path), add a cli flag to `migrate` to force ignore saving a backup).
