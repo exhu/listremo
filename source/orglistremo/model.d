@@ -16,7 +16,8 @@ enum SortField {
 
 enum OutputFormat {
   console,
-  csv
+  csv,
+  html
 }
 
 enum ColorMode {

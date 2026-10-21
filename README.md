@@ -9,7 +9,7 @@ Tested on Linux only.
 `listremo` maintains a persistent SQLite catalog of indexed files and
 directories, computes cryptographic hashes, detects duplicate and unique
 entries across drives or within subtrees, and formats output as readable
-console tables or RFC 4180 CSV streams.
+console tables, RFC 4180 CSV streams, or standalone collapsible HTML trees.
 
 The application answers key questions about cataloged storage:
 - What storage roots exist? (`listremo root list`)
@@ -56,6 +56,8 @@ The application answers key questions about cataloged storage:
   - Compact 8-character hashes by default, or full 64-character SHA-256
     hashes via `--full-hash`.
   - Machine-readable RFC 4180 compliant CSV export (`--csv` or `--format csv`).
+  - Standalone HTML with collapsible directory trees (`--html` or
+    `--format html`).
 - Database and storage:
   - SQLite database backend with Write-Ahead Logging (WAL) and foreign keys.
   - Configurable database path via `--db <path>`, `LISTREMO_DB` environment
@@ -66,8 +68,9 @@ The application answers key questions about cataloged storage:
 ### Global Options
 
 - `--db <path>`: Path to SQLite database file.
-- `--format <console|csv>`: Output format (default: `console`).
+- `--format <console|csv|html>`: Output format (default: `console`).
 - `--csv`: Shorthand for `--format csv`.
+- `--html`: Shorthand for `--format html`.
 - `--color <auto|always|never>`: Control ANSI color rendering.
 - `--full-hash`: Display full 64-character SHA-256 hashes in console output.
 

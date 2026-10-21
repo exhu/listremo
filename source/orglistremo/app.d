@@ -89,6 +89,7 @@ struct CliGlobalOptions {
   string cliDb;
   string formatStr = "console";
   bool csvFlag;
+  bool htmlFlag;
   string colorStr = "auto";
   bool fullHash;
   bool showHelp;
@@ -152,8 +153,9 @@ bool parseGlobalOptions(ref string[] args, out CliGlobalOptions globals) {
       config.passThrough,
       config.caseSensitive,
       "db", "Path to SQLite database", &globals.cliDb,
-      "format", "Output format (console or csv)", &globals.formatStr,
+      "format", "Output format (console, csv, html)", &globals.formatStr,
       "csv", "Shortcut for --format csv", &globals.csvFlag,
+      "html", "Shortcut for --format html", &globals.htmlFlag,
       "color", "Color mode (auto, always, never)", &globals.colorStr,
       "full-hash", "Display full 64-char SHA256 in console", &globals.fullHash,
       "busy-timeout", "SQLite busy timeout in ms (default 60000)",
@@ -171,10 +173,17 @@ bool buildOutputOptions(
   in CliGlobalOptions globals,
   out OutputOptions opts
 ) {
-  if (globals.formatStr != "console" && globals.formatStr != "csv") {
+  if (globals.formatStr != "console" && globals.formatStr != "csv" &&
+      globals.formatStr != "html") {
     stderr.writefln(
-      "Invalid --format '%s'. Valid values: console, csv.", globals.formatStr
+      "Invalid --format '%s'. Valid values: console, csv, html.",
+      globals.formatStr
     );
+    return false;
+  }
+
+  if (globals.csvFlag && globals.htmlFlag) {
+    stderr.writeln("Error: Cannot specify both --csv and --html.");
     return false;
   }
 
@@ -193,9 +202,13 @@ bool buildOutputOptions(
     return false;
   }
 
-  opts.format = (globals.csvFlag || globals.formatStr == "csv")
-    ? OutputFormat.csv
-    : OutputFormat.console;
+  if (globals.htmlFlag || globals.formatStr == "html") {
+    opts.format = OutputFormat.html;
+  } else if (globals.csvFlag || globals.formatStr == "csv") {
+    opts.format = OutputFormat.csv;
+  } else {
+    opts.format = OutputFormat.console;
+  }
 
   opts.styler.enabled = (opts.format == OutputFormat.console)
     && shouldColorize(colorMode);
@@ -235,8 +248,9 @@ void printUsage() {
   writeln("  --no-backup                  Skip saving a database backup\n");
   writeln("Global Options:");
   writeln("  --db <path>                  SQLite database path");
-  writeln("  --format <console|csv>       Output format (default: console)");
+  writeln("  --format <console|csv|html>  Output format (default: console)");
   writeln("  --csv                        Shorthand for --format csv");
+  writeln("  --html                       Shorthand for --format html");
   writeln("  --color <auto|always|never>  Control ANSI colors");
   writeln("  --full-hash                  Show full 64-char hashes");
   writeln(
@@ -1061,6 +1075,30 @@ unittest {
   assert(buildOutputOptions(globals, opts));
   assert(opts.format == OutputFormat.csv);
   assert(!opts.styler.enabled);
+
+  // Test html format and flags
+  string[] htmlArgs = ["listremo", "--format", "html"];
+  CliGlobalOptions htmlGlobals;
+  assert(parseGlobalOptions(htmlArgs, htmlGlobals));
+  assert(htmlGlobals.formatStr == "html");
+  OutputOptions htmlOpts;
+  assert(buildOutputOptions(htmlGlobals, htmlOpts));
+  assert(htmlOpts.format == OutputFormat.html);
+
+  string[] htmlFlagArgs = ["listremo", "--html"];
+  CliGlobalOptions htmlFlagGlobals;
+  assert(parseGlobalOptions(htmlFlagArgs, htmlFlagGlobals));
+  assert(htmlFlagGlobals.htmlFlag);
+  OutputOptions htmlFlagOpts;
+  assert(buildOutputOptions(htmlFlagGlobals, htmlFlagOpts));
+  assert(htmlFlagOpts.format == OutputFormat.html);
+
+  // Test conflicting csv and html flags
+  string[] formatConflictArgs = ["listremo", "--csv", "--html"];
+  CliGlobalOptions conflictGlobals;
+  assert(parseGlobalOptions(formatConflictArgs, conflictGlobals));
+  OutputOptions conflictOpts;
+  assert(!buildOutputOptions(conflictGlobals, conflictOpts));
 
   // Test invalid global options
   globals.formatStr = "xml";

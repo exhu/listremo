@@ -1,4 +1,3 @@
-- display tree list as xml, html with collapsible tree
 - add filter options e.g. to display items matching by name, sha256 (using only
   what sqlite can help with)
 - separate app: support thumbnailer as external app to gradually or selectively add
@@ -13,3 +12,5 @@ thumbs.db may yield better performance.
 
 - review source code
 - manually test
+
+- backlog: display tree list as xml?
