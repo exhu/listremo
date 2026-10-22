@@ -21,11 +21,13 @@ struct ListEntriesFilter {
 }
 
 struct HashQueryFilter {
-  bool hasRoot;
-  long rootId;
-  string subpath;
+  bool hasRoot = false;
+  long rootId = 0;
+  string rootPattern = null;
+  string subpath = null;
   EntryType typeFilter = EntryType.file;
-  bool skipEmpty;
+  bool skipEmpty = false;
+  bool useGlob = false;
 }
 
 struct RootRepository {
@@ -634,8 +636,8 @@ private:
     in HashQueryFilter filter,
     string havingClause
   ) {
-    const outerFilters = buildFilterSql(filter, "e.");
-    const innerFilters = buildFilterSql(filter, "");
+    const outerFilters = buildFilterSql(filter, "e.", "r.");
+    const innerFilters = buildFilterSql(filter, "e_sub.", "r_sub.");
 
     const sql = "SELECT " ~
       "e.id, e.root_id, r.name, e.rel_path, e.parent_path, " ~
@@ -644,9 +646,10 @@ private:
       "JOIN roots r ON r.id = e.root_id " ~
       "WHERE " ~ outerFilters ~
       " AND (e.is_dir, e.sha256) IN (" ~
-        "SELECT is_dir, sha256 FROM entries " ~
+        "SELECT e_sub.is_dir, e_sub.sha256 FROM entries e_sub " ~
+        "JOIN roots r_sub ON r_sub.id = e_sub.root_id " ~
         "WHERE " ~ innerFilters ~ " " ~
-        "GROUP BY is_dir, sha256 " ~
+        "GROUP BY e_sub.is_dir, e_sub.sha256 " ~
         "HAVING " ~ havingClause ~
       ") " ~
       "ORDER BY e.size DESC, e.is_dir, e.sha256, r.name, e.rel_path ASC";
@@ -656,46 +659,107 @@ private:
     return readEntries(stmt);
   }
 
-  static string buildFilterSql(in HashQueryFilter filter, string prefix) {
-    string s = prefix ~ "rel_path != '.'";
+  static string buildFilterSql(
+    in HashQueryFilter filter,
+    string entryPrefix,
+    string rootPrefix
+  ) {
+    string s = entryPrefix ~ "rel_path != '.'";
     if (filter.typeFilter == EntryType.file) {
-      s ~= " AND " ~ prefix ~ "is_dir = 0";
+      s ~= " AND " ~ entryPrefix ~ "is_dir = 0";
     } else if (filter.typeFilter == EntryType.dir) {
-      s ~= " AND " ~ prefix ~ "is_dir = 1";
+      s ~= " AND " ~ entryPrefix ~ "is_dir = 1";
     }
 
     if (filter.skipEmpty) {
-      s ~= " AND " ~ prefix ~ "size > 0 AND " ~ prefix ~ "sha256 != '0'";
+      s ~= " AND " ~ entryPrefix ~ "size > 0 AND " ~ entryPrefix ~
+        "sha256 != '0'";
     }
 
     if (filter.hasRoot) {
-      s ~= " AND " ~ prefix ~ "root_id = ?";
-      if (filter.subpath.length > 0) {
-        s ~= " AND (" ~ prefix ~ "rel_path = ? OR " ~
-          prefix ~ "rel_path LIKE ? ESCAPE '\\')";
+      s ~= " AND " ~ entryPrefix ~ "root_id = ?";
+    } else if (filter.rootPattern.length > 0) {
+      if (filter.useGlob) {
+        s ~= " AND " ~ rootPrefix ~ "name GLOB ?";
+      } else {
+        s ~= " AND " ~ rootPrefix ~ "name LIKE ? ESCAPE '\\'";
+      }
+    }
+
+    const hasSubpath = filter.subpath.length > 0;
+    const isSubpathPattern = hasSubpath && (
+      filter.useGlob
+        ? hasGlobWildcard(filter.subpath)
+        : hasPatternWildcard(filter.subpath)
+    );
+    if (hasSubpath) {
+      if (filter.useGlob) {
+        if (isSubpathPattern) {
+          s ~= " AND " ~ entryPrefix ~ "rel_path GLOB ?";
+        } else {
+          s ~= " AND (" ~ entryPrefix ~ "rel_path = ? OR " ~
+            entryPrefix ~ "rel_path GLOB ?)";
+        }
+      } else {
+        if (isSubpathPattern) {
+          s ~= " AND " ~ entryPrefix ~ "rel_path LIKE ? ESCAPE '\\'";
+        } else {
+          s ~= " AND (" ~ entryPrefix ~ "rel_path = ? OR " ~
+            entryPrefix ~ "rel_path LIKE ? ESCAPE '\\')";
+        }
       }
     }
     return s;
+  }
+
+  static void bindFilters(
+    ref Statement stmt,
+    ref int idx,
+    in HashQueryFilter filter
+  ) {
+    if (filter.hasRoot) {
+      stmt.bind(idx++, filter.rootId);
+    } else if (filter.rootPattern.length > 0) {
+      if (filter.useGlob) {
+        stmt.bind(idx++, filter.rootPattern);
+      } else {
+        stmt.bind(idx++, escapeLikePattern(filter.rootPattern));
+      }
+    }
+
+    const hasSubpath = filter.subpath.length > 0;
+    const isSubpathPattern = hasSubpath && (
+      filter.useGlob
+        ? hasGlobWildcard(filter.subpath)
+        : hasPatternWildcard(filter.subpath)
+    );
+    if (hasSubpath) {
+      if (filter.useGlob) {
+        if (isSubpathPattern) {
+          stmt.bind(idx++, filter.subpath);
+        } else {
+          stmt.bind(idx++, filter.subpath);
+          stmt.bind(idx++, filter.subpath ~ "/*");
+        }
+      } else {
+        if (isSubpathPattern) {
+          stmt.bind(idx++, escapeLikePattern(filter.subpath));
+        } else {
+          const unescaped = unescapePatternEscapes(filter.subpath);
+          stmt.bind(idx++, unescaped);
+          stmt.bind(idx++, escapeLike(unescaped) ~ "/%");
+        }
+      }
+    }
   }
 
   static void bindDuplicateOrUniqueParams(
     ref Statement stmt,
     in HashQueryFilter filter
   ) {
-    if (!filter.hasRoot) {
-      return;
-    }
     int idx = 1;
-    stmt.bind(idx++, filter.rootId);
-    if (filter.subpath.length > 0) {
-      stmt.bind(idx++, filter.subpath);
-      stmt.bind(idx++, escapeLike(filter.subpath) ~ "/%");
-    }
-    stmt.bind(idx++, filter.rootId);
-    if (filter.subpath.length > 0) {
-      stmt.bind(idx++, filter.subpath);
-      stmt.bind(idx++, escapeLike(filter.subpath) ~ "/%");
-    }
+    bindFilters(stmt, idx, filter);
+    bindFilters(stmt, idx, filter);
   }
 
   static Entry[] readEntries(ref Statement stmt) {
@@ -1056,4 +1120,56 @@ unittest {
   const combined = entryRepo.listEntries("r1", fGlobAndHash);
   assert(combined.length == 1);
   assert(combined[0].name == "a.jpg");
+
+  // Test listDuplicates and listUnique with patterns across roots
+  Entry[] r2Entries = [
+    Entry(0, r2, "r2", ".", null, ".", true, 10, 1000, "dir2_hash"),
+    Entry(0, r2, "r2", "copy_a.jpg", ".", "copy_a.jpg", false, 30, 1000, "hA")
+  ];
+  entryRepo.saveSyncEntries(r2, r2Entries, 9000);
+
+  // Test listDuplicates with LIKE rootPattern (r1 and r2 match r%)
+  HashQueryFilter fDupLike;
+  fDupLike.rootPattern = "r%";
+  fDupLike.skipEmpty = true;
+  const dupLike = entryRepo.listDuplicates(fDupLike);
+  assert(dupLike.length == 2);
+  assert(dupLike[0].sha256 == "hA");
+  assert(dupLike[1].sha256 == "hA");
+
+  // Test listDuplicates with GLOB rootPattern
+  HashQueryFilter fDupGlob;
+  fDupGlob.rootPattern = "r[12]";
+  fDupGlob.useGlob = true;
+  fDupGlob.skipEmpty = true;
+  const dupGlob = entryRepo.listDuplicates(fDupGlob);
+  assert(dupGlob.length == 2);
+  assert(dupGlob[0].sha256 == "hA");
+
+  // In r1 alone, hA is unique (no duplicates in r1 with skipEmpty)
+  HashQueryFilter fDupR1;
+  fDupR1.rootPattern = "r1";
+  fDupR1.skipEmpty = true;
+  assert(entryRepo.listDuplicates(fDupR1).length == 0);
+
+  // Test listDuplicates with subpath GLOB
+  HashQueryFilter fDupSubGlob;
+  fDupSubGlob.rootPattern = "r1";
+  fDupSubGlob.subpath = "photos/*.jpg";
+  fDupSubGlob.useGlob = true;
+  assert(entryRepo.listDuplicates(fDupSubGlob).length == 0);
+
+  // Test listUnique with LIKE rootPattern
+  HashQueryFilter fUniqLike;
+  fUniqLike.rootPattern = "r1";
+  fUniqLike.subpath = "photos";
+  fUniqLike.skipEmpty = true;
+  const uniqPhotos = entryRepo.listUnique(fUniqLike);
+  assert(uniqPhotos.length == 2); // a.jpg and b.jpg
+
+  // Test listUnique with GLOB rootPattern and case-sensitivity
+  HashQueryFilter fUniqCase;
+  fUniqCase.rootPattern = "R*";
+  fUniqCase.useGlob = true;
+  assert(entryRepo.listUnique(fUniqCase).length == 0);
 }

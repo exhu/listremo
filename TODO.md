@@ -1,3 +1,11 @@
+- make `list`, `duplicates`, `unique` commands accept not only one but many patterns,
+e.g. `listremo list disks% copies:/disks` will display items matching
+first pattern, then items matching the second pattern;
+`listremo duplicates disks% copies:/disks` will display only those
+two or more items from both patterns that have the same hash value;
+`listremo unique disks% copies:/disks` will display only those
+items from both patterns that have unique hash value.
+
 - separate app: support thumbnailer as external app to gradually or
 selectively add thumbnails, e.g. list a path to rescan adding missing or
 regenerating outdated (or forced) thumbnails, it's a good idea to have a

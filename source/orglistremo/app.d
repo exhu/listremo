@@ -124,6 +124,7 @@ struct DuplicateOrUniqueArgs {
   string target;
   EntryType typeFilter = EntryType.file;
   bool skipEmpty;
+  bool useGlob;
 }
 
 void printSchemaMismatchWarning(int dbSchemaVer) {
@@ -266,6 +267,17 @@ void printUsage() {
   );
   writeln(
     "  --sort <path|size|mtime>     Sort entries (default: path)\n"
+  );
+  writeln("Duplicates & Unique Options:");
+  writeln(
+    "  --glob                       Match target with SQLite GLOB (*, ?, " ~
+    "[...])"
+  );
+  writeln(
+    "  --type <all|file|dir>        Filter entry type (default: file)"
+  );
+  writeln(
+    "  --skip-empty                 Skip empty files and directories\n"
   );
   writeln("Sync Options:");
   writeln(
@@ -1073,6 +1085,8 @@ bool parseDuplicateOrUniqueArgs(
       if (!parseTypeFilter(args[++i], parsed.typeFilter)) {
         return false;
       }
+    } else if (arg == "--glob") {
+      parsed.useGlob = true;
     } else if (arg == "--skip-empty") {
       parsed.skipEmpty = true;
     } else if (arg.length > 0 && arg[0] == '-') {
@@ -1096,21 +1110,33 @@ bool resolveHashQueryFilter(
 ) {
   filter.typeFilter = args.typeFilter;
   filter.skipEmpty = args.skipEmpty;
+  filter.useGlob = args.useGlob;
 
   if (args.target.length == 0) {
     filter.hasRoot = false;
+    filter.rootPattern = null;
+    filter.subpath = null;
     return true;
   }
 
-  const spec = TargetSpec.parse(args.target);
-  Root root;
-  if (!rootRepo.findByName(spec.rootName, root)) {
-    stderr.writefln("Error: Root '%s' not found.", spec.rootName);
+  const spec = TargetSpec.parse(args.target, args.useGlob);
+  const matched = args.useGlob
+    ? rootRepo.findByGlob(spec.rootName)
+    : rootRepo.findByPattern(spec.rootName);
+  if (matched.length == 0) {
+    const isWildcard = args.useGlob
+      ? hasGlobWildcard(spec.rootName)
+      : hasPatternWildcard(spec.rootName);
+    if (isWildcard) {
+      stderr.writefln("Error: No roots match pattern '%s'.", spec.rootName);
+    } else {
+      stderr.writefln("Error: Root '%s' not found.", spec.rootName);
+    }
     return false;
   }
 
-  filter.hasRoot = true;
-  filter.rootId = root.id;
+  filter.hasRoot = false;
+  filter.rootPattern = spec.rootName;
   filter.subpath = spec.hasSubpath ? spec.subpath : null;
   return true;
 }
@@ -1317,6 +1343,15 @@ unittest {
   );
   assert(dupArgs.typeFilter == EntryType.all);
   assert(dupArgs.skipEmpty);
+
+  DuplicateOrUniqueArgs dupGlobArgs;
+  assert(
+    parseDuplicateOrUniqueArgs(
+      "duplicates", ["duplicates", "r*", "--glob"], dupGlobArgs
+    )
+  );
+  assert(dupGlobArgs.target == "r*");
+  assert(dupGlobArgs.useGlob);
 
   DuplicateOrUniqueArgs dupUnknown;
   assert(
@@ -1732,4 +1767,36 @@ unittest {
 
   // Alias 'files'
   assert(dispatchCommand(ctx, ["files", "--hash", "0"], opts) == 0);
+
+  // 5. Test duplicates with pattern and --glob
+  assert(dispatchCommand(ctx, ["duplicates", "alpha%"], opts) == 0);
+  assert(
+    dispatchCommand(ctx, ["duplicates", "alpha*", "--glob"], opts) == 0
+  );
+  assert(
+    dispatchCommand(ctx, ["duplicates", "alpha_[12]", "--glob"], opts) == 0
+  );
+  assert(dispatchCommand(ctx, ["duplicates", "alpha_1:/"], opts) == 0);
+  assert(dispatchCommand(ctx, ["duplicates", ":/", "--glob"], opts) == 0);
+  assert(
+    dispatchCommand(ctx, ["duplicates", "ALPHA*", "--glob"], opts) == 1
+  );
+  assert(dispatchCommand(ctx, ["duplicates", "nonexistent%"], opts) == 1);
+  assert(dispatchCommand(ctx, ["duplicates", "nonexistent"], opts) == 1);
+
+  // 6. Test unique with pattern and --glob
+  assert(dispatchCommand(ctx, ["unique", "alpha%"], opts) == 0);
+  assert(
+    dispatchCommand(ctx, ["unique", "alpha*", "--glob"], opts) == 0
+  );
+  assert(
+    dispatchCommand(ctx, ["unique", "alpha_[12]", "--glob"], opts) == 0
+  );
+  assert(dispatchCommand(ctx, ["unique", "alpha_1:/"], opts) == 0);
+  assert(dispatchCommand(ctx, ["unique", ":/", "--glob"], opts) == 0);
+  assert(
+    dispatchCommand(ctx, ["unique", "ALPHA*", "--glob"], opts) == 1
+  );
+  assert(dispatchCommand(ctx, ["unique", "nonexistent%"], opts) == 1);
+  assert(dispatchCommand(ctx, ["unique", "nonexistent"], opts) == 1);
 }

@@ -85,10 +85,16 @@ The application answers key questions about cataloged storage:
 - `listremo list <target> [--type file|dir|all] [--sort path|size|mtime]`:
   List cataloged entries (alias: `files`). Target format is `<root>` or
   `<root>:/<subpath>`.
-- `listremo duplicates [<target>] [--type file|dir|all] [--skip-empty]`:
+- `listremo duplicates [<target>] [opts]` (options: `--glob`,
+  `--type file|dir|all`, `--skip-empty`):
   Find duplicate files or directories across all roots or within `<target>`.
-- `listremo unique [<target>] [--type file|dir|all] [--skip-empty]`:
+  `<target>` supports `LIKE` or `GLOB` pattern matching across selected roots
+  and subtrees.
+- `listremo unique [<target>] [opts]` (options: `--glob`, `--type file|dir|all`,
+  `--skip-empty`):
   Find unique files or directories across all roots or within `<target>`.
+  `<target>` supports `LIKE` or `GLOB` pattern matching across selected roots
+  and subtrees.
 - `listremo migrate [--no-backup]`:
   Migrate database schema to the current application version (prompts to save a
   backup file unless `--no-backup` is specified).
