@@ -112,7 +112,7 @@ struct MigrateArgs {
 }
 
 struct ListArgs {
-  string target;
+  string[] targets;
   EntryType typeFilter = EntryType.all;
   SortField sortField = SortField.path;
   bool useGlob;
@@ -121,7 +121,7 @@ struct ListArgs {
 }
 
 struct DuplicateOrUniqueArgs {
-  string target;
+  string[] targets;
   EntryType typeFilter = EntryType.file;
   bool skipEmpty;
   bool useGlob;
@@ -231,13 +231,13 @@ void printUsage() {
   writeln("  root list [pattern]          List registered storage roots");
   writeln("  sync <name|pattern> [opts]   Synchronize a storage root");
   writeln("  sync --all [pattern] [opts]  Synchronize matching storage roots");
-  writeln("  list [<target>] [options]    List files & dirs (alias: files)");
-  writeln("  duplicates [<target>] [opts] Find duplicate files/dirs");
-  writeln("  unique [<target>] [options]  Find unique files/dirs");
+  writeln("  list [<target>...] [opts]    List files & dirs (alias: files)");
+  writeln("  duplicates [<target>...]     Find duplicate files/dirs");
+  writeln("  unique [<target>...]         Find unique files/dirs");
   writeln("  migrate [--no-backup]        Migrate database schema\n");
   writeln("List Options & Target Syntax:");
   writeln(
-    "  <target>                     Target root and optional path:"
+    "  <target>...                  One or more target roots / paths:"
   );
   writeln(
     "                                 <root>         e.g. backup"
@@ -1012,22 +1012,40 @@ bool parseListArgs(string[] args, out ListArgs parsed) {
         );
         return false;
       }
-      if (parsed.target.length > 0) {
-        stderr.writefln("Unexpected argument '%s'.", arg);
-        return false;
-      }
-      parsed.target = arg;
+      parsed.targets ~= arg;
     }
   }
 
-  if (parsed.target.length == 0 && !parsed.hasHash) {
+  if (parsed.targets.length == 0 && !parsed.hasHash) {
     stderr.writeln(
-      "Usage: listremo list [<target>] [--hash <pattern>] [--glob] " ~
+      "Usage: listremo list [<target>...] [--hash <pattern>] [--glob] " ~
       "[--type all|file|dir] [--sort path|size|mtime]"
     );
     return false;
   }
   return true;
+}
+
+bool validateTargetRoot(
+  ref RootRepository rootRepo,
+  string rootName,
+  bool useGlob
+) {
+  const matched = useGlob
+    ? rootRepo.findByGlob(rootName)
+    : rootRepo.findByPattern(rootName);
+  if (matched.length > 0) {
+    return true;
+  }
+  const isWildcard = useGlob
+    ? hasGlobWildcard(rootName)
+    : hasPatternWildcard(rootName);
+  if (isWildcard) {
+    stderr.writefln("Error: No roots match pattern '%s'.", rootName);
+  } else {
+    stderr.writefln("Error: Root '%s' not found.", rootName);
+  }
+  return false;
 }
 
 int handleListCommand(
@@ -1040,33 +1058,42 @@ int handleListCommand(
     return 1;
   }
 
-  const spec = TargetSpec.parse(listArgs.target, listArgs.useGlob);
+  const rawTargets = listArgs.targets.length > 0
+    ? listArgs.targets
+    : [""];
+
   RootRepository rootRepo = RootRepository(db);
-  const matched = listArgs.useGlob
-    ? rootRepo.findByGlob(spec.rootName)
-    : rootRepo.findByPattern(spec.rootName);
-  if (matched.length == 0) {
-    const isWildcard = listArgs.useGlob
-      ? hasGlobWildcard(spec.rootName)
-      : hasPatternWildcard(spec.rootName);
-    if (isWildcard) {
-      stderr.writefln("Error: No roots match pattern '%s'.", spec.rootName);
-    } else {
-      stderr.writefln("Error: Root '%s' not found.", spec.rootName);
+  TargetSpec[] specs;
+  foreach (t; rawTargets) {
+    const spec = TargetSpec.parse(t, listArgs.useGlob);
+    if (!validateTargetRoot(rootRepo, spec.rootName, listArgs.useGlob)) {
+      return 1;
     }
-    return 1;
+    specs ~= spec;
   }
 
   EntryRepository entryRepo = EntryRepository(db);
-  ListEntriesFilter filter;
-  filter.subpath = spec.hasSubpath ? spec.subpath : null;
-  filter.typeFilter = listArgs.typeFilter;
-  filter.sort = listArgs.sortField;
-  filter.useGlob = listArgs.useGlob;
-  filter.hashPattern = listArgs.hasHash ? listArgs.hashPattern : null;
+  Entry[] allEntries;
+  bool[long] seenIds;
 
-  const entries = entryRepo.listEntries(spec.rootName, filter);
-  outputEntries(entries, opts);
+  foreach (ref spec; specs) {
+    ListEntriesFilter filter;
+    filter.subpath = spec.hasSubpath ? spec.subpath : null;
+    filter.typeFilter = listArgs.typeFilter;
+    filter.sort = listArgs.sortField;
+    filter.useGlob = listArgs.useGlob;
+    filter.hashPattern = listArgs.hasHash ? listArgs.hashPattern : null;
+
+    const batch = entryRepo.listEntries(spec.rootName, filter);
+    foreach (ref e; batch) {
+      if (e.id !in seenIds) {
+        seenIds[e.id] = true;
+        allEntries ~= e;
+      }
+    }
+  }
+
+  outputEntries(allEntries, opts);
   return 0;
 }
 
@@ -1093,11 +1120,7 @@ bool parseDuplicateOrUniqueArgs(
       stderr.writefln("Unknown flag '%s' for %s.", arg, cmdName);
       return false;
     } else {
-      if (parsed.target.length > 0) {
-        stderr.writefln("Unexpected argument '%s'.", arg);
-        return false;
-      }
-      parsed.target = arg;
+      parsed.targets ~= arg;
     }
   }
   return true;
@@ -1111,33 +1134,21 @@ bool resolveHashQueryFilter(
   filter.typeFilter = args.typeFilter;
   filter.skipEmpty = args.skipEmpty;
   filter.useGlob = args.useGlob;
+  filter.hasRoot = false;
+  filter.rootPattern = null;
+  filter.subpath = null;
 
-  if (args.target.length == 0) {
-    filter.hasRoot = false;
-    filter.rootPattern = null;
-    filter.subpath = null;
+  if (args.targets.length == 0) {
     return true;
   }
 
-  const spec = TargetSpec.parse(args.target, args.useGlob);
-  const matched = args.useGlob
-    ? rootRepo.findByGlob(spec.rootName)
-    : rootRepo.findByPattern(spec.rootName);
-  if (matched.length == 0) {
-    const isWildcard = args.useGlob
-      ? hasGlobWildcard(spec.rootName)
-      : hasPatternWildcard(spec.rootName);
-    if (isWildcard) {
-      stderr.writefln("Error: No roots match pattern '%s'.", spec.rootName);
-    } else {
-      stderr.writefln("Error: Root '%s' not found.", spec.rootName);
+  foreach (t; args.targets) {
+    const spec = TargetSpec.parse(t, args.useGlob);
+    if (!validateTargetRoot(rootRepo, spec.rootName, args.useGlob)) {
+      return false;
     }
-    return false;
+    filter.targets ~= spec;
   }
-
-  filter.hasRoot = false;
-  filter.rootPattern = spec.rootName;
-  filter.subpath = spec.hasSubpath ? spec.subpath : null;
   return true;
 }
 
@@ -1321,10 +1332,11 @@ unittest {
   ListArgs listArgs;
   assert(
     parseListArgs(
-      ["list", "myroot", "--type", "file", "--sort", "size"], listArgs
+      ["list", "myroot", "other:/sub", "--type", "file", "--sort", "size"],
+      listArgs
     )
   );
-  assert(listArgs.target == "myroot");
+  assert(listArgs.targets == ["myroot", "other:/sub"]);
   assert(listArgs.typeFilter == EntryType.file);
   assert(listArgs.sortField == SortField.size);
 
@@ -1347,10 +1359,10 @@ unittest {
   DuplicateOrUniqueArgs dupGlobArgs;
   assert(
     parseDuplicateOrUniqueArgs(
-      "duplicates", ["duplicates", "r*", "--glob"], dupGlobArgs
+      "duplicates", ["duplicates", "r*", "b*:/sub", "--glob"], dupGlobArgs
     )
   );
-  assert(dupGlobArgs.target == "r*");
+  assert(dupGlobArgs.targets == ["r*", "b*:/sub"]);
   assert(dupGlobArgs.useGlob);
 
   DuplicateOrUniqueArgs dupUnknown;
@@ -1727,27 +1739,34 @@ unittest {
     dispatchCommand(ctx, ["list", "--hash", "0", "alpha_1"], opts) == 1
   );
 
-  // Unexpected second positional argument
+  // Multiple target patterns succeed; fail if any pattern matches no root
   assert(
-    dispatchCommand(ctx, ["list", "alpha_1", "extra"], opts) == 1
+    dispatchCommand(ctx, ["list", "alpha%", "beta"], opts) == 0
+  );
+  assert(
+    dispatchCommand(ctx, ["list", "alpha%", "nonexistent"], opts) == 1
   );
 
   // --hash across all roots without target
   assert(dispatchCommand(ctx, ["list", "--hash", "0"], opts) == 0);
   assert(dispatchCommand(ctx, ["list", "--hash", "e3b0%"], opts) == 0);
 
-  // --hash with target preceding it
+  // --hash with target(s) preceding it
   assert(
     dispatchCommand(ctx, ["list", "alpha_1", "--hash", "0"], opts) == 0
   );
   assert(
-    dispatchCommand(ctx, ["list", "alpha_1:/", "--hash", "0"], opts) == 0
+    dispatchCommand(
+      ctx, ["list", "alpha_1:/", "beta", "--hash", "0"], opts
+    ) == 0
   );
 
   // --glob matching
   assert(dispatchCommand(ctx, ["list", "alpha*", "--glob"], opts) == 0);
   assert(
-    dispatchCommand(ctx, ["list", "alpha_[12]", "--glob"], opts) == 0
+    dispatchCommand(
+      ctx, ["list", "alpha_[12]", "beta", "--glob"], opts
+    ) == 0
   );
   assert(
     dispatchCommand(ctx, ["list", "alpha_1:*", "--glob"], opts) == 0
@@ -1768,13 +1787,18 @@ unittest {
   // Alias 'files'
   assert(dispatchCommand(ctx, ["files", "--hash", "0"], opts) == 0);
 
-  // 5. Test duplicates with pattern and --glob
+  // 5. Test duplicates with pattern(s) and --glob
   assert(dispatchCommand(ctx, ["duplicates", "alpha%"], opts) == 0);
+  assert(
+    dispatchCommand(ctx, ["duplicates", "alpha%", "beta"], opts) == 0
+  );
   assert(
     dispatchCommand(ctx, ["duplicates", "alpha*", "--glob"], opts) == 0
   );
   assert(
-    dispatchCommand(ctx, ["duplicates", "alpha_[12]", "--glob"], opts) == 0
+    dispatchCommand(
+      ctx, ["duplicates", "alpha_[12]", "beta", "--glob"], opts
+    ) == 0
   );
   assert(dispatchCommand(ctx, ["duplicates", "alpha_1:/"], opts) == 0);
   assert(dispatchCommand(ctx, ["duplicates", ":/", "--glob"], opts) == 0);
@@ -1783,14 +1807,24 @@ unittest {
   );
   assert(dispatchCommand(ctx, ["duplicates", "nonexistent%"], opts) == 1);
   assert(dispatchCommand(ctx, ["duplicates", "nonexistent"], opts) == 1);
+  assert(
+    dispatchCommand(
+      ctx, ["duplicates", "alpha%", "nonexistent"], opts
+    ) == 1
+  );
 
-  // 6. Test unique with pattern and --glob
+  // 6. Test unique with pattern(s) and --glob
   assert(dispatchCommand(ctx, ["unique", "alpha%"], opts) == 0);
+  assert(
+    dispatchCommand(ctx, ["unique", "alpha%", "beta"], opts) == 0
+  );
   assert(
     dispatchCommand(ctx, ["unique", "alpha*", "--glob"], opts) == 0
   );
   assert(
-    dispatchCommand(ctx, ["unique", "alpha_[12]", "--glob"], opts) == 0
+    dispatchCommand(
+      ctx, ["unique", "alpha_[12]", "beta", "--glob"], opts
+    ) == 0
   );
   assert(dispatchCommand(ctx, ["unique", "alpha_1:/"], opts) == 0);
   assert(dispatchCommand(ctx, ["unique", ":/", "--glob"], opts) == 0);
@@ -1799,4 +1833,9 @@ unittest {
   );
   assert(dispatchCommand(ctx, ["unique", "nonexistent%"], opts) == 1);
   assert(dispatchCommand(ctx, ["unique", "nonexistent"], opts) == 1);
+  assert(
+    dispatchCommand(
+      ctx, ["unique", "alpha%", "nonexistent"], opts
+    ) == 1
+  );
 }

@@ -82,19 +82,18 @@ The application answers key questions about cataloged storage:
 - `listremo root list`: List all registered storage roots and summary stats.
 - `listremo sync <name> [--force-hash]`: Synchronize a specific storage root.
 - `listremo sync --all [--force-hash]`: Synchronize all storage roots.
-- `listremo list <target> [--type file|dir|all] [--sort path|size|mtime]`:
-  List cataloged entries (alias: `files`). Target format is `<root>` or
-  `<root>:/<subpath>`.
-- `listremo duplicates [<target>] [opts]` (options: `--glob`,
+- `listremo list [<target>...] [--hash <pattern>] [--glob]`
+  `[--type file|dir|all] [--sort path|size|mtime]`:
+  List cataloged entries (alias: `files`). Target format is `<root>`,
+  `<root>:/<subpath>`, or `:/<subpath>` (multiple targets are listed in order).
+- `listremo duplicates [<target>...] [opts]` (options: `--glob`,
   `--type file|dir|all`, `--skip-empty`):
-  Find duplicate files or directories across all roots or within `<target>`.
-  `<target>` supports `LIKE` or `GLOB` pattern matching across selected roots
-  and subtrees.
-- `listremo unique [<target>] [opts]` (options: `--glob`, `--type file|dir|all`,
-  `--skip-empty`):
-  Find unique files or directories across all roots or within `<target>`.
-  `<target>` supports `LIKE` or `GLOB` pattern matching across selected roots
-  and subtrees.
+  Find duplicate files or directories across all roots or across the specified
+  `<target>` patterns (`LIKE` or `GLOB`).
+- `listremo unique [<target>...] [opts]` (options: `--glob`,
+  `--type file|dir|all`, `--skip-empty`):
+  Find unique files or directories across all roots or across the specified
+  `<target>` patterns (`LIKE` or `GLOB`).
 - `listremo migrate [--no-backup]`:
   Migrate database schema to the current application version (prompts to save a
   backup file unless `--no-backup` is specified).

@@ -3,7 +3,7 @@ module orglistremo.db.repo;
 import d2sqlite3 : Database, Row, SqliteType, Statement;
 import orglistremo.model :
   DuplicateGroup, Entry, EntryType, hasGlobWildcard, hasPatternWildcard, Root,
-  RootSummary, SortField, unescapePatternEscapes;
+  RootSummary, SortField, TargetSpec, unescapePatternEscapes;
 import std.datetime.systime : Clock;
 
 struct CachedFileEntry {
@@ -25,6 +25,7 @@ struct HashQueryFilter {
   long rootId = 0;
   string rootPattern = null;
   string subpath = null;
+  TargetSpec[] targets;
   EntryType typeFilter = EntryType.file;
   bool skipEmpty = false;
   bool useGlob = false;
@@ -676,6 +677,24 @@ private:
         "sha256 != '0'";
     }
 
+    if (filter.targets.length > 0) {
+      s ~= " AND (";
+      foreach (i, ref t; filter.targets) {
+        if (i > 0) {
+          s ~= " OR ";
+        }
+        s ~= "(" ~ buildSingleTargetSql(
+          t.rootName,
+          t.hasSubpath ? t.subpath : null,
+          filter.useGlob,
+          entryPrefix,
+          rootPrefix
+        ) ~ ")";
+      }
+      s ~= ")";
+      return s;
+    }
+
     if (filter.hasRoot) {
       s ~= " AND " ~ entryPrefix ~ "root_id = ?";
     } else if (filter.rootPattern.length > 0) {
@@ -686,30 +705,50 @@ private:
       }
     }
 
-    const hasSubpath = filter.subpath.length > 0;
-    const isSubpathPattern = hasSubpath && (
-      filter.useGlob
-        ? hasGlobWildcard(filter.subpath)
-        : hasPatternWildcard(filter.subpath)
-    );
-    if (hasSubpath) {
-      if (filter.useGlob) {
-        if (isSubpathPattern) {
-          s ~= " AND " ~ entryPrefix ~ "rel_path GLOB ?";
-        } else {
-          s ~= " AND (" ~ entryPrefix ~ "rel_path = ? OR " ~
-            entryPrefix ~ "rel_path GLOB ?)";
-        }
-      } else {
-        if (isSubpathPattern) {
-          s ~= " AND " ~ entryPrefix ~ "rel_path LIKE ? ESCAPE '\\'";
-        } else {
-          s ~= " AND (" ~ entryPrefix ~ "rel_path = ? OR " ~
-            entryPrefix ~ "rel_path LIKE ? ESCAPE '\\')";
-        }
-      }
+    if (filter.subpath.length > 0) {
+      s ~= " AND " ~ buildSubpathSql(
+        filter.subpath, filter.useGlob, entryPrefix
+      );
     }
     return s;
+  }
+
+  static string buildSingleTargetSql(
+    string rootPattern,
+    string subpath,
+    bool useGlob,
+    string entryPrefix,
+    string rootPrefix
+  ) {
+    string s = useGlob
+      ? (rootPrefix ~ "name GLOB ?")
+      : (rootPrefix ~ "name LIKE ? ESCAPE '\\'");
+    if (subpath.length > 0) {
+      s ~= " AND " ~ buildSubpathSql(subpath, useGlob, entryPrefix);
+    }
+    return s;
+  }
+
+  static string buildSubpathSql(
+    string subpath,
+    bool useGlob,
+    string entryPrefix
+  ) {
+    const isPattern = useGlob
+      ? hasGlobWildcard(subpath)
+      : hasPatternWildcard(subpath);
+    if (useGlob) {
+      if (isPattern) {
+        return entryPrefix ~ "rel_path GLOB ?";
+      }
+      return "(" ~ entryPrefix ~ "rel_path = ? OR " ~
+        entryPrefix ~ "rel_path GLOB ?)";
+    }
+    if (isPattern) {
+      return entryPrefix ~ "rel_path LIKE ? ESCAPE '\\'";
+    }
+    return "(" ~ entryPrefix ~ "rel_path = ? OR " ~
+      entryPrefix ~ "rel_path LIKE ? ESCAPE '\\')";
   }
 
   static void bindFilters(
@@ -717,6 +756,19 @@ private:
     ref int idx,
     in HashQueryFilter filter
   ) {
+    if (filter.targets.length > 0) {
+      foreach (ref t; filter.targets) {
+        bindSingleTarget(
+          stmt,
+          idx,
+          t.rootName,
+          t.hasSubpath ? t.subpath : null,
+          filter.useGlob
+        );
+      }
+      return;
+    }
+
     if (filter.hasRoot) {
       stmt.bind(idx++, filter.rootId);
     } else if (filter.rootPattern.length > 0) {
@@ -727,28 +779,51 @@ private:
       }
     }
 
-    const hasSubpath = filter.subpath.length > 0;
-    const isSubpathPattern = hasSubpath && (
-      filter.useGlob
-        ? hasGlobWildcard(filter.subpath)
-        : hasPatternWildcard(filter.subpath)
-    );
-    if (hasSubpath) {
-      if (filter.useGlob) {
-        if (isSubpathPattern) {
-          stmt.bind(idx++, filter.subpath);
-        } else {
-          stmt.bind(idx++, filter.subpath);
-          stmt.bind(idx++, filter.subpath ~ "/*");
-        }
+    if (filter.subpath.length > 0) {
+      bindSubpath(stmt, idx, filter.subpath, filter.useGlob);
+    }
+  }
+
+  static void bindSingleTarget(
+    ref Statement stmt,
+    ref int idx,
+    string rootPattern,
+    string subpath,
+    bool useGlob
+  ) {
+    if (useGlob) {
+      stmt.bind(idx++, rootPattern);
+    } else {
+      stmt.bind(idx++, escapeLikePattern(rootPattern));
+    }
+    if (subpath.length > 0) {
+      bindSubpath(stmt, idx, subpath, useGlob);
+    }
+  }
+
+  static void bindSubpath(
+    ref Statement stmt,
+    ref int idx,
+    string subpath,
+    bool useGlob
+  ) {
+    const isPattern = useGlob
+      ? hasGlobWildcard(subpath)
+      : hasPatternWildcard(subpath);
+    if (useGlob) {
+      if (isPattern) {
+        stmt.bind(idx++, subpath);
       } else {
-        if (isSubpathPattern) {
-          stmt.bind(idx++, escapeLikePattern(filter.subpath));
-        } else {
-          const unescaped = unescapePatternEscapes(filter.subpath);
-          stmt.bind(idx++, unescaped);
-          stmt.bind(idx++, escapeLike(unescaped) ~ "/%");
-        }
+        stmt.bind(idx++, subpath);
+        stmt.bind(idx++, subpath ~ "/*");
+      }
+    } else {
+      if (isPattern) {
+        stmt.bind(idx++, escapeLikePattern(subpath));
+      } else {
+        const unescaped = unescapePatternEscapes(subpath);
+        stmt.bind(idx++, unescaped);
+        stmt.bind(idx++, escapeLike(unescaped) ~ "/%");
       }
     }
   }
@@ -1172,4 +1247,31 @@ unittest {
   fUniqCase.rootPattern = "R*";
   fUniqCase.useGlob = true;
   assert(entryRepo.listUnique(fUniqCase).length == 0);
+
+  // Test multiple targets in HashQueryFilter for listDuplicates and listUnique
+  HashQueryFilter fMultiDup;
+  fMultiDup.targets = [
+    TargetSpec.parse("r1:/photos"),
+    TargetSpec.parse("r2:/")
+  ];
+  fMultiDup.skipEmpty = true;
+  const multiDups = entryRepo.listDuplicates(fMultiDup);
+  assert(multiDups.length == 2); // r1:/photos/a.jpg and r2:/copy_a.jpg (hA)
+  assert(multiDups[0].sha256 == "hA");
+  assert(multiDups[1].sha256 == "hA");
+
+  // Unique across r1:/photos and r2:/ is only r1:/photos/b.jpg (hB)
+  const multiUniq = entryRepo.listUnique(fMultiDup);
+  assert(multiUniq.length == 1);
+  assert(multiUniq[0].name == "b.jpg");
+  assert(multiUniq[0].sha256 == "hB");
+
+  // Overlapping targets in HashQueryFilter do not duplicate a single row
+  HashQueryFilter fOverlapDup;
+  fOverlapDup.targets = [
+    TargetSpec.parse("r1"),
+    TargetSpec.parse("r1:/photos")
+  ];
+  fOverlapDup.skipEmpty = true;
+  assert(entryRepo.listDuplicates(fOverlapDup).length == 0);
 }
