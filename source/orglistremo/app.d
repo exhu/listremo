@@ -10,8 +10,8 @@ import orglistremo.db.repo_locks :
   isPidAlive, SyncLockInfo, SyncLockRepository;
 import orglistremo.db.schema_version : schemaVersion;
 import orglistremo.model :
-  ColorMode, Entry, EntryType, hasPatternWildcard, OutputFormat, Root,
-  RootSummary, SortField, TargetSpec;
+  ColorMode, Entry, EntryType, hasGlobWildcard, hasPatternWildcard,
+  OutputFormat, Root, RootSummary, SortField, TargetSpec;
 import orglistremo.output.console :
   ConsoleProgressReporter, OutputOptions, shouldColorize, Styler;
 import orglistremo.output.formatter :
@@ -115,6 +115,9 @@ struct ListArgs {
   string target;
   EntryType typeFilter = EntryType.all;
   SortField sortField = SortField.path;
+  bool useGlob;
+  string hashPattern;
+  bool hasHash;
 }
 
 struct DuplicateOrUniqueArgs {
@@ -227,10 +230,43 @@ void printUsage() {
   writeln("  root list [pattern]          List registered storage roots");
   writeln("  sync <name|pattern> [opts]   Synchronize a storage root");
   writeln("  sync --all [pattern] [opts]  Synchronize matching storage roots");
-  writeln("  list <target> [options]      List files & dirs (alias: files)");
+  writeln("  list [<target>] [options]    List files & dirs (alias: files)");
   writeln("  duplicates [<target>] [opts] Find duplicate files/dirs");
   writeln("  unique [<target>] [options]  Find unique files/dirs");
   writeln("  migrate [--no-backup]        Migrate database schema\n");
+  writeln("List Options & Target Syntax:");
+  writeln(
+    "  <target>                     Target root and optional path:"
+  );
+  writeln(
+    "                                 <root>         e.g. backup"
+  );
+  writeln(
+    "                                 <root>:/<path> e.g. backup:/photos"
+  );
+  writeln(
+    "                                 :/<path>       across all roots"
+  );
+  writeln(
+    "                               Wildcards: % (LIKE) or * (with --glob)."
+  );
+  writeln(
+    "                               Target is optional before --hash."
+  );
+  writeln(
+    "  --glob                       Match target with SQLite GLOB (*, ?, " ~
+    "[...])"
+  );
+  writeln(
+    "  --hash <pattern>             Filter entries by SHA-256 via SQLite " ~
+    "LIKE"
+  );
+  writeln(
+    "  --type <all|file|dir>        Filter entry type (default: all)"
+  );
+  writeln(
+    "  --sort <path|size|mtime>     Sort entries (default: path)\n"
+  );
   writeln("Sync Options:");
   writeln(
     "  --force                      Sync when root path is empty but " ~
@@ -944,10 +980,26 @@ bool parseListArgs(string[] args, out ListArgs parsed) {
       if (!parseSortField(args[++i], parsed.sortField)) {
         return false;
       }
+    } else if (arg == "--glob") {
+      parsed.useGlob = true;
+    } else if (arg == "--hash") {
+      if (i + 1 >= args.length) {
+        stderr.writeln("Error: Missing value for --hash option.");
+        return false;
+      }
+      parsed.hasHash = true;
+      parsed.hashPattern = args[++i];
     } else if (arg.length > 0 && arg[0] == '-') {
       stderr.writefln("Unknown flag '%s' for list.", arg);
       return false;
     } else {
+      if (parsed.hasHash) {
+        stderr.writefln(
+          "Unexpected argument '%s'. Target path must be passed before --hash.",
+          arg
+        );
+        return false;
+      }
       if (parsed.target.length > 0) {
         stderr.writefln("Unexpected argument '%s'.", arg);
         return false;
@@ -956,10 +1008,10 @@ bool parseListArgs(string[] args, out ListArgs parsed) {
     }
   }
 
-  if (parsed.target.length == 0) {
+  if (parsed.target.length == 0 && !parsed.hasHash) {
     stderr.writeln(
-      "Usage: listremo list <target> [--type all|file|dir] " ~
-      "[--sort path|size|mtime]"
+      "Usage: listremo list [<target>] [--hash <pattern>] [--glob] " ~
+      "[--type all|file|dir] [--sort path|size|mtime]"
     );
     return false;
   }
@@ -976,11 +1028,16 @@ int handleListCommand(
     return 1;
   }
 
-  const spec = TargetSpec.parse(listArgs.target);
+  const spec = TargetSpec.parse(listArgs.target, listArgs.useGlob);
   RootRepository rootRepo = RootRepository(db);
-  const matched = rootRepo.findByPattern(spec.rootName);
+  const matched = listArgs.useGlob
+    ? rootRepo.findByGlob(spec.rootName)
+    : rootRepo.findByPattern(spec.rootName);
   if (matched.length == 0) {
-    if (hasPatternWildcard(spec.rootName)) {
+    const isWildcard = listArgs.useGlob
+      ? hasGlobWildcard(spec.rootName)
+      : hasPatternWildcard(spec.rootName);
+    if (isWildcard) {
       stderr.writefln("Error: No roots match pattern '%s'.", spec.rootName);
     } else {
       stderr.writefln("Error: Root '%s' not found.", spec.rootName);
@@ -993,6 +1050,8 @@ int handleListCommand(
   filter.subpath = spec.hasSubpath ? spec.subpath : null;
   filter.typeFilter = listArgs.typeFilter;
   filter.sort = listArgs.sortField;
+  filter.useGlob = listArgs.useGlob;
+  filter.hashPattern = listArgs.hasHash ? listArgs.hashPattern : null;
 
   const entries = entryRepo.listEntries(spec.rootName, filter);
   outputEntries(entries, opts);
@@ -1618,4 +1677,59 @@ unittest {
   // List nonexistent root pattern
   assert(dispatchCommand(ctx, ["list", "nonexistent%"], opts) == 1);
   assert(dispatchCommand(ctx, ["list", "nonexistent"], opts) == 1);
+
+  // 4. Test list with --glob and --hash
+  // Missing target without --hash should fail
+  assert(dispatchCommand(ctx, ["list"], opts) == 1);
+  assert(dispatchCommand(ctx, ["list", "--glob"], opts) == 1);
+
+  // Missing value for --hash
+  assert(dispatchCommand(ctx, ["list", "--hash"], opts) == 1);
+  assert(dispatchCommand(ctx, ["list", "alpha_1", "--hash"], opts) == 1);
+
+  // Positional argument after --hash should fail
+  assert(
+    dispatchCommand(ctx, ["list", "--hash", "0", "alpha_1"], opts) == 1
+  );
+
+  // Unexpected second positional argument
+  assert(
+    dispatchCommand(ctx, ["list", "alpha_1", "extra"], opts) == 1
+  );
+
+  // --hash across all roots without target
+  assert(dispatchCommand(ctx, ["list", "--hash", "0"], opts) == 0);
+  assert(dispatchCommand(ctx, ["list", "--hash", "e3b0%"], opts) == 0);
+
+  // --hash with target preceding it
+  assert(
+    dispatchCommand(ctx, ["list", "alpha_1", "--hash", "0"], opts) == 0
+  );
+  assert(
+    dispatchCommand(ctx, ["list", "alpha_1:/", "--hash", "0"], opts) == 0
+  );
+
+  // --glob matching
+  assert(dispatchCommand(ctx, ["list", "alpha*", "--glob"], opts) == 0);
+  assert(
+    dispatchCommand(ctx, ["list", "alpha_[12]", "--glob"], opts) == 0
+  );
+  assert(
+    dispatchCommand(ctx, ["list", "alpha_1:*", "--glob"], opts) == 0
+  );
+  assert(dispatchCommand(ctx, ["list", ":*", "--glob"], opts) == 0);
+  assert(dispatchCommand(ctx, ["list", "ALPHA*", "--glob"], opts) == 1);
+
+  // Combined --glob and --hash
+  assert(
+    dispatchCommand(
+      ctx, ["list", "alpha*", "--glob", "--hash", "0"], opts
+    ) == 0
+  );
+  assert(
+    dispatchCommand(ctx, ["list", "--glob", "--hash", "0"], opts) == 0
+  );
+
+  // Alias 'files'
+  assert(dispatchCommand(ctx, ["files", "--hash", "0"], opts) == 0);
 }

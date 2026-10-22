@@ -68,10 +68,12 @@ struct Entry {
 }
 
 struct TargetSpec {
-  static TargetSpec parse(string spec) {
+  static TargetSpec parse(string spec, bool useGlob = false) {
     TargetSpec result;
     const trimmed = spec.strip();
     if (trimmed.length == 0) {
+      result.rootName = useGlob ? "*" : "%";
+      result.hasSubpath = false;
       return result;
     }
 
@@ -83,7 +85,7 @@ struct TargetSpec {
     }
 
     const rName = trimmed[0 .. colonIdx].strip();
-    result.rootName = rName.length > 0 ? rName : "%";
+    result.rootName = rName.length > 0 ? rName : (useGlob ? "*" : "%");
     string sub = trimmed[colonIdx + 1 .. $];
     while (sub.length > 0 && sub[0] == '/') {
       sub = sub[1 .. $];
@@ -132,6 +134,15 @@ bool hasPatternWildcard(string s) {
   return false;
 }
 
+bool hasGlobWildcard(string s) {
+  foreach (c; s) {
+    if (c == '*' || c == '?' || c == '[') {
+      return true;
+    }
+  }
+  return false;
+}
+
 string unescapePatternEscapes(string s) {
   string res;
   size_t i = 0;
@@ -157,6 +168,14 @@ struct DuplicateGroup {
 
 unittest {
   // Test TargetSpec parsing
+  const tEmptyLike = TargetSpec.parse("");
+  assert(tEmptyLike.rootName == "%");
+  assert(!tEmptyLike.hasSubpath);
+
+  const tEmptyGlob = TargetSpec.parse("", true);
+  assert(tEmptyGlob.rootName == "*");
+  assert(!tEmptyGlob.hasSubpath);
+
   const t1 = TargetSpec.parse("backup");
   assert(t1.rootName == "backup");
   assert(!t1.hasSubpath);
@@ -184,10 +203,19 @@ unittest {
   assert(t6.rootName == "%");
   assert(!t6.hasSubpath);
 
+  const t6Glob = TargetSpec.parse(":", true);
+  assert(t6Glob.rootName == "*");
+  assert(!t6Glob.hasSubpath);
+
   const t7 = TargetSpec.parse(":/photos/%");
   assert(t7.rootName == "%");
   assert(t7.hasSubpath);
   assert(t7.subpath == "photos/%");
+
+  const t7Glob = TargetSpec.parse(":/photos/*", true);
+  assert(t7Glob.rootName == "*");
+  assert(t7Glob.hasSubpath);
+  assert(t7Glob.subpath == "photos/*");
 
   const t8 = TargetSpec.parse(":photos/100\\%done");
   assert(t8.rootName == "%");
@@ -202,6 +230,16 @@ unittest {
   assert(!hasPatternWildcard("abc\\%def"));
   assert(hasPatternWildcard("abc\\\\%def"));
   assert(!hasPatternWildcard("abc\\\\\\%def"));
+
+  // Test hasGlobWildcard
+  assert(hasGlobWildcard("*"));
+  assert(hasGlobWildcard("?"));
+  assert(hasGlobWildcard("[0-9]"));
+  assert(hasGlobWildcard("photos/*.jpg"));
+  assert(hasGlobWildcard("photos/pic?.png"));
+  assert(hasGlobWildcard("photos/[*].txt"));
+  assert(!hasGlobWildcard("photos/pic.png"));
+  assert(!hasGlobWildcard("normal_name"));
 
   // Test unescapePatternEscapes
   assert(unescapePatternEscapes("100\\%done") == "100%done");

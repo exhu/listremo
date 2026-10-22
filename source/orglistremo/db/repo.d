@@ -2,8 +2,8 @@ module orglistremo.db.repo;
 
 import d2sqlite3 : Database, Row, SqliteType, Statement;
 import orglistremo.model :
-  DuplicateGroup, Entry, EntryType, hasPatternWildcard, Root, RootSummary,
-  SortField, unescapePatternEscapes;
+  DuplicateGroup, Entry, EntryType, hasGlobWildcard, hasPatternWildcard, Root,
+  RootSummary, SortField, unescapePatternEscapes;
 import std.datetime.systime : Clock;
 
 struct CachedFileEntry {
@@ -16,6 +16,8 @@ struct ListEntriesFilter {
   string subpath;
   EntryType typeFilter = EntryType.all;
   SortField sort = SortField.path;
+  bool useGlob = false;
+  string hashPattern = null;
 }
 
 struct HashQueryFilter {
@@ -140,6 +142,27 @@ struct RootRepository {
       ORDER BY name;
     `, freeCol));
     stmt.bind(1, escapeLikePattern(pattern));
+    auto results = stmt.execute();
+    Root[] roots;
+    foreach (row; results) {
+      roots ~= readRootRow(row);
+    }
+    return roots;
+  }
+
+  Root[] findByGlob(string pattern) {
+    import std.format : format;
+
+    const freeCol = hasFreeSpaceColumn()
+      ? "free_space"
+      : "NULL AS free_space";
+    auto stmt = db.prepare(format(`
+      SELECT id, name, path, created_at, last_sync, %s
+      FROM roots
+      WHERE name GLOB ?
+      ORDER BY name;
+    `, freeCol));
+    stmt.bind(1, pattern);
     auto results = stmt.execute();
     Root[] roots;
     foreach (row; results) {
@@ -343,13 +366,29 @@ struct EntryRepository {
     }
 
     const hasSubpath = filter.subpath.length > 0;
-    const isSubpathPattern = hasSubpath && hasPatternWildcard(filter.subpath);
+    const isSubpathPattern = hasSubpath && (
+      filter.useGlob
+        ? hasGlobWildcard(filter.subpath)
+        : hasPatternWildcard(filter.subpath)
+    );
     if (hasSubpath) {
-      if (isSubpathPattern) {
-        sql ~= " AND e.rel_path LIKE ? ESCAPE '\\'";
+      if (filter.useGlob) {
+        if (isSubpathPattern) {
+          sql ~= " AND e.rel_path GLOB ?";
+        } else {
+          sql ~= " AND (e.rel_path = ? OR e.rel_path GLOB ?)";
+        }
       } else {
-        sql ~= " AND (e.rel_path = ? OR e.rel_path LIKE ? ESCAPE '\\')";
+        if (isSubpathPattern) {
+          sql ~= " AND e.rel_path LIKE ? ESCAPE '\\'";
+        } else {
+          sql ~= " AND (e.rel_path = ? OR e.rel_path LIKE ? ESCAPE '\\')";
+        }
       }
+    }
+
+    if (filter.hashPattern.length > 0) {
+      sql ~= " AND e.sha256 LIKE ? ESCAPE '\\'";
     }
 
     switch (filter.sort) {
@@ -369,13 +408,25 @@ struct EntryRepository {
     int paramIdx = 1;
     stmt.bind(paramIdx++, rootId);
     if (hasSubpath) {
-      if (isSubpathPattern) {
-        stmt.bind(paramIdx++, escapeLikePattern(filter.subpath));
+      if (filter.useGlob) {
+        if (isSubpathPattern) {
+          stmt.bind(paramIdx++, filter.subpath);
+        } else {
+          stmt.bind(paramIdx++, filter.subpath);
+          stmt.bind(paramIdx++, filter.subpath ~ "/*");
+        }
       } else {
-        const unescaped = unescapePatternEscapes(filter.subpath);
-        stmt.bind(paramIdx++, unescaped);
-        stmt.bind(paramIdx++, escapeLike(unescaped) ~ "/%");
+        if (isSubpathPattern) {
+          stmt.bind(paramIdx++, escapeLikePattern(filter.subpath));
+        } else {
+          const unescaped = unescapePatternEscapes(filter.subpath);
+          stmt.bind(paramIdx++, unescaped);
+          stmt.bind(paramIdx++, escapeLike(unescaped) ~ "/%");
+        }
       }
+    }
+    if (filter.hashPattern.length > 0) {
+      stmt.bind(paramIdx++, filter.hashPattern);
     }
 
     return readEntries(stmt);
@@ -391,8 +442,13 @@ struct EntryRepository {
         e.name, e.is_dir, e.size, e.mtime, e.sha256
       FROM entries e
       JOIN roots r ON r.id = e.root_id
-      WHERE r.name LIKE ? ESCAPE '\'
     `;
+
+    if (filter.useGlob) {
+      sql ~= " WHERE r.name GLOB ?";
+    } else {
+      sql ~= " WHERE r.name LIKE ? ESCAPE '\\'";
+    }
 
     if (filter.typeFilter == EntryType.file) {
       sql ~= " AND e.is_dir = 0";
@@ -401,13 +457,29 @@ struct EntryRepository {
     }
 
     const hasSubpath = filter.subpath.length > 0;
-    const isSubpathPattern = hasSubpath && hasPatternWildcard(filter.subpath);
+    const isSubpathPattern = hasSubpath && (
+      filter.useGlob
+        ? hasGlobWildcard(filter.subpath)
+        : hasPatternWildcard(filter.subpath)
+    );
     if (hasSubpath) {
-      if (isSubpathPattern) {
-        sql ~= " AND e.rel_path LIKE ? ESCAPE '\\'";
+      if (filter.useGlob) {
+        if (isSubpathPattern) {
+          sql ~= " AND e.rel_path GLOB ?";
+        } else {
+          sql ~= " AND (e.rel_path = ? OR e.rel_path GLOB ?)";
+        }
       } else {
-        sql ~= " AND (e.rel_path = ? OR e.rel_path LIKE ? ESCAPE '\\')";
+        if (isSubpathPattern) {
+          sql ~= " AND e.rel_path LIKE ? ESCAPE '\\'";
+        } else {
+          sql ~= " AND (e.rel_path = ? OR e.rel_path LIKE ? ESCAPE '\\')";
+        }
       }
+    }
+
+    if (filter.hashPattern.length > 0) {
+      sql ~= " AND e.sha256 LIKE ? ESCAPE '\\'";
     }
 
     switch (filter.sort) {
@@ -425,15 +497,31 @@ struct EntryRepository {
 
     auto stmt = db.prepare(sql);
     int paramIdx = 1;
-    stmt.bind(paramIdx++, escapeLikePattern(rootPattern));
+    if (filter.useGlob) {
+      stmt.bind(paramIdx++, rootPattern);
+    } else {
+      stmt.bind(paramIdx++, escapeLikePattern(rootPattern));
+    }
     if (hasSubpath) {
-      if (isSubpathPattern) {
-        stmt.bind(paramIdx++, escapeLikePattern(filter.subpath));
+      if (filter.useGlob) {
+        if (isSubpathPattern) {
+          stmt.bind(paramIdx++, filter.subpath);
+        } else {
+          stmt.bind(paramIdx++, filter.subpath);
+          stmt.bind(paramIdx++, filter.subpath ~ "/*");
+        }
       } else {
-        const unescaped = unescapePatternEscapes(filter.subpath);
-        stmt.bind(paramIdx++, unescaped);
-        stmt.bind(paramIdx++, escapeLike(unescaped) ~ "/%");
+        if (isSubpathPattern) {
+          stmt.bind(paramIdx++, escapeLikePattern(filter.subpath));
+        } else {
+          const unescaped = unescapePatternEscapes(filter.subpath);
+          stmt.bind(paramIdx++, unescaped);
+          stmt.bind(paramIdx++, escapeLike(unescaped) ~ "/%");
+        }
       }
+    }
+    if (filter.hashPattern.length > 0) {
+      stmt.bind(paramIdx++, filter.hashPattern);
     }
 
     return readEntries(stmt);
@@ -905,4 +993,67 @@ unittest {
   assert(escapeLikePattern("abc\\%def") == "abc\\%def");
   assert(escapeLikePattern("abc_def") == "abc\\_def");
   assert(escapeLikePattern("abc\\\\%def") == "abc\\\\%def");
+
+  // Test findByGlob on roots
+  const globRoots = rootRepo.findByGlob("r*");
+  assert(globRoots.length >= 3);
+
+  const globR1R2 = rootRepo.findByGlob("r[12]");
+  assert(globR1R2.length == 2);
+  assert(globR1R2[0].name == "r1");
+  assert(globR1R2[1].name == "r2");
+
+  // SQLite GLOB is case-sensitive: "R*" should match no lowercase roots
+  assert(rootRepo.findByGlob("R*").length == 0);
+
+  // Test listEntries with useGlob
+  ListEntriesFilter fGlobJpg;
+  fGlobJpg.subpath = "*.jpg";
+  fGlobJpg.useGlob = true;
+  const globJpgEntries = entryRepo.listEntries("r1", fGlobJpg);
+  assert(globJpgEntries.length == 3);
+
+  ListEntriesFilter fGlobCase;
+  fGlobCase.subpath = "*.JPG";
+  fGlobCase.useGlob = true;
+  assert(entryRepo.listEntries("r1", fGlobCase).length == 0);
+
+  // Subpath without wildcards in GLOB mode matches directory and subtree
+  ListEntriesFilter fGlobSub;
+  fGlobSub.subpath = "photos";
+  fGlobSub.useGlob = true;
+  const globSubEntries = entryRepo.listEntries("r1", fGlobSub);
+  assert(globSubEntries.length == 3);
+
+  // Test listEntries with hashPattern (LIKE operator)
+  ListEntriesFilter fHashExact;
+  fHashExact.hashPattern = "hA";
+  const hAEntries = entryRepo.listEntries("r1", fHashExact);
+  assert(hAEntries.length == 1);
+  assert(hAEntries[0].name == "a.jpg");
+
+  ListEntriesFilter fHashZero;
+  fHashZero.hashPattern = "0";
+  const zeroEntries = entryRepo.listEntries("r1", fHashZero);
+  assert(zeroEntries.length == 3);
+
+  ListEntriesFilter fHashLike;
+  fHashLike.hashPattern = "h%";
+  const hashLikeEntries = entryRepo.listEntries("%", fHashLike);
+  assert(hashLikeEntries.length >= 4); // hA, hB, hC, hash_dup
+
+  // Single-character wildcard '_' in hash LIKE pattern
+  ListEntriesFilter fHashUnderscore;
+  fHashUnderscore.hashPattern = "h_";
+  const hashUnderEntries = entryRepo.listEntries("r1", fHashUnderscore);
+  assert(hashUnderEntries.length == 3); // hA, hB, hC
+
+  // Combine GLOB subpath and hash LIKE pattern
+  ListEntriesFilter fGlobAndHash;
+  fGlobAndHash.subpath = "photos/*.jpg";
+  fGlobAndHash.useGlob = true;
+  fGlobAndHash.hashPattern = "hA";
+  const combined = entryRepo.listEntries("r1", fGlobAndHash);
+  assert(combined.length == 1);
+  assert(combined[0].name == "a.jpg");
 }
