@@ -1,3 +1,4 @@
+- add \* to match any roots
 - add filter options e.g. to display items matching by name, sha256 (using only
   what sqlite can help with)
 - sync to check free disk space in html output
