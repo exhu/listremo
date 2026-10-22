@@ -1,5 +1,6 @@
 - add filter options e.g. to display items matching by name, sha256 (using only
   what sqlite can help with)
+- sync to check free disk space in html output
 - separate app: support thumbnailer as external app to gradually or selectively add
 thumbnails, e.g. list a path to rescan adding missing or regenerating outdated
 (or forced) thumbnails, it's a good idea to have a separate db for this.
