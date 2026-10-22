@@ -217,6 +217,8 @@ bool buildOutputOptions(
 }
 
 void printUsage() {
+  import orglistremo.app_version : appVersion;
+  writefln("listremo version %s", appVersion);
   writeln("Usage: listremo [global options] <command> [arguments...]\n");
   writeln("Commands:");
   writeln("  root add <name> <path>       Register a new storage root");
