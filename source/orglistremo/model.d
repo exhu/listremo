@@ -82,7 +82,8 @@ struct TargetSpec {
       return result;
     }
 
-    result.rootName = trimmed[0 .. colonIdx];
+    const rName = trimmed[0 .. colonIdx].strip();
+    result.rootName = rName.length > 0 ? rName : "%";
     string sub = trimmed[colonIdx + 1 .. $];
     while (sub.length > 0 && sub[0] == '/') {
       sub = sub[1 .. $];
@@ -116,6 +117,37 @@ private:
   }
 }
 
+bool hasPatternWildcard(string s) {
+  size_t backslashes = 0;
+  foreach (c; s) {
+    if (c == '\\') {
+      backslashes++;
+    } else {
+      if (c == '%' && (backslashes % 2 == 0)) {
+        return true;
+      }
+      backslashes = 0;
+    }
+  }
+  return false;
+}
+
+string unescapePatternEscapes(string s) {
+  string res;
+  size_t i = 0;
+  while (i < s.length) {
+    if (s[i] == '\\' && i + 1 < s.length &&
+        (s[i + 1] == '%' || s[i + 1] == '\\')) {
+      res ~= s[i + 1];
+      i += 2;
+    } else {
+      res ~= s[i];
+      i++;
+    }
+  }
+  return res;
+}
+
 struct DuplicateGroup {
   string sha256;
   ulong size;
@@ -147,6 +179,34 @@ unittest {
   assert(t5.rootName == "backup");
   assert(t5.hasSubpath);
   assert(t5.subpath == "photos/file.txt");
+
+  const t6 = TargetSpec.parse(":");
+  assert(t6.rootName == "%");
+  assert(!t6.hasSubpath);
+
+  const t7 = TargetSpec.parse(":/photos/%");
+  assert(t7.rootName == "%");
+  assert(t7.hasSubpath);
+  assert(t7.subpath == "photos/%");
+
+  const t8 = TargetSpec.parse(":photos/100\\%done");
+  assert(t8.rootName == "%");
+  assert(t8.hasSubpath);
+  assert(t8.subpath == "photos/100\\%done");
+
+  // Test hasPatternWildcard
+  assert(hasPatternWildcard("%"));
+  assert(hasPatternWildcard("abc%"));
+  assert(hasPatternWildcard("%def"));
+  assert(!hasPatternWildcard("abc"));
+  assert(!hasPatternWildcard("abc\\%def"));
+  assert(hasPatternWildcard("abc\\\\%def"));
+  assert(!hasPatternWildcard("abc\\\\\\%def"));
+
+  // Test unescapePatternEscapes
+  assert(unescapePatternEscapes("100\\%done") == "100%done");
+  assert(unescapePatternEscapes("path\\\\file") == "path\\file");
+  assert(unescapePatternEscapes("normal") == "normal");
 
   // Test fullPath formatting
   Entry e;

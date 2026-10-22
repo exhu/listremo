@@ -10,8 +10,8 @@ import orglistremo.db.repo_locks :
   isPidAlive, SyncLockInfo, SyncLockRepository;
 import orglistremo.db.schema_version : schemaVersion;
 import orglistremo.model :
-  ColorMode, Entry, EntryType, OutputFormat, Root, RootSummary, SortField,
-  TargetSpec;
+  ColorMode, Entry, EntryType, hasPatternWildcard, OutputFormat, Root,
+  RootSummary, SortField, TargetSpec;
 import orglistremo.output.console :
   ConsoleProgressReporter, OutputOptions, shouldColorize, Styler;
 import orglistremo.output.formatter :
@@ -222,9 +222,9 @@ void printUsage() {
   writeln("  root add <name> <path>       Register a new storage root");
   writeln("  root remove <name>           Remove a root and entries");
   writeln("  root set-path <name> <path>  Update mount path of a root");
-  writeln("  root list                    List all registered storage roots");
-  writeln("  sync <name> [options]        Synchronize a storage root");
-  writeln("  sync --all [options]         Synchronize all storage roots");
+  writeln("  root list [pattern]          List registered storage roots");
+  writeln("  sync <name|pattern> [opts]   Synchronize a storage root");
+  writeln("  sync --all [pattern] [opts]  Synchronize matching storage roots");
   writeln("  list <target> [options]      List files & dirs (alias: files)");
   writeln("  duplicates [<target>] [opts] Find duplicate files/dirs");
   writeln("  unique [<target>] [options]  Find unique files/dirs");
@@ -321,7 +321,12 @@ int handleRootCommand(
       }
       return handleRootSetPath(rootRepo, args, opts);
     case "list":
-      const summaries = rootRepo.listRoots();
+      if (args.length > 3) {
+        stderr.writeln("Usage: listremo root list [pattern]");
+        return 1;
+      }
+      const pattern = args.length == 3 ? args[2] : null;
+      const summaries = rootRepo.listRoots(pattern);
       outputRoots(summaries, opts);
       return 0;
     default:
@@ -446,12 +451,10 @@ bool parseSyncArgs(string[] args, out SyncArgs parsed) {
     }
   }
 
-  if (parsed.allFlag && parsed.targetRoot.length > 0) {
-    stderr.writeln("Error: Cannot specify both <name> and --all.");
-    return false;
-  }
   if (!parsed.allFlag && parsed.targetRoot.length == 0) {
-    stderr.writeln("Usage: listremo sync <name> [options] OR --all");
+    stderr.writeln(
+      "Usage: listremo sync <name|pattern> [options] OR --all [pattern]"
+    );
     return false;
   }
   return true;
@@ -482,17 +485,48 @@ int handleSyncCommand(
   RootRepository rootRepo = RootRepository(ctx.db);
   Root[] toSync;
   if (syncArgs.allFlag) {
-    const summaries = rootRepo.listRoots();
-    foreach (ref s; summaries) {
-      toSync ~= s.root;
+    if (syncArgs.targetRoot.length > 0) {
+      toSync = rootRepo.findByPattern(syncArgs.targetRoot);
+      if (toSync.length == 0) {
+        stderr.writefln(
+          "Error: No roots match pattern '%s'.", syncArgs.targetRoot
+        );
+        return 1;
+      }
+    } else {
+      const summaries = rootRepo.listRoots();
+      foreach (ref s; summaries) {
+        toSync ~= s.root;
+      }
     }
   } else {
-    Root r;
-    if (!rootRepo.findByName(syncArgs.targetRoot, r)) {
-      stderr.writefln("Error: Root '%s' not registered.", syncArgs.targetRoot);
+    const matched = rootRepo.findByPattern(syncArgs.targetRoot);
+    if (matched.length == 0) {
+      if (hasPatternWildcard(syncArgs.targetRoot)) {
+        stderr.writefln(
+          "Error: No roots match pattern '%s'.", syncArgs.targetRoot
+        );
+      } else {
+        stderr.writefln(
+          "Error: Root '%s' not registered.", syncArgs.targetRoot
+        );
+      }
       return 1;
     }
-    toSync ~= r;
+    if (matched.length > 1) {
+      import std.algorithm.iteration : map;
+      import std.array : join;
+
+      const names = matched.map!(r => r.name).join(", ");
+      stderr.writefln(
+        "Error: Pattern '%s' matches multiple roots (%s). " ~
+        "Use --all to sync all matching roots.",
+        syncArgs.targetRoot,
+        names
+      );
+      return 1;
+    }
+    toSync ~= matched[0];
   }
 
   import core.time : MonoTime;
@@ -942,9 +976,13 @@ int handleListCommand(
 
   const spec = TargetSpec.parse(listArgs.target);
   RootRepository rootRepo = RootRepository(db);
-  Root root;
-  if (!rootRepo.findByName(spec.rootName, root)) {
-    stderr.writefln("Error: Root '%s' not found.", spec.rootName);
+  const matched = rootRepo.findByPattern(spec.rootName);
+  if (matched.length == 0) {
+    if (hasPatternWildcard(spec.rootName)) {
+      stderr.writefln("Error: No roots match pattern '%s'.", spec.rootName);
+    } else {
+      stderr.writefln("Error: Root '%s' not found.", spec.rootName);
+    }
     return 1;
   }
 
@@ -954,7 +992,7 @@ int handleListCommand(
   filter.typeFilter = listArgs.typeFilter;
   filter.sort = listArgs.sortField;
 
-  const entries = entryRepo.listEntries(root.id, filter);
+  const entries = entryRepo.listEntries(spec.rootName, filter);
   outputEntries(entries, opts);
   return 0;
 }
@@ -1131,9 +1169,24 @@ unittest {
   assert(syncAll.forceFlag);
   assert(syncAll.forceHash);
 
-  // Conflicting sync arguments
-  SyncArgs conflictArgs;
-  assert(!parseSyncArgs(["sync", "myroot", "--all"], conflictArgs));
+  // Sync --all with pattern is supported
+  SyncArgs syncAllPattern;
+  assert(parseSyncArgs(["sync", "myroot", "--all"], syncAllPattern));
+  assert(syncAllPattern.allFlag);
+  assert(syncAllPattern.targetRoot == "myroot");
+
+  SyncArgs syncAllPrefix;
+  assert(parseSyncArgs(["sync", "--all", "backup%"], syncAllPrefix));
+  assert(syncAllPrefix.allFlag);
+  assert(syncAllPrefix.targetRoot == "backup%");
+
+  // Missing sync target without --all
+  SyncArgs missingSyncTarget;
+  assert(!parseSyncArgs(["sync"], missingSyncTarget));
+
+  // Too many positional arguments
+  SyncArgs tooManyArgs;
+  assert(!parseSyncArgs(["sync", "r1", "r2"], tooManyArgs));
 
   // Unknown sync flag
   SyncArgs unknownFlagArgs;
@@ -1481,4 +1534,86 @@ unittest {
   }
 
   roCtx.db.close();
+}
+
+unittest {
+  import orglistremo.db.connection : openDatabase;
+  import std.file : exists, mkdirRecurse, rmdirRecurse, tempDir;
+  import std.path : buildPath;
+
+  const appTestDir = buildPath(tempDir(), "listremo_pattern_test");
+  if (exists(appTestDir)) {
+    rmdirRecurse(appTestDir);
+  }
+  mkdirRecurse(appTestDir);
+  scope (exit) {
+    if (exists(appTestDir)) {
+      rmdirRecurse(appTestDir);
+    }
+  }
+
+  const d1 = buildPath(appTestDir, "d1");
+  const d2 = buildPath(appTestDir, "d2");
+  mkdirRecurse(d1);
+  mkdirRecurse(d2);
+
+  Database db = openDatabase(":memory:");
+  DbContext ctx = DbContext(db, ":memory:", schemaVersion, false, 60_000);
+  OutputOptions opts;
+  opts.format = OutputFormat.console;
+
+  // 1. Test root add and root list [pattern]
+  assert(dispatchCommand(ctx, ["root", "add", "alpha_1", d1], opts) == 0);
+  assert(dispatchCommand(ctx, ["root", "add", "alpha_2", d2], opts) == 0);
+  assert(dispatchCommand(ctx, ["root", "add", "beta", d2], opts) == 0);
+
+  assert(dispatchCommand(ctx, ["root", "list"], opts) == 0);
+  assert(dispatchCommand(ctx, ["root", "list", "alpha%"], opts) == 0);
+  assert(dispatchCommand(ctx, ["root", "list", "beta"], opts) == 0);
+  assert(dispatchCommand(ctx, ["root", "list", "nonexistent%"], opts) == 0);
+  assert(dispatchCommand(ctx, ["root", "list", "too", "many"], opts) == 1);
+
+  // 2. Test sync with pattern
+  // sync alpha% should fail because multiple roots match
+  assert(dispatchCommand(ctx, ["sync", "alpha%", "--no-progress"], opts) == 1);
+
+  // sync --all alpha% should succeed and sync both roots
+  assert(
+    dispatchCommand(
+      ctx, ["sync", "--all", "alpha%", "--no-progress"], opts
+    ) == 0
+  );
+
+  // sync beta (single match) should succeed
+  assert(dispatchCommand(ctx, ["sync", "beta", "--no-progress"], opts) == 0);
+
+  // sync b% (single match) should succeed
+  assert(dispatchCommand(ctx, ["sync", "b%", "--no-progress"], opts) == 0);
+
+  // sync nonexistent pattern should fail
+  assert(
+    dispatchCommand(
+      ctx, ["sync", "nonexistent%", "--no-progress"], opts
+    ) == 1
+  );
+  assert(
+    dispatchCommand(
+      ctx, ["sync", "--all", "nonexistent%", "--no-progress"], opts
+    ) == 1
+  );
+
+  // 3. Test list with pattern
+  // List across all roots
+  assert(dispatchCommand(ctx, ["list", "%"], opts) == 0);
+  assert(dispatchCommand(ctx, ["list", ":"], opts) == 0);
+
+  // List across multiple matching roots
+  assert(dispatchCommand(ctx, ["list", "alpha%"], opts) == 0);
+
+  // List specific root with pattern in path
+  assert(dispatchCommand(ctx, ["list", "alpha_1:%"], opts) == 0);
+
+  // List nonexistent root pattern
+  assert(dispatchCommand(ctx, ["list", "nonexistent%"], opts) == 1);
+  assert(dispatchCommand(ctx, ["list", "nonexistent"], opts) == 1);
 }

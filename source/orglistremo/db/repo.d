@@ -2,7 +2,8 @@ module orglistremo.db.repo;
 
 import d2sqlite3 : Database, Row, SqliteType, Statement;
 import orglistremo.model :
-  DuplicateGroup, Entry, EntryType, Root, RootSummary, SortField;
+  DuplicateGroup, Entry, EntryType, hasPatternWildcard, Root, RootSummary,
+  SortField, unescapePatternEscapes;
 import std.datetime.systime : Clock;
 
 struct CachedFileEntry {
@@ -126,14 +127,34 @@ struct RootRepository {
     }
   }
 
-  RootSummary[] listRoots() {
+  Root[] findByPattern(string pattern) {
+    import std.format : format;
+
+    const freeCol = hasFreeSpaceColumn()
+      ? "free_space"
+      : "NULL AS free_space";
+    auto stmt = db.prepare(format(`
+      SELECT id, name, path, created_at, last_sync, %s
+      FROM roots
+      WHERE name LIKE ? ESCAPE '\'
+      ORDER BY name;
+    `, freeCol));
+    stmt.bind(1, escapeLikePattern(pattern));
+    auto results = stmt.execute();
+    Root[] roots;
+    foreach (row; results) {
+      roots ~= readRootRow(row);
+    }
+    return roots;
+  }
+
+  RootSummary[] listRoots(string pattern = null) {
     import std.format : format;
 
     const freeCol = hasFreeSpaceColumn()
       ? "r.free_space"
       : "NULL AS free_space";
-    RootSummary[] summaries;
-    auto stmt = db.prepare(format(`
+    string sql = format(`
       SELECT
         r.id, r.name, r.path, r.created_at, r.last_sync, %s,
         COALESCE(SUM(CASE WHEN e.is_dir = 0 THEN 1 ELSE 0 END), 0)
@@ -145,9 +166,18 @@ struct RootRepository {
           AS total_size
       FROM roots r
       LEFT JOIN entries e ON e.root_id = r.id
-      GROUP BY r.id
-      ORDER BY r.name;
-    `, freeCol));
+    `, freeCol);
+
+    if (pattern.length > 0) {
+      sql ~= " WHERE r.name LIKE ? ESCAPE '\\'";
+    }
+    sql ~= " GROUP BY r.id ORDER BY r.name;";
+
+    auto stmt = db.prepare(sql);
+    if (pattern.length > 0) {
+      stmt.bind(1, escapeLikePattern(pattern));
+    }
+    RootSummary[] summaries;
     auto results = stmt.execute();
     foreach (row; results) {
       RootSummary summary;
@@ -313,8 +343,13 @@ struct EntryRepository {
     }
 
     const hasSubpath = filter.subpath.length > 0;
+    const isSubpathPattern = hasSubpath && hasPatternWildcard(filter.subpath);
     if (hasSubpath) {
-      sql ~= " AND (e.rel_path = ? OR e.rel_path LIKE ? ESCAPE '\\')";
+      if (isSubpathPattern) {
+        sql ~= " AND e.rel_path LIKE ? ESCAPE '\\'";
+      } else {
+        sql ~= " AND (e.rel_path = ? OR e.rel_path LIKE ? ESCAPE '\\')";
+      }
     }
 
     switch (filter.sort) {
@@ -334,8 +369,71 @@ struct EntryRepository {
     int paramIdx = 1;
     stmt.bind(paramIdx++, rootId);
     if (hasSubpath) {
-      stmt.bind(paramIdx++, filter.subpath);
-      stmt.bind(paramIdx++, escapeLike(filter.subpath) ~ "/%");
+      if (isSubpathPattern) {
+        stmt.bind(paramIdx++, escapeLikePattern(filter.subpath));
+      } else {
+        const unescaped = unescapePatternEscapes(filter.subpath);
+        stmt.bind(paramIdx++, unescaped);
+        stmt.bind(paramIdx++, escapeLike(unescaped) ~ "/%");
+      }
+    }
+
+    return readEntries(stmt);
+  }
+
+  Entry[] listEntries(
+    string rootPattern,
+    in ListEntriesFilter filter = ListEntriesFilter.init
+  ) {
+    string sql = `
+      SELECT
+        e.id, e.root_id, r.name, e.rel_path, e.parent_path,
+        e.name, e.is_dir, e.size, e.mtime, e.sha256
+      FROM entries e
+      JOIN roots r ON r.id = e.root_id
+      WHERE r.name LIKE ? ESCAPE '\'
+    `;
+
+    if (filter.typeFilter == EntryType.file) {
+      sql ~= " AND e.is_dir = 0";
+    } else if (filter.typeFilter == EntryType.dir) {
+      sql ~= " AND e.is_dir = 1";
+    }
+
+    const hasSubpath = filter.subpath.length > 0;
+    const isSubpathPattern = hasSubpath && hasPatternWildcard(filter.subpath);
+    if (hasSubpath) {
+      if (isSubpathPattern) {
+        sql ~= " AND e.rel_path LIKE ? ESCAPE '\\'";
+      } else {
+        sql ~= " AND (e.rel_path = ? OR e.rel_path LIKE ? ESCAPE '\\')";
+      }
+    }
+
+    switch (filter.sort) {
+      case SortField.size:
+        sql ~= " ORDER BY e.size DESC, r.name ASC, e.rel_path ASC";
+        break;
+      case SortField.mtime:
+        sql ~= " ORDER BY e.mtime DESC, r.name ASC, e.rel_path ASC";
+        break;
+      case SortField.path:
+      default:
+        sql ~= " ORDER BY r.name ASC, e.rel_path ASC";
+        break;
+    }
+
+    auto stmt = db.prepare(sql);
+    int paramIdx = 1;
+    stmt.bind(paramIdx++, escapeLikePattern(rootPattern));
+    if (hasSubpath) {
+      if (isSubpathPattern) {
+        stmt.bind(paramIdx++, escapeLikePattern(filter.subpath));
+      } else {
+        const unescaped = unescapePatternEscapes(filter.subpath);
+        stmt.bind(paramIdx++, unescaped);
+        stmt.bind(paramIdx++, escapeLike(unescaped) ~ "/%");
+      }
     }
 
     return readEntries(stmt);
@@ -512,17 +610,6 @@ private:
     }
   }
 
-  static string escapeLike(string s) {
-    string res;
-    foreach (c; s) {
-      if (c == '%' || c == '_' || c == '\\') {
-        res ~= '\\';
-      }
-      res ~= c;
-    }
-    return res;
-  }
-
   static Entry[] readEntries(ref Statement stmt) {
     Entry[] entries;
     auto results = stmt.execute();
@@ -544,6 +631,46 @@ private:
     }
     return entries;
   }
+}
+
+string escapeLikePattern(string s) {
+  string res;
+  size_t i = 0;
+  while (i < s.length) {
+    const c = s[i];
+    if (c == '\\') {
+      if (i + 1 < s.length && s[i + 1] == '%') {
+        res ~= "\\%";
+        i += 2;
+        continue;
+      }
+      if (i + 1 < s.length && s[i + 1] == '\\') {
+        res ~= "\\\\";
+        i += 2;
+        continue;
+      }
+      res ~= "\\\\";
+      i++;
+    } else if (c == '_') {
+      res ~= "\\_";
+      i++;
+    } else {
+      res ~= c;
+      i++;
+    }
+  }
+  return res;
+}
+
+string escapeLike(string s) {
+  string res;
+  foreach (c; s) {
+    if (c == '%' || c == '_' || c == '\\') {
+      res ~= '\\';
+    }
+    res ~= c;
+  }
+  return res;
 }
 
 unittest {
@@ -721,4 +848,61 @@ unittest {
     }
   }
   assert(foundBatch);
+
+  // Test pattern matching on roots
+  const rMatches = rootRepo.findByPattern("r%");
+  assert(rMatches.length >= 4);
+
+  const r1Exact = rootRepo.findByPattern("r1");
+  assert(r1Exact.length == 1);
+  assert(r1Exact[0].name == "r1");
+
+  const rPctId = rootRepo.addRoot("100%disk", "/mnt/pct");
+  const rPctMatches = rootRepo.findByPattern("100\\%disk");
+  assert(rPctMatches.length == 1);
+  assert(rPctMatches[0].name == "100%disk");
+
+  const noneMatches = rootRepo.findByPattern("nonexistent%");
+  assert(noneMatches.length == 0);
+
+  // Test listRoots with pattern
+  const batchSummaries = rootRepo.listRoots("r_batch");
+  assert(batchSummaries.length == 1);
+  assert(batchSummaries[0].root.name == "r_batch");
+
+  const noSummaries = rootRepo.listRoots("nonexistent%");
+  assert(noSummaries.length == 0);
+
+  // Test listEntries by rootPattern
+  const allEntriesAcrossRoots = entryRepo.listEntries("%");
+  assert(allEntriesAcrossRoots.length > 0);
+
+  const jpgEntries = entryRepo.listEntries(
+    "r1", ListEntriesFilter("%.jpg")
+  );
+  assert(jpgEntries.length == 3);
+  foreach (ref e; jpgEntries) {
+    import std.algorithm.searching : endsWith;
+    assert(e.relPath.endsWith(".jpg"));
+  }
+
+  // Test literal % in entry path
+  Entry[] pctEntries = [
+    Entry(
+      0, rPctId, "100%disk", "100%free.txt", ".", "100%free.txt",
+      false, 10, 1000, "hpct"
+    )
+  ];
+  entryRepo.saveSyncEntries(rPctId, pctEntries, 8000);
+  const foundPct = entryRepo.listEntries(
+    "100\\%disk", ListEntriesFilter("100\\%free.txt")
+  );
+  assert(foundPct.length == 1);
+  assert(foundPct[0].name == "100%free.txt");
+
+  // Test escapeLikePattern
+  assert(escapeLikePattern("abc%def") == "abc%def");
+  assert(escapeLikePattern("abc\\%def") == "abc\\%def");
+  assert(escapeLikePattern("abc_def") == "abc\\_def");
+  assert(escapeLikePattern("abc\\\\%def") == "abc\\\\%def");
 }
