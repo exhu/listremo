@@ -3,9 +3,10 @@ module orglistremo.output.html;
 import orglistremo.model : DuplicateGroup, Entry, RootSummary;
 import orglistremo.output.console : OutputOptions;
 import orglistremo.output.units :
-  formatDuration, formatIso8601, formatSizeHuman, formatUnixTime;
+  formatDuration, formatHash, formatIso8601, formatLastSync, formatSizeHuman,
+  formatUnixTime;
 import std.algorithm.sorting : sort;
-import std.array : appender;
+import std.array : Appender, appender;
 import std.format : format;
 import std.stdio : File, stdout;
 
@@ -39,9 +40,7 @@ void printHtmlRoots(
     outStream.writeln(`    <tbody>`);
 
     foreach (ref s; summaries) {
-      const syncStr = s.root.hasLastSync
-        ? formatUnixTime(s.root.lastSync)
-        : "never";
+      const syncStr = formatLastSync(s.root.lastSync, s.root.hasLastSync);
       const freeStr = s.root.hasFreeSpace
         ? formatSizeHuman(s.root.freeSpace)
         : "-";
@@ -245,8 +244,19 @@ void printHtmlUnique(
 }
 
 string escapeHtml(string s) {
-  auto app = appender!string();
-  foreach (dchar c; s) {
+  bool needsEscape = false;
+  foreach (const char c; s) {
+    if (c == '&' || c == '<' || c == '>' || c == '"' || c == '\'') {
+      needsEscape = true;
+      break;
+    }
+  }
+  if (!needsEscape) {
+    return s;
+  }
+
+  Appender!string app = appender!string();
+  foreach (const char c; s) {
     switch (c) {
       case '&':
         app.put("&amp;");
@@ -399,13 +409,6 @@ string[] splitPath(string p) {
     parts ~= p[start .. $];
   }
   return parts;
-}
-
-string formatHash(string h, bool fullHash) {
-  if (fullHash || h == "0" || h.length <= 12) {
-    return h;
-  }
-  return h[0 .. 12];
 }
 
 void renderTreeRoot(
@@ -782,20 +785,17 @@ unittest {
   assert(trees[0].rootNode.files.length == 1);
   assert(trees[0].rootNode.files[0].name == "root_file.txt");
 
-  // Test rendering functions with File.tmpfile()
+  // Test rendering functions with captureOutput
+  import orglistremo.internal.testutil : captureOutput;
   import orglistremo.model : Root;
   import std.string : indexOf;
 
   OutputOptions opts;
   opts.fullHash = false;
 
-  File tmpEntries = File.tmpfile();
-  printHtmlEntries(entries, opts, tmpEntries);
-  tmpEntries.rewind();
-  string entriesContent;
-  foreach (line; tmpEntries.byLine()) {
-    entriesContent ~= line ~ "\n";
-  }
+  const entriesContent = captureOutput((File f) {
+    printHtmlEntries(entries, opts, f);
+  });
   assert(entriesContent.indexOf("<!DOCTYPE html>") != -1);
   assert(entriesContent.indexOf("class=\"tree-dir\"") != -1);
   assert(entriesContent.indexOf("class=\"tree-file\"") != -1);
@@ -812,13 +812,9 @@ unittest {
   r.freeSpace = 1024 * 1024 * 500;
   RootSummary[] roots = [RootSummary(r, 10, 2, 1024 * 1024 * 50)];
 
-  File tmpRoots = File.tmpfile();
-  printHtmlRoots(roots, opts, tmpRoots);
-  tmpRoots.rewind();
-  string rootsContent;
-  foreach (line; tmpRoots.byLine()) {
-    rootsContent ~= line ~ "\n";
-  }
+  const rootsContent = captureOutput((File f) {
+    printHtmlRoots(roots, opts, f);
+  });
   assert(rootsContent.indexOf("roots-table") != -1);
   assert(rootsContent.indexOf("backup") != -1);
 
@@ -830,23 +826,34 @@ unittest {
   dg.entries = [entries[2], entries[3]];
   DuplicateGroup[] dups = [dg];
 
-  File tmpDups = File.tmpfile();
-  printHtmlDuplicates(dups, opts, tmpDups);
-  tmpDups.rewind();
-  string dupsContent;
-  foreach (line; tmpDups.byLine()) {
-    dupsContent ~= line ~ "\n";
-  }
+  const dupsContent = captureOutput((File f) {
+    printHtmlDuplicates(dups, opts, f);
+  });
   assert(dupsContent.indexOf("dup-group") != -1);
   assert(dupsContent.indexOf("dup_hash_123456789") != -1);
 
   // Test printHtmlUnique
-  File tmpUniq = File.tmpfile();
-  printHtmlUnique(entries[2 .. 4], opts, tmpUniq);
-  tmpUniq.rewind();
-  string uniqContent;
-  foreach (line; tmpUniq.byLine()) {
-    uniqContent ~= line ~ "\n";
-  }
+  const uniqContent = captureOutput((File f) {
+    printHtmlUnique(entries[2 .. 4], opts, f);
+  });
   assert(uniqContent.indexOf("Unique Entries") != -1);
+
+  // Fast path (no special chars)
+  assert(escapeHtml("plain_name.txt") == "plain_name.txt");
+
+  // ASCII special characters
+  assert(escapeHtml("<b>\"one\" & 'two'</b>") ==
+    "&lt;b&gt;&quot;one&quot; &amp; &#39;two&#39;&lt;/b&gt;");
+
+  // Multibyte UTF-8 characters preserved intact
+  assert(escapeHtml("<тест> & '日本語'") ==
+    "&lt;тест&gt; &amp; &#39;日本語&#39;");
+
+  // Invalid non-UTF-8 bytes do not throw UnicodeException
+  const string invalidBytes = cast(string) [
+    cast(char) 0xFF, '<', cast(char) 0xFE, '&', cast(char) 0x80
+  ];
+  const string escapedInvalid = escapeHtml(invalidBytes);
+  assert(escapedInvalid == cast(string) [cast(char) 0xFF] ~ "&lt;" ~
+    cast(string) [cast(char) 0xFE] ~ "&amp;" ~ cast(string) [cast(char) 0x80]);
 }

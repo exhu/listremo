@@ -1,5 +1,6 @@
 module orglistremo.app;
 
+import core.sync.mutex : Mutex;
 import d2sqlite3 : Database;
 import orglistremo.config : resolveDbPath;
 import orglistremo.db.backup :
@@ -9,23 +10,25 @@ import orglistremo.db.connection :
 import orglistremo.db.repo :
   EntryRepository, HashQueryFilter, ListEntriesFilter, RootRepository;
 import orglistremo.db.repo_locks :
-  isPidAlive, SyncLockInfo, SyncLockRepository;
+  SyncLockInfo, SyncLockRepository;
 import orglistremo.db.schema_version : schemaVersion;
 import orglistremo.importer : handleImportCommand;
+import orglistremo.internal.os :
+  getLocalHostName, isPidAlive;
 import orglistremo.model :
-  ColorMode, Entry, EntryType, hasGlobWildcard, hasPatternWildcard,
-  OutputFormat, Root, RootSummary, SortField, TargetSpec;
+  ColorMode, Entry, EntryType, OutputFormat, Root, RootSummary, SortField,
+  TargetSpec;
 import orglistremo.output.console :
   ConsoleProgressReporter, OutputOptions, shouldColorize, Styler;
 import orglistremo.output.formatter :
   outputDuplicates, outputEntries, outputRoots, outputUnique;
 import orglistremo.output.units : formatDuration, formatUnixTime;
+import orglistremo.pattern : hasGlobWildcard, hasPatternWildcard;
 import orglistremo.sync.scanner :
   syncRoot, SyncIssue, SyncOptions, SyncProgressCallback;
 import std.datetime.systime : Clock;
 import std.getopt : config, getopt;
 import std.process : thisProcessID;
-import std.socket : Socket;
 import std.stdio : stderr, writefln, writeln;
 
 version (unittest) {
@@ -118,6 +121,7 @@ struct SyncArgs {
   bool noProgress;
   bool breakLock;
   uint jobs = 1;
+  bool jobsPassed;
   uint progressIntervalMs = 1000;
   string targetRoot;
 }
@@ -407,10 +411,27 @@ int handleRootAdd(
     stderr.writeln("Usage: listremo root add <name> <path>");
     return 1;
   }
+  const name = args[2];
+  if (name.length == 0) {
+    stderr.writeln("Error: Root name cannot be empty.");
+    return 1;
+  }
+  import std.algorithm.searching : canFind;
+  if (name.canFind(':')) {
+    stderr.writeln("Error: Root name cannot contain ':'.");
+    return 1;
+  }
+  const rawPath = args[3];
+  if (rawPath.length == 0) {
+    stderr.writeln("Error: Root path cannot be empty.");
+    return 1;
+  }
+  import std.path : absolutePath, buildNormalizedPath;
+  const normPath = buildNormalizedPath(absolutePath(rawPath));
   try {
-    rootRepo.addRoot(args[2], args[3]);
+    rootRepo.addRoot(name, normPath);
     if (opts.format == OutputFormat.console) {
-      writefln("Registered root '%s' -> '%s'", args[2], args[3]);
+      writefln("Registered root '%s' -> '%s'", name, normPath);
     }
     return 0;
   } catch (Exception e) {
@@ -447,13 +468,25 @@ int handleRootSetPath(
     stderr.writeln("Usage: listremo root set-path <name> <new_path>");
     return 1;
   }
-  if (rootRepo.setPath(args[2], args[3])) {
+  const name = args[2];
+  if (name.length == 0) {
+    stderr.writeln("Error: Root name cannot be empty.");
+    return 1;
+  }
+  const rawPath = args[3];
+  if (rawPath.length == 0) {
+    stderr.writeln("Error: Root path cannot be empty.");
+    return 1;
+  }
+  import std.path : absolutePath, buildNormalizedPath;
+  const normPath = buildNormalizedPath(absolutePath(rawPath));
+  if (rootRepo.setPath(name, normPath)) {
     if (opts.format == OutputFormat.console) {
-      writefln("Updated path for '%s' -> '%s'", args[2], args[3]);
+      writefln("Updated path for '%s' -> '%s'", name, normPath);
     }
     return 0;
   }
-  stderr.writefln("Error: Root '%s' not found.", args[2]);
+  stderr.writefln("Error: Root '%s' not found.", name);
   return 1;
 }
 
@@ -475,6 +508,7 @@ bool parseSyncArgs(string[] args, out SyncArgs parsed) {
         stderr.writeln("Error: Missing value for --jobs option.");
         return false;
       }
+      parsed.jobsPassed = true;
       const valStr = args[++i];
       try {
         import std.conv : to;
@@ -495,9 +529,18 @@ bool parseSyncArgs(string[] args, out SyncArgs parsed) {
       try {
         import std.conv : to;
         parsed.progressIntervalMs = to!uint(valStr);
+        if (parsed.progressIntervalMs == 0) {
+          stderr.writefln(
+            "Invalid --progress-interval value '%s'. " ~
+            "Expected positive integer.",
+            valStr
+          );
+          return false;
+        }
       } catch (Exception) {
         stderr.writefln(
-          "Invalid --progress-interval value '%s'. Expected positive integer.",
+          "Invalid --progress-interval value '%s'. " ~
+          "Expected positive integer.",
           valStr
         );
         return false;
@@ -514,6 +557,10 @@ bool parseSyncArgs(string[] args, out SyncArgs parsed) {
     }
   }
 
+  if (parsed.jobsPassed && !parsed.allFlag) {
+    stderr.writeln("Warning: Option --jobs/-j has no effect without --all.");
+  }
+
   if (!parsed.allFlag && parsed.targetRoot.length == 0) {
     stderr.writeln(
       "Usage: listremo sync <name|pattern> [options] OR --all [pattern]"
@@ -526,8 +573,9 @@ bool parseSyncArgs(string[] args, out SyncArgs parsed) {
 struct SyncRunContext {
   SyncArgs syncArgs;
   OutputOptions opts;
-  ConsoleProgressReporter reporter;
+  ConsoleProgressReporter reporter = null;
   bool syncStarted = false;
+  Mutex logMutex = null;
 }
 
 int handleSyncCommand(
@@ -557,10 +605,7 @@ int handleSyncCommand(
         return 1;
       }
     } else {
-      const summaries = rootRepo.listRoots();
-      foreach (ref s; summaries) {
-        toSync ~= s.root;
-      }
+      toSync = rootRepo.findByPattern("%");
     }
   } else {
     const matched = rootRepo.findByPattern(syncArgs.targetRoot);
@@ -571,7 +616,7 @@ int handleSyncCommand(
         );
       } else {
         stderr.writefln(
-          "Error: Root '%s' not registered.", syncArgs.targetRoot
+          "Error: Root '%s' not found.", syncArgs.targetRoot
         );
       }
       return 1;
@@ -620,6 +665,7 @@ bool runParallelSync(
   out bool syncStarted
 ) {
   import core.sync.mutex : Mutex;
+  import orglistremo.db.connection : openWorkerDatabase;
   import std.parallelism : TaskPool, totalCPUs;
 
   const numWorkers = (syncArgs.jobs == 0)
@@ -635,23 +681,31 @@ bool runParallelSync(
   bool anyStarted = false;
 
   foreach (root; pool.parallel(toSync)) {
-    auto threadDb = openDatabaseChecked(
-      ctx.dbPath, ctx.busyTimeoutMs
-    ).db;
-    scope (exit) {
-      threadDb.close();
-    }
+    try {
+      Database threadDb = openWorkerDatabase(
+        ctx.dbPath, ctx.busyTimeoutMs
+      );
+      scope (exit) {
+        threadDb.close();
+      }
 
-    SyncRunContext threadCtx = SyncRunContext(syncArgs, opts, null);
-    if (!syncSingleRoot(threadDb, root, threadCtx)) {
+      SyncRunContext threadCtx = SyncRunContext(
+        syncArgs, opts, null, false, mtx
+      );
+      const success = syncSingleRoot(threadDb, root, threadCtx);
       synchronized (mtx) {
+        if (!success) {
+          hadError = true;
+        }
+        if (threadCtx.syncStarted) {
+          anyStarted = true;
+        }
+      }
+    } catch (Exception e) {
+      syncLog(mtx, {
         hadError = true;
-      }
-    }
-    if (threadCtx.syncStarted) {
-      synchronized (mtx) {
-        anyStarted = true;
-      }
+        stderr.writefln("Error syncing root '%s': %s", root.name, e.msg);
+      });
     }
   }
 
@@ -685,6 +739,16 @@ bool runSequentialSync(
   return hadError;
 }
 
+void syncLog(Mutex mtx, scope void delegate() action) {
+  if (mtx !is null) {
+    synchronized (mtx) {
+      action();
+    }
+  } else {
+    action();
+  }
+}
+
 bool syncSingleRoot(
   ref Database db,
   const ref Root root,
@@ -692,7 +756,7 @@ bool syncSingleRoot(
 ) {
   SyncLockRepository lockRepo = SyncLockRepository(db);
   const myPid = thisProcessID;
-  const myHost = Socket.hostName;
+  const myHost = getLocalHostName();
   const now = Clock.currTime.toUnixTime();
   SyncLockInfo existingLock;
 
@@ -707,13 +771,15 @@ bool syncSingleRoot(
       );
     } else if (existingLock.hostname == myHost
                && !isPidAlive(existingLock.pid)) {
-      stderr.writefln(
-        "Warning: Clearing stale sync lock on root '%s' " ~
-        "(PID %d on %s is no longer active).",
-        root.name,
-        existingLock.pid,
-        existingLock.hostname
-      );
+      syncLog(runCtx.logMutex, {
+        stderr.writefln(
+          "Warning: Clearing stale sync lock on root '%s' " ~
+          "(PID %d on %s is no longer active).",
+          root.name,
+          existingLock.pid,
+          existingLock.hostname
+        );
+      });
       lockRepo.breakLock(root.id);
       acquired = lockRepo.acquireLock(
         root.id, myPid, myHost, now, existingLock
@@ -722,29 +788,33 @@ bool syncSingleRoot(
   }
 
   if (!acquired) {
-    stderr.writefln(
-      "Error: Root '%s' is currently being synced by PID %d on host '%s' " ~
-      "(started %s).",
-      root.name,
-      existingLock.pid,
-      existingLock.hostname,
-      formatUnixTime(existingLock.startedAt)
-    );
-    stderr.writeln(
-      "Use 'listremo sync <name> --break-lock' if the process was terminated."
-    );
+    syncLog(runCtx.logMutex, {
+      stderr.writefln(
+        "Error: Root '%s' is currently being synced by PID %d on host '%s' " ~
+        "(started %s).",
+        root.name,
+        existingLock.pid,
+        existingLock.hostname,
+        formatUnixTime(existingLock.startedAt)
+      );
+      stderr.writeln(
+        "Use 'listremo sync <name> --break-lock' if the process was terminated."
+      );
+    });
     return false;
   }
 
   scope (exit) {
-    lockRepo.releaseLock(root.id);
+    lockRepo.releaseLock(root.id, myPid, myHost);
   }
 
   runCtx.syncStarted = true;
 
-  if (runCtx.opts.format == OutputFormat.console) {
-    writefln("Syncing root '%s' (%s)...", root.name, root.path);
-  }
+  syncLog(runCtx.logMutex, {
+    if (runCtx.opts.format == OutputFormat.console) {
+      writefln("Syncing root '%s' (%s)...", root.name, root.path);
+    }
+  });
   try {
     SyncOptions syncOpts;
     syncOpts.force = runCtx.syncArgs.forceFlag;
@@ -753,47 +823,55 @@ bool syncSingleRoot(
       syncOpts.onProgress = &runCtx.reporter.onProgress;
     }
     syncOpts.onIssue = (const ref SyncIssue issue) {
-      if (runCtx.reporter !is null) {
-        runCtx.reporter.clear();
-      }
-      stderr.writefln(
-        "Warning: Failed to %s '%s': %s",
-        issue.isDir ? "access directory" : "read file",
-        issue.path,
-        issue.message
-      );
+      syncLog(runCtx.logMutex, {
+        if (runCtx.reporter !is null) {
+          runCtx.reporter.clear();
+        }
+        stderr.writefln(
+          "Warning: Failed to %s '%s': %s",
+          issue.isDir ? "access directory" : "read file",
+          issue.path,
+          issue.message
+        );
+      });
     };
 
     const stats = syncRoot(db, root, syncOpts);
-    if (runCtx.reporter !is null) {
-      runCtx.reporter.clear();
-    }
-    if (runCtx.opts.format == OutputFormat.console) {
-      writefln(
-        "  Done: %d files, %d dirs, %d reused hashes.",
-        stats.fileCount,
-        stats.dirCount,
-        stats.reusedHashes
-      );
-    }
-    if (stats.errors.length > 0) {
-      stderr.writefln("  Completed with %d error(s):", stats.errors.length);
-      foreach (ref err; stats.errors) {
-        stderr.writefln(
-          "    - Failed to %s '%s': %s",
-          err.isDir ? "access directory" : "read file",
-          err.path,
-          err.message
+    syncLog(runCtx.logMutex, {
+      if (runCtx.reporter !is null) {
+        runCtx.reporter.clear();
+      }
+      if (runCtx.opts.format == OutputFormat.console) {
+        writefln(
+          "  Done: %d files, %d dirs, %d reused hashes.",
+          stats.fileCount,
+          stats.dirCount,
+          stats.reusedHashes
         );
       }
+      if (stats.errors.length > 0) {
+        stderr.writefln("  Completed with %d error(s):", stats.errors.length);
+        foreach (ref err; stats.errors) {
+          stderr.writefln(
+            "    - Failed to %s '%s': %s",
+            err.isDir ? "access directory" : "read file",
+            err.path,
+            err.message
+          );
+        }
+      }
+    });
+    if (stats.errors.length > 0) {
       return false;
     }
     return true;
   } catch (Exception e) {
-    if (runCtx.reporter !is null) {
-      runCtx.reporter.clear();
-    }
-    stderr.writefln("Error syncing root '%s': %s", root.name, e.msg);
+    syncLog(runCtx.logMutex, {
+      if (runCtx.reporter !is null) {
+        runCtx.reporter.clear();
+      }
+      stderr.writefln("Error syncing root '%s': %s", root.name, e.msg);
+    });
     return false;
   }
 }
@@ -848,7 +926,17 @@ int handleMigrateCommand(
     if (!promptBackupPath(ctx.dbPath, backupPath)) {
       return 1;
     }
-    if (!writeDatabaseBackup(ctx.dbPath, backupPath, opts)) {
+    try {
+      writeDatabaseBackup(ctx.db, backupPath);
+      if (opts.format == OutputFormat.console) {
+        writefln("Saved database backup to '%s'.", backupPath);
+      }
+    } catch (Exception e) {
+      stderr.writefln(
+        "Error: Failed to write backup file '%s': %s",
+        backupPath,
+        e.msg
+      );
       return 1;
     }
   }
@@ -1030,8 +1118,50 @@ int handleListCommand(
     }
   }
 
+  if (specs.length > 1) {
+    sortEntries(allEntries, listArgs.sortField);
+  }
+
   outputEntries(allEntries, opts);
   return 0;
+}
+
+void sortEntries(Entry[] entries, SortField sortField) {
+  import std.algorithm.sorting : sort;
+
+  switch (sortField) {
+    case SortField.size:
+      entries.sort!((a, b) {
+        if (a.size != b.size) {
+          return a.size > b.size;
+        }
+        if (a.rootName != b.rootName) {
+          return a.rootName < b.rootName;
+        }
+        return a.relPath < b.relPath;
+      });
+      break;
+    case SortField.mtime:
+      entries.sort!((a, b) {
+        if (a.mtime != b.mtime) {
+          return a.mtime > b.mtime;
+        }
+        if (a.rootName != b.rootName) {
+          return a.rootName < b.rootName;
+        }
+        return a.relPath < b.relPath;
+      });
+      break;
+    case SortField.path:
+    default:
+      entries.sort!((a, b) {
+        if (a.rootName != b.rootName) {
+          return a.rootName < b.rootName;
+        }
+        return a.relPath < b.relPath;
+      });
+      break;
+  }
 }
 
 bool parseDuplicateOrUniqueArgs(
@@ -1327,23 +1457,12 @@ unittest {
   );
   assert(handleRootCommand(ctx, ["root", "remove", "r1"], testOpts) == 0);
 
-  // Sync commands with empty root and --force
-  import std.file : exists, mkdirRecurse, rmdirRecurse, tempDir;
-  import std.path : buildPath;
-  const syncTempDir = buildPath(tempDir(), "listremo_app_sync_test");
-  if (exists(syncTempDir)) {
-    rmdirRecurse(syncTempDir);
-  }
-  mkdirRecurse(syncTempDir);
-  scope (exit) {
-    if (exists(syncTempDir)) {
-      rmdirRecurse(syncTempDir);
-    }
-  }
+  import orglistremo.internal.testutil : TempDir;
+  TempDir syncTempDir = TempDir("app_sync");
 
   assert(
     handleRootCommand(
-      ctx, ["root", "add", "r_temp", syncTempDir], testOpts
+      ctx, ["root", "add", "r_temp", syncTempDir.path], testOpts
     ) == 0
   );
   // Initially empty directory and empty DB -> returns 0
@@ -1389,11 +1508,11 @@ unittest {
   // Test sync continues on unreadable file and returns 1
   import std.file : write;
   import std.process : execute;
-  write(buildPath(syncTempDir, "ok.txt"), "good content");
-  write(buildPath(syncTempDir, "bad.txt"), "secret content");
-  execute(["chmod", "000", buildPath(syncTempDir, "bad.txt")]);
+  write(syncTempDir.subPath("ok.txt"), "good content");
+  write(syncTempDir.subPath("bad.txt"), "secret content");
+  execute(["chmod", "000", syncTempDir.subPath("bad.txt")]);
   scope (exit) {
-    execute(["chmod", "644", buildPath(syncTempDir, "bad.txt")]);
+    execute(["chmod", "644", syncTempDir.subPath("bad.txt")]);
   }
 
   // Returns 1 because errors occurred during sync
@@ -1435,59 +1554,22 @@ unittest {
   assert(!parseMigrateArgs(["migrate", "extra"], migInvalidPos));
 
   // Test backup path proposal and read-only / migration workflow
-  const migDir = buildPath(tempDir(), "listremo_app_migrate_test");
-  if (exists(migDir)) {
-    execute(["chmod", "-R", "755", migDir]);
-    rmdirRecurse(migDir);
-  }
-  mkdirRecurse(migDir);
-  scope (exit) {
-    if (exists(migDir)) {
-      execute(["chmod", "-R", "755", migDir]);
-      rmdirRecurse(migDir);
-    }
-  }
+  import orglistremo.internal.testutil :
+    createLegacyV0Db, LegacyV0Options, TempDir;
+  TempDir migDir = TempDir("app_migrate");
 
-  const dbFile = buildPath(migDir, "catalog.db");
-  const backup1 = buildPath(migDir, "catalog-backup-1.db");
-  const backup2 = buildPath(migDir, "catalog-backup-2.db");
+  const dbFile = migDir.subPath("catalog.db");
+  const backup1 = migDir.subPath("catalog-backup-1.db");
+  const backup2 = migDir.subPath("catalog-backup-2.db");
 
   assert(proposeBackupPath(dbFile) == backup1);
   write(backup1, "existing backup");
   assert(proposeBackupPath(dbFile) == backup2);
 
   // Create legacy v0 database with roots and entries
-  {
-    auto rawDb = Database(dbFile);
-    rawDb.execute(`
-      CREATE TABLE roots (
-        id          INTEGER PRIMARY KEY AUTOINCREMENT,
-        name        TEXT NOT NULL UNIQUE,
-        path        TEXT NOT NULL,
-        created_at  INTEGER NOT NULL,
-        last_sync   INTEGER
-      );
-    `);
-    rawDb.execute(`
-      CREATE TABLE entries (
-        id          INTEGER PRIMARY KEY AUTOINCREMENT,
-        root_id     INTEGER NOT NULL REFERENCES roots(id) ON DELETE CASCADE,
-        rel_path    TEXT NOT NULL,
-        parent_path TEXT,
-        name        TEXT NOT NULL,
-        is_dir      INTEGER NOT NULL,
-        size        INTEGER NOT NULL,
-        mtime       INTEGER NOT NULL,
-        sha256      TEXT NOT NULL,
-        UNIQUE(root_id, rel_path)
-      );
-    `);
-    rawDb.execute(`
-      INSERT INTO roots (name, path, created_at)
-      VALUES ('old_root', '/mnt/old', 1650000000);
-    `);
-    rawDb.close();
-  }
+  createLegacyV0Db(
+    dbFile, LegacyV0Options("old_root", "/mnt/old", 1650000000)
+  );
 
   DbOpenResult openRes = openDatabaseChecked(dbFile);
   assert(openRes.isReadOnly);
@@ -1516,11 +1598,12 @@ unittest {
   assert(dispatchCommand(roCtx, ["sync", "old_root"], opts) == 1);
 
   // Test writeDatabaseBackup failure preserves original database intact
+  import std.exception : assertThrown;
   const roBackupDir = buildPath(migDir, "unwritable_dir");
   mkdirRecurse(roBackupDir);
   execute(["chmod", "500", roBackupDir]);
   const badBackupPath = buildPath(roBackupDir, "backup.db");
-  assert(!writeDatabaseBackup(dbFile, badBackupPath, opts));
+  assertThrown!Exception(writeDatabaseBackup(roCtx.db, badBackupPath));
   assert(readDbSchemaVersion(roCtx.db) == 0);
 
   // Migrate with --no-backup upgrades schema and unlocks write commands
@@ -1553,7 +1636,7 @@ unittest {
   // 1. Artificially acquire lock by thisProcessID (active process)
   assert(
     lockRepo.acquireLock(
-      lockRoot.id, thisProcessID, Socket.hostName, 1700000000, existing
+      lockRoot.id, thisProcessID, getLocalHostName(), 1700000000, existing
     )
   );
 
@@ -1571,7 +1654,7 @@ unittest {
   version (Posix) {
     assert(
       lockRepo.acquireLock(
-        lockRoot.id, 99_999_999, Socket.hostName, 1700000000, existing
+        lockRoot.id, 99_999_999, getLocalHostName(), 1700000000, existing
       )
     );
     // Sync without --break-lock should auto-clear stale lock and succeed
@@ -1583,22 +1666,12 @@ unittest {
 
 unittest {
   import orglistremo.db.connection : openDatabase;
-  import std.file : exists, mkdirRecurse, rmdirRecurse, tempDir;
-  import std.path : buildPath;
+  import orglistremo.internal.testutil : TempDir;
+  import std.file : mkdirRecurse;
 
-  const appTestDir = buildPath(tempDir(), "listremo_pattern_test");
-  if (exists(appTestDir)) {
-    rmdirRecurse(appTestDir);
-  }
-  mkdirRecurse(appTestDir);
-  scope (exit) {
-    if (exists(appTestDir)) {
-      rmdirRecurse(appTestDir);
-    }
-  }
-
-  const d1 = buildPath(appTestDir, "d1");
-  const d2 = buildPath(appTestDir, "d2");
+  TempDir appTestDir = TempDir("app_pattern");
+  const d1 = appTestDir.subPath("d1");
+  const d2 = appTestDir.subPath("d2");
   mkdirRecurse(d1);
   mkdirRecurse(d2);
 
@@ -1775,4 +1848,60 @@ unittest {
       ctx, ["unique", "alpha%", "nonexistent"], opts
     ) == 1
   );
+
+  // Test sortEntries helper
+  Entry[] toSort = [
+    Entry(1, 1, "rA", "f1", ".", "f1", false, 100, 1000, "h1"),
+    Entry(2, 1, "rA", "f2", ".", "f2", false, 500, 3000, "h2"),
+    Entry(3, 2, "rB", "f3", ".", "f3", false, 200, 2000, "h3"),
+    Entry(4, 2, "rB", "f4", ".", "f4", false, 800, 4000, "h4")
+  ];
+  sortEntries(toSort, SortField.size);
+  assert(toSort[0].size == 800);
+  assert(toSort[1].size == 500);
+  assert(toSort[2].size == 200);
+  assert(toSort[3].size == 100);
+
+  sortEntries(toSort, SortField.mtime);
+  assert(toSort[0].mtime == 4000);
+  assert(toSort[1].mtime == 3000);
+  assert(toSort[2].mtime == 2000);
+  assert(toSort[3].mtime == 1000);
+
+  // Test root CLI validation & path normalization
+  assert(
+    handleRootCommand(ctx, ["root", "add", "bad:name", "/mnt"], opts) == 1
+  );
+  assert(
+    handleRootCommand(ctx, ["root", "add", "", "/mnt"], opts) == 1
+  );
+  assert(
+    handleRootCommand(ctx, ["root", "add", "valid", ""], opts) == 1
+  );
+  assert(
+    handleRootCommand(ctx, ["root", "set-path", "", "/mnt"], opts) == 1
+  );
+  assert(
+    handleRootCommand(ctx, ["root", "set-path", "r1", ""], opts) == 1
+  );
+  assert(
+    handleRootCommand(
+      ctx, ["root", "add", "norm_root", "./custom_rel"], opts
+    ) == 0
+  );
+  Root normCheck;
+  import std.path : absolutePath, buildNormalizedPath;
+  assert(RootRepository(ctx.db).findByName("norm_root", normCheck));
+  assert(normCheck.path == buildNormalizedPath(absolutePath("./custom_rel")));
+
+  // Test --progress-interval 0 rejection & -j flag without --all
+  SyncArgs intervalArgs;
+  assert(
+    !parseSyncArgs(
+      ["sync", "norm_root", "--progress-interval", "0"], intervalArgs
+    )
+  );
+  SyncArgs jobsArgs;
+  assert(parseSyncArgs(["sync", "norm_root", "-j", "4"], jobsArgs));
+  assert(jobsArgs.jobsPassed);
 }

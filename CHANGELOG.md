@@ -1,5 +1,42 @@
 # Changelog
 
+## 0.11
+
+- Extracted test helpers into `internal/testutil.d` (`TempDir`,
+  `createLegacyV0Db`, `captureOutput`) and eliminated hardcoded temporary
+  paths across tests to prevent collisions under parallel execution.
+- Centralized POSIX and platform system calls (`isPidAlive`,
+  `getDeviceFreeSpace`, `isTty`, `isStdoutTty`, `getTerminalWidth`,
+  `getLocalHostName`) into `internal/os.d` scoped to `package(orglistremo)`.
+- Created `pattern.d` centralizing wildcard detection, `NamePattern`, and SQL
+  `LIKE` escaping with zero-allocation fast paths for clean strings.
+- Fixed `_` wildcard escaping in hash search queries (`BUG-16`).
+- Consolidated model and formatting helpers in `model.d` and `output/units.d`
+  (`emptyHash`, `groupDuplicates`, `countEntries`, `summarizeDuplicates`,
+  `makeEntry`, and `formatHash`).
+
+## 0.10
+
+- Hardened database backup against live WAL corruption using SQLite online
+  backup (`VACUUM INTO ?;`).
+- Fixed HTML escaping in `escapeHtml` to process arbitrary non-UTF-8 filenames
+  byte-by-byte without throwing `UnicodeException`.
+- Made console path truncation in `truncatePathLeft` byte-safe by slicing on
+  valid UTF-8 code point boundaries.
+- Fixed directory empty check in `isDiskDirEmpty` to recognize symlinks and
+  propagate filesystem access errors.
+- Decoupled Unix epoch timestamp formatting from `"never"` sync indicator in
+  `formatUnixTime` and introduced `formatLastSync`.
+- Added strict CLI root input validation, root name colon rejection, path
+  normalization, and option validation for `--progress-interval` and `-j`.
+- Enforced thread-safe worker database connections (`openWorkerDatabase`) and
+  synchronized console output in parallel sync.
+- Added lock release ownership verification ensuring locks are released only by
+  matching PID and hostname.
+- Ensured global sort order preservation across multiple targets in `list`.
+- Fixed migration pragma restoration on failure and applied write pragmas.
+- Fixed import TOCTOU race by classifying existing roots inside transaction.
+
 ## 0.9
 
 - Added `import` command (`listremo import <db_file> [<root_pattern>...]`) to

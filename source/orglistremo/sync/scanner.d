@@ -2,6 +2,7 @@ module orglistremo.sync.scanner;
 
 import d2sqlite3 : Database;
 import orglistremo.db.repo : CachedFileEntry, EntryRepository;
+import orglistremo.internal.os : getDeviceFreeSpace;
 import orglistremo.model : Entry, Root;
 import orglistremo.sync.hasher : ChildRecord, hashDirectory, hashFile;
 import std.datetime.systime : Clock;
@@ -52,42 +53,11 @@ struct SyncOptions {
   SyncIssueCallback onIssue;
 }
 
-version (Posix) {
-  import core.sys.posix.sys.statvfs : statvfs_t, statvfs;
-  import std.string : toStringz;
-
-  package(orglistremo) bool getDeviceFreeSpace(
-    string path,
-    out ulong freeBytes
-  ) {
-    statvfs_t st;
-    if (statvfs(path.toStringz, &st) != 0) {
-      return false;
-    }
-    const ulong blockSize = st.f_frsize ? st.f_frsize : st.f_bsize;
-    freeBytes = cast(ulong) st.f_bavail * blockSize;
-    return true;
-  }
-} else {
-  package(orglistremo) bool getDeviceFreeSpace(
-    string path,
-    out ulong freeBytes
-  ) {
-    return false;
-  }
-}
-
 bool isDiskDirEmpty(string path) {
-  try {
-    foreach (entry; dirEntries(path, SpanMode.shallow)) {
-      if (!entry.isSymlink) {
-        return false;
-      }
-    }
-    return true;
-  } catch (Exception) {
+  foreach (entry; dirEntries(path, SpanMode.shallow, false)) {
     return false;
   }
+  return true;
 }
 
 SyncResult syncRoot(
@@ -128,7 +98,14 @@ SyncResult syncRoot(
     &entryRepo,
     options.batchSize
   );
+  scope (failure) {
+    entryRepo.clearStagedEntries(root.id);
+  }
   ctx.scanDir(root.path, ".");
+
+  if (ctx.pendingBatch.length > 0) {
+    ctx.flushBatch();
+  }
 
   if (options.onProgress !is null) {
     SyncProgress p;
@@ -139,14 +116,14 @@ SyncResult syncRoot(
     options.onProgress(p);
   }
 
-  ulong freeSpace = 0;
-  const hasFreeSpace = getDeviceFreeSpace(root.path, freeSpace);
+  const freeSpaceOpt = getDeviceFreeSpace(root.path);
+  const ulong freeSpace =
+    freeSpaceOpt.isNull ? 0 : cast(ulong) freeSpaceOpt.get;
+  const bool hasFreeSpace = !freeSpaceOpt.isNull;
 
   const syncTimestamp = Clock.currTime.toUnixTime();
-  entryRepo.saveSyncEntries(
+  entryRepo.commitStagedSync(
     root.id,
-    ctx.allEntries,
-    ctx.pendingBatch,
     syncTimestamp,
     freeSpace,
     hasFreeSpace
@@ -192,10 +169,11 @@ struct ScannerContext {
       return;
     }
     try {
-      entryRepo.upsertEntriesBatch(rootId, pendingBatch);
+      entryRepo.stageEntriesBatch(rootId, pendingBatch);
       pendingBatch = null;
-    } catch (Exception) {
-      // Retain pendingBatch to retry later
+    } catch (Exception e) {
+      recordIssue(rootName, "Batch staging failed: " ~ e.msg, true);
+      throw e;
     }
   }
 
@@ -401,7 +379,8 @@ unittest {
   import d2sqlite3 : Database;
   import orglistremo.db.connection : openDatabase;
   import orglistremo.db.repo : RootRepository;
-  import std.file : mkdir, mkdirRecurse, rmdirRecurse, tempDir, write;
+  import orglistremo.internal.testutil : TempDir;
+  import std.file : mkdir, mkdirRecurse, write;
 
   Database db = openDatabase(":memory:");
   RootRepository rootRepo = RootRepository(db);
@@ -414,21 +393,12 @@ unittest {
   //   empty_dir/
   //   nested/
   //     sub.txt ("xyz", 3 bytes)
-  const baseTmp = buildPath(tempDir(), "listremo_sync_test");
-  if (exists(baseTmp)) {
-    rmdirRecurse(baseTmp);
-  }
+  TempDir baseTmp = TempDir("sync_base");
   mkdirRecurse(buildPath(baseTmp, "nested"));
   mkdirRecurse(buildPath(baseTmp, "empty_dir"));
   write(buildPath(baseTmp, "empty.txt"), "");
   write(buildPath(baseTmp, "data.txt"), "abc");
   write(buildPath(baseTmp, "nested", "sub.txt"), "xyz");
-
-  scope (exit) {
-    if (exists(baseTmp)) {
-      rmdirRecurse(baseTmp);
-    }
-  }
 
   const rootId = rootRepo.addRoot("fixture", baseTmp);
   Root root;
@@ -506,16 +476,7 @@ unittest {
   assert(saveEvents == 1);
 
   // Test empty root path safety check
-  const emptyBase = buildPath(tempDir(), "listremo_empty_test");
-  if (exists(emptyBase)) {
-    rmdirRecurse(emptyBase);
-  }
-  mkdirRecurse(emptyBase);
-  scope (exit) {
-    if (exists(emptyBase)) {
-      rmdirRecurse(emptyBase);
-    }
-  }
+  TempDir emptyBase = TempDir("sync_empty");
 
   // 1. Initial sync of empty directory when DB has 0 entries -> succeeds
   const emptyRootId = rootRepo.addRoot("empty_root", emptyBase);
@@ -559,12 +520,7 @@ unittest {
 
   // Test continuation on unreadable file and directory
   import std.process : execute;
-  const permBase = buildPath(tempDir(), "listremo_perm_test");
-  if (exists(permBase)) {
-    execute(["chmod", "755", permBase]);
-    rmdirRecurse(permBase);
-  }
-  mkdirRecurse(permBase);
+  TempDir permBase = TempDir("sync_perm");
   write(buildPath(permBase, "good.txt"), "hello");
   write(buildPath(permBase, "bad.txt"), "secret");
   const badDir = buildPath(permBase, "bad_dir");
@@ -573,14 +529,6 @@ unittest {
 
   execute(["chmod", "000", buildPath(permBase, "bad.txt")]);
   execute(["chmod", "000", badDir]);
-
-  scope (exit) {
-    execute(["chmod", "755", badDir]);
-    execute(["chmod", "644", buildPath(permBase, "bad.txt")]);
-    if (exists(permBase)) {
-      rmdirRecurse(permBase);
-    }
-  }
 
   const permRootId = rootRepo.addRoot("perm_root", permBase);
   Root permRoot;
@@ -622,12 +570,45 @@ unittest {
 }
 
 unittest {
-  ulong freeBytes;
   version (Posix) {
     import std.file : tempDir;
 
-    assert(getDeviceFreeSpace(tempDir(), freeBytes));
-    assert(freeBytes > 0);
-    assert(!getDeviceFreeSpace("/nonexistent_path_987654", freeBytes));
+    const freeOpt = getDeviceFreeSpace(tempDir());
+    assert(!freeOpt.isNull);
+    assert(freeOpt.get > 0);
+    assert(getDeviceFreeSpace("/nonexistent_path_987654").isNull);
   }
+}
+
+unittest {
+  import orglistremo.internal.testutil : TempDir;
+  import std.file : FileException, remove, symlink, write;
+  import std.process : execute;
+
+  TempDir emptyTestDir = TempDir("chk_empty");
+
+  // 1. Truly empty directory returns true
+  assert(isDiskDirEmpty(emptyTestDir.path));
+
+  // 2. Symlink-only directory returns false (BUG-09)
+  const string symlinkPath = emptyTestDir.subPath("link_entry");
+  symlink("nonexistent_target", symlinkPath);
+  assert(!isDiskDirEmpty(emptyTestDir.path));
+  remove(symlinkPath);
+
+  // 3. Regular file returns false
+  const string filePath = emptyTestDir.subPath("file_entry.txt");
+  write(filePath, "data");
+  assert(!isDiskDirEmpty(emptyTestDir.path));
+  remove(filePath);
+
+  // 4. Permission denied propagates FileException (BUG-09)
+  execute(["chmod", "000", emptyTestDir.path]);
+  bool threwFileException = false;
+  try {
+    isDiskDirEmpty(emptyTestDir.path);
+  } catch (FileException) {
+    threwFileException = true;
+  }
+  assert(threwFileException);
 }

@@ -1,5 +1,6 @@
 module orglistremo.sync.hasher;
 
+import orglistremo.model : emptyHash;
 import std.algorithm.sorting : sort;
 import std.digest : LetterCase, toHexString;
 import std.digest.sha : SHA256;
@@ -20,7 +21,7 @@ string hashFile(
   HashChunkCallback onChunk = null
 ) {
   if (fileSize == 0) {
-    return "0";
+    return emptyHash;
   }
 
   auto file = File(filePath, "rb");
@@ -45,7 +46,7 @@ void hashDirectory(
   out ulong outTotalSize
 ) {
   if (children.length == 0) {
-    outSha256 = "0";
+    outSha256 = emptyHash;
     outTotalSize = 0;
     return;
   }
@@ -69,20 +70,16 @@ void hashDirectory(
 }
 
 unittest {
-  import std.file : exists, remove, tempDir, write;
-  import std.path : buildPath;
+  import orglistremo.internal.testutil : TempDir;
+  import std.file : write;
 
   // Test empty file
-  const emptyHash = hashFile("/dev/null", 0);
-  assert(emptyHash == "0");
+  const zeroHash = hashFile("/dev/null", 0);
+  assert(zeroHash == emptyHash);
 
   // Test non-empty file
-  const tmpFile = buildPath(tempDir(), "listremo_hasher_test.txt");
-  scope (exit) {
-    if (exists(tmpFile)) {
-      remove(tmpFile);
-    }
-  }
+  TempDir tempDir = TempDir("hasher");
+  const tmpFile = tempDir.subPath("test.txt");
   write(tmpFile, "hello listremo\n");
   ulong callbackBytesHashed = 0;
   ulong callbackTotalBytes = 0;
@@ -104,7 +101,7 @@ unittest {
   string dirHash;
   ulong dirSize;
   hashDirectory(emptyChildren, dirHash, dirSize);
-  assert(dirHash == "0");
+  assert(dirHash == emptyHash);
   assert(dirSize == 0);
 
   // Test deterministic directory hashing regardless of initial child order

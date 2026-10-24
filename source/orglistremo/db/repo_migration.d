@@ -5,6 +5,11 @@ import orglistremo.app_version : appVersion;
 import orglistremo.db.schema_version : schemaVersion;
 import std.datetime.systime : Clock;
 
+void applyWritePragmas(ref Database db) {
+  db.execute("PRAGMA journal_mode = WAL;");
+  db.execute("PRAGMA synchronous = NORMAL;");
+}
+
 void migrateDatabase(ref Database db, int fromVersion) {
   if (fromVersion < 0 || fromVersion >= schemaVersion) {
     import std.format : format;
@@ -17,7 +22,17 @@ void migrateDatabase(ref Database db, int fromVersion) {
     );
   }
 
-  db.execute("PRAGMA query_only = OFF;");
+  const bool wasQueryOnly =
+    db.execute("PRAGMA query_only;").oneValue!int != 0;
+  if (wasQueryOnly) {
+    db.execute("PRAGMA query_only = OFF;");
+  }
+  scope (failure) {
+    if (wasQueryOnly) {
+      db.execute("PRAGMA query_only = ON;");
+    }
+  }
+
   db.execute("BEGIN IMMEDIATE;");
   scope (failure) {
     db.execute("ROLLBACK;");
@@ -46,6 +61,7 @@ void migrateDatabase(ref Database db, int fromVersion) {
   }
 
   db.execute("COMMIT;");
+  applyWritePragmas(db);
 }
 
 void migrateFrom0to1(ref Database db, long creationDate, long now) {
@@ -187,21 +203,10 @@ void insertVersionRow(
 }
 
 unittest {
+  import orglistremo.internal.testutil : createLegacyV0Db, LegacyV0Options;
+
   auto db = Database(":memory:");
-  // Start with v0 schema (only roots table)
-  db.execute(`
-    CREATE TABLE roots (
-      id          INTEGER PRIMARY KEY AUTOINCREMENT,
-      name        TEXT NOT NULL UNIQUE,
-      path        TEXT NOT NULL,
-      created_at  INTEGER NOT NULL,
-      last_sync   INTEGER
-    );
-  `);
-  db.execute(`
-    INSERT INTO roots (name, path, created_at)
-    VALUES ('r1', '/path/1', 1700000000);
-  `);
+  createLegacyV0Db(db, LegacyV0Options("r1", "/path/1", 1700000000));
 
   // Migrate from 0 to 2
   migrateDatabase(db, 0);
@@ -273,4 +278,15 @@ unittest {
     "SELECT free_space FROM roots WHERE name = 'r_v2';"
   ).oneValue!long;
   assert(freeVal == 5000000000);
+}
+
+unittest {
+  auto db = Database(":memory:");
+  applyWritePragmas(db);
+  assert(db.execute("PRAGMA synchronous;").oneValue!int == 1);
+
+  db.execute("PRAGMA query_only = ON;");
+  import std.exception : assertThrown;
+  assertThrown!Exception(migrateDatabase(db, -1));
+  assert(db.execute("PRAGMA query_only;").oneValue!int != 0);
 }

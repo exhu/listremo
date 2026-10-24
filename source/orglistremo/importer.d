@@ -7,10 +7,11 @@ import orglistremo.db.backup : promptBackupPath, writeDatabaseBackup;
 import orglistremo.db.connection : readDbSchemaVersion;
 import orglistremo.db.repo : EntryRepository, RootRepository;
 import orglistremo.model :
-  Entry, hasPatternWildcard, OutputFormat, Root;
+  Entry, OutputFormat, Root;
+import orglistremo.pattern : hasPatternWildcard;
 import orglistremo.output.console : OutputOptions;
 import orglistremo.output.units : formatDuration;
-import std.stdio : File, stderr, stdout, writeln;
+import std.stdio : File, stderr, stdout, writefln, writeln;
 
 struct ImportArgs {
   string sourceDbPath;
@@ -107,6 +108,11 @@ ImportSummary executeImportRoots(
     return summary;
   }
 
+  targetDb.execute("BEGIN IMMEDIATE;");
+  scope (failure) {
+    targetDb.execute("ROLLBACK;");
+  }
+
   RootRepository dstRootRepo = RootRepository(targetDb);
   EntryRepository dstEntryRepo = EntryRepository(targetDb);
   EntryRepository srcEntryRepo = EntryRepository(sourceDb);
@@ -121,11 +127,6 @@ ImportSummary executeImportRoots(
     } else {
       newRoots ~= srcRoot;
     }
-  }
-
-  targetDb.execute("BEGIN IMMEDIATE;");
-  scope (failure) {
-    targetDb.execute("ROLLBACK;");
   }
 
   // 1. Import new roots and their entries
@@ -232,7 +233,17 @@ int handleImportCommand(
     if (!promptBackupPath(ctx.dbPath, backupPath, "Import")) {
       return 1;
     }
-    if (!writeDatabaseBackup(ctx.dbPath, backupPath, opts)) {
+    try {
+      writeDatabaseBackup(ctx.db, backupPath);
+      if (opts.format == OutputFormat.console) {
+        writefln("Saved database backup to '%s'.", backupPath);
+      }
+    } catch (Exception e) {
+      stderr.writefln(
+        "Error: Failed to write backup file '%s': %s",
+        backupPath,
+        e.msg
+      );
       return 1;
     }
   }
@@ -588,15 +599,13 @@ unittest {
   assert(dstEntries.listEntries(dstKeepId).length == 2);
 
   // Test printImportSummary output
+  import orglistremo.internal.testutil : captureOutput;
+
   OutputOptions outOpts;
   outOpts.format = OutputFormat.console;
-  File tmpSummary = File.tmpfile();
-  printImportSummary(summary, dur!"msecs"(120), outOpts, tmpSummary);
-  tmpSummary.rewind();
-  string summaryText;
-  foreach (line; tmpSummary.byLineCopy()) {
-    summaryText ~= line ~ "\n";
-  }
+  const summaryText = captureOutput((File f) {
+    printImportSummary(summary, dur!"msecs"(120), outOpts, f);
+  });
   import std.algorithm.searching : canFind;
   assert(canFind(summaryText, "New roots imported (1): root_new"));
   assert(canFind(summaryText, "Roots updated (1): root_update"));
@@ -614,38 +623,15 @@ unittest {
 unittest {
   import orglistremo.db.connection : openDatabaseChecked;
   import orglistremo.db.schema_version : schemaVersion;
-  import std.file : exists, mkdirRecurse, rmdirRecurse, tempDir;
-  import std.path : buildPath;
+  import orglistremo.internal.testutil : createLegacyV0Db, TempDir;
 
-  const testDir = buildPath(tempDir(), "listremo_importer_cmd_test");
-  if (exists(testDir)) {
-    rmdirRecurse(testDir);
-  }
-  mkdirRecurse(testDir);
-  scope (exit) {
-    if (exists(testDir)) {
-      rmdirRecurse(testDir);
-    }
-  }
-
-  const dstPath = buildPath(testDir, "dst.db");
-  const srcPath = buildPath(testDir, "src.db");
-  const oldVerPath = buildPath(testDir, "old_ver.db");
+  TempDir testDir = TempDir("importer");
+  const dstPath = testDir.subPath("dst.db");
+  const srcPath = testDir.subPath("src.db");
+  const oldVerPath = testDir.subPath("old_ver.db");
 
   // Create old schema v0 database
-  {
-    auto rawDb = Database(oldVerPath);
-    rawDb.execute(`
-      CREATE TABLE roots (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT NOT NULL UNIQUE,
-        path TEXT NOT NULL,
-        created_at INTEGER NOT NULL,
-        last_sync INTEGER
-      );
-    `);
-    rawDb.close();
-  }
+  createLegacyV0Db(oldVerPath);
 
   // Create source database (current schema version)
   {
@@ -704,7 +690,7 @@ unittest {
   // 2. Nonexistent source DB is rejected
   assert(
     handleImportCommand(
-      ctx, ["import", buildPath(testDir, "missing.db"), "--no-backup"], opts
+      ctx, ["import", testDir.subPath("missing.db"), "--no-backup"], opts
     ) == 1
   );
 

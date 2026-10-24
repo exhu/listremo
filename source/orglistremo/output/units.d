@@ -1,7 +1,15 @@
 module orglistremo.output.units;
 
 import core.time : Duration;
+import orglistremo.model : emptyHash;
 import std.format : format;
+
+string formatHash(string h, bool fullHash) {
+  if (fullHash || h == emptyHash || h.length <= 12) {
+    return h;
+  }
+  return h[0 .. 12];
+}
 
 string formatSizeHuman(ulong bytes) {
   if (bytes < 1024) {
@@ -18,11 +26,16 @@ string formatSizeHuman(ulong bytes) {
 }
 
 string formatUnixTime(long ts) {
-  if (ts <= 0) {
-    return "never";
-  }
   return formatTimestamp(ts, ' ');
 }
+
+string formatLastSync(long ts, bool hasLastSync) {
+  if (!hasLastSync) {
+    return "never";
+  }
+  return formatUnixTime(ts);
+}
+
 
 string formatIso8601(long unixTs) {
   if (unixTs <= 0) {
@@ -79,8 +92,15 @@ unittest {
   assert(formatSizeHuman(1024) == "1.00 KiB");
   assert(formatSizeHuman(1048576) == "1.00 MiB");
 
-  assert(formatUnixTime(0) == "never");
+  assert(formatUnixTime(0).length == 19);
+  assert(formatUnixTime(0)[0 .. 4] == "1970");
   assert(formatUnixTime(1700000000).length == 19);
+
+  assert(formatLastSync(0, false) == "never");
+  assert(formatLastSync(1700000000, false) == "never");
+  assert(formatLastSync(0, true).length == 19);
+  assert(formatLastSync(0, true)[0 .. 4] == "1970");
+  assert(formatLastSync(1700000000, true).length == 19);
 
   assert(formatIso8601(0) == "");
   const iso = formatIso8601(1700000000);
@@ -91,4 +111,10 @@ unittest {
   assert(formatDuration(dur!"msecs"(1500)) == "1.50 s");
   assert(formatDuration(dur!"seconds"(65)) == "1m 05s");
   assert(formatDuration(dur!"seconds"(3665)) == "1h 01m 05s");
+
+  assert(formatHash("0", false) == "0");
+  assert(formatHash("e3b0c44298fc1c149afbf4c8996fb924", false)
+    == "e3b0c44298fc");
+  assert(formatHash("e3b0c44298fc1c149afbf4c8996fb924", true)
+    == "e3b0c44298fc1c149afbf4c8996fb924");
 }

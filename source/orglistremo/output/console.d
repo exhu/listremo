@@ -1,10 +1,12 @@
 module orglistremo.output.console;
 
 import core.time : dur, Duration, MonoTime;
+import orglistremo.internal.os :
+  getTerminalWidth, isStdoutTty, isTty;
 import orglistremo.model :
   ColorMode, DuplicateGroup, Entry, OutputFormat, RootSummary;
 import orglistremo.output.units :
-  formatDuration, formatSizeHuman, formatUnixTime;
+  formatDuration, formatHash, formatLastSync, formatSizeHuman, formatUnixTime;
 import orglistremo.sync.scanner :
   SyncPhase, SyncProgress, SyncProgressCallback;
 import std.format : format;
@@ -62,9 +64,8 @@ public:
     this.styler = opts.styler;
     this.interval = dur!"msecs"(intervalMs);
     this.stream = stream;
-    import core.sys.posix.unistd : isatty;
     this.isTty = (opts.format == OutputFormat.console)
-      && (isatty(stream.fileno) != 0);
+      && .isTty(stream.fileno);
   }
 
   this(
@@ -199,13 +200,12 @@ bool shouldColorize(ColorMode mode) {
   if (mode == ColorMode.never) {
     return false;
   }
-  import core.sys.posix.unistd : isatty, STDOUT_FILENO;
   import std.process : environment;
 
   if (environment.get("NO_COLOR", null) !is null) {
     return false;
   }
-  return isatty(STDOUT_FILENO) != 0;
+  return isStdoutTty();
 }
 
 string formatEntryPath(in Entry e, in Styler styler) {
@@ -252,9 +252,7 @@ void printConsoleRoots(
 
   foreach (ref s; summaries) {
     const rawSize = formatSizeHuman(s.totalSize);
-    const syncTimeStr = s.root.hasLastSync
-      ? formatUnixTime(s.root.lastSync)
-      : "never";
+    const syncTimeStr = formatLastSync(s.root.lastSync, s.root.hasLastSync);
     const freeStr = s.root.hasFreeSpace
       ? formatSizeHuman(s.root.freeSpace)
       : "-";
@@ -374,33 +372,51 @@ void printConsoleUnique(
 
 private:
 
-string formatHash(string h, bool fullHash) {
-  if (fullHash || h == "0" || h.length <= 12) {
-    return h;
+size_t countCodePoints(string s) {
+  size_t count = 0;
+  foreach (const char c; s) {
+    if ((c & 0xC0) != 0x80) {
+      count++;
+    }
   }
-  return h[0 .. 12];
+  return count;
+}
+
+size_t findSuffixStart(string s, size_t targetCodePoints) {
+  if (targetCodePoints == 0 || s.length == 0) {
+    return s.length;
+  }
+  size_t count = 0;
+  size_t i = s.length;
+  while (i > 0) {
+    i--;
+    if ((s[i] & 0xC0) != 0x80) {
+      count++;
+      if (count == targetCodePoints) {
+        return i;
+      }
+    }
+  }
+  return 0;
 }
 
 string truncatePathLeft(string path, size_t maxLen) {
-  if (path.length <= maxLen) {
+  if (maxLen == 0) {
+    return "";
+  }
+  if (path.length <= maxLen || countCodePoints(path) <= maxLen) {
     return path;
   }
   if (maxLen <= 3) {
-    return path[$ - maxLen .. $];
+    const size_t start = findSuffixStart(path, maxLen);
+    return path[start .. $];
   }
-  return "..." ~ path[$ - (maxLen - 3) .. $];
-}
-
-size_t getTerminalWidth(int fd) {
-  import core.sys.posix.sys.ioctl : ioctl, winsize, TIOCGWINSZ;
-  winsize ws;
-  if (ioctl(fd, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0) {
-    return cast(size_t) ws.ws_col;
-  }
-  return 80;
+  const size_t start = findSuffixStart(path, maxLen - 3);
+  return "..." ~ path[start .. $];
 }
 
 unittest {
+  import orglistremo.internal.testutil : captureOutput;
   import orglistremo.model : Root;
 
   Styler styler;
@@ -410,8 +426,10 @@ unittest {
   assert(formatSizeHuman(1024) == "1.00 KiB");
   assert(formatSizeHuman(1048576) == "1.00 MiB");
 
-  assert(formatUnixTime(0) == "never");
+  assert(formatUnixTime(0).length == 19);
   assert(formatUnixTime(1700000000).length == 19);
+  assert(formatLastSync(0, false) == "never");
+  assert(formatLastSync(0, true).length == 19);
 
   assert(formatHash("0", false) == "0");
   assert(formatHash("abcdef0123456789", false) == "abcdef012345");
@@ -443,25 +461,29 @@ unittest {
   Root r = Root(1, "main", "/mnt/data", 1000, 2000, true);
   RootSummary[] roots = [RootSummary(r, 10, 2, 2048)];
 
-  File tmpOut = File.tmpfile();
-  printConsoleRoots(roots, optsNoColor, tmpOut);
-  tmpOut.rewind();
-  const headerLine = tmpOut.readln();
-  assert(headerLine.length > 0);
-  const rowLine = tmpOut.readln();
-  assert(rowLine.length > 0);
+  const rootsOut = captureOutput((File f) {
+    printConsoleRoots(roots, optsNoColor, f);
+  });
+  import std.string : splitLines;
+  const rootLines = rootsOut.splitLines();
+  assert(rootLines.length >= 2);
+  assert(rootLines[0].length > 0);
+  assert(rootLines[1].length > 0);
 
   // Test printConsoleRoots with colors (verifying alignment not corrupted)
   OutputOptions optsColor;
   optsColor.styler.enabled = true;
-  File tmpOutColor = File.tmpfile();
-  printConsoleRoots(roots, optsColor, tmpOutColor);
+  captureOutput((File f) {
+    printConsoleRoots(roots, optsColor, f);
+  });
 
   // Test printConsoleEntries (uncolored and colored)
-  File tmpEntries = File.tmpfile();
-  printConsoleEntries([e1, e2], optsNoColor, tmpEntries);
-  File tmpEntriesColor = File.tmpfile();
-  printConsoleEntries([e1, e2], optsColor, tmpEntriesColor);
+  captureOutput((File f) {
+    printConsoleEntries([e1, e2], optsNoColor, f);
+  });
+  captureOutput((File f) {
+    printConsoleEntries([e1, e2], optsColor, f);
+  });
 
   // Test printConsoleDuplicates (uncolored and colored)
   DuplicateGroup dg;
@@ -469,21 +491,41 @@ unittest {
   dg.size = 100;
   dg.isDir = false;
   dg.entries = [e1];
-  File tmpDups = File.tmpfile();
-  printConsoleDuplicates([dg], optsNoColor, tmpDups);
-  File tmpDupsColor = File.tmpfile();
-  printConsoleDuplicates([dg], optsColor, tmpDupsColor);
+  captureOutput((File f) {
+    printConsoleDuplicates([dg], optsNoColor, f);
+  });
+  captureOutput((File f) {
+    printConsoleDuplicates([dg], optsColor, f);
+  });
 
   // Test printConsoleUnique (uncolored and colored)
-  File tmpUniq = File.tmpfile();
-  printConsoleUnique([e1], optsNoColor, tmpUniq);
-  File tmpUniqColor = File.tmpfile();
-  printConsoleUnique([e1], optsColor, tmpUniqColor);
+  captureOutput((File f) {
+    printConsoleUnique([e1], optsNoColor, f);
+  });
+  captureOutput((File f) {
+    printConsoleUnique([e1], optsColor, f);
+  });
 
   // Test truncatePathLeft
+  import std.utf : validate;
   assert(truncatePathLeft("short.txt", 20) == "short.txt");
   assert(truncatePathLeft("abcdefghij", 5) == "...ij");
   assert(truncatePathLeft("abcdefghij", 2) == "ij");
+  assert(truncatePathLeft("abcdefghij", 0) == "");
+
+  // Multibyte 2-byte characters (Cyrillic: 9 chars, 18 bytes)
+  const string cyrillic = "документы";
+  assert(truncatePathLeft(cyrillic, 10) == "документы");
+  assert(truncatePathLeft(cyrillic, 5) == "...ты");
+  assert(truncatePathLeft(cyrillic, 2) == "ты");
+  validate(truncatePathLeft(cyrillic, 5));
+
+  // Multibyte 3-byte characters (CJK: 7 chars, 21 bytes)
+  const string japanese = "日本語テキスト";
+  assert(truncatePathLeft(japanese, 8) == "日本語テキスト");
+  assert(truncatePathLeft(japanese, 5) == "...スト");
+  assert(truncatePathLeft(japanese, 2) == "スト");
+  validate(truncatePathLeft(japanese, 5));
 
   // Test ConsoleProgressReporter with forceTty = true
   File progOut = File.tmpfile();
@@ -536,11 +578,6 @@ unittest {
   assert(nonTtyReporter.currentVisibleLength == 0);
 
   // Test ConsoleProgressReporter with optsColor: emits \033[K on line overwrite
-  File colorProgOut = File.tmpfile();
-  auto colorReporter = new ConsoleProgressReporter(
-    optsColor, 0, colorProgOut, true
-  );
-
   SyncProgress longSp;
   longSp.phase = SyncPhase.hashing;
   longSp.currentPath = "long_path_name.bin";
@@ -549,7 +586,6 @@ unittest {
   longSp.totalBytes = 1000;
   longSp.fileBytesHashed = 230;
   longSp.fileBytesTotal = 1000;
-  colorReporter.update(longSp);
 
   SyncProgress shortSp;
   shortSp.phase = SyncPhase.hashing;
@@ -559,28 +595,26 @@ unittest {
   shortSp.totalBytes = 1000;
   shortSp.fileBytesHashed = 230;
   shortSp.fileBytesTotal = 1000;
-  colorReporter.update(shortSp);
 
-  colorProgOut.rewind();
-  ubyte[] colorBytes = new ubyte[cast(size_t) colorProgOut.size];
-  colorProgOut.rawRead(colorBytes);
+  const colorProgOut = captureOutput((File f) {
+    auto colorReporter = new ConsoleProgressReporter(
+      optsColor, 0, f, true
+    );
+    colorReporter.update(longSp);
+    colorReporter.update(shortSp);
+    colorReporter.clear();
+    assert(colorReporter.currentVisibleLength == 0);
+  });
   import std.algorithm.searching : canFind;
-  assert(canFind(cast(string) colorBytes, "\033[K"));
-
-  // Test clear with optsColor emits \033[K
-  colorReporter.clear();
-  assert(colorReporter.currentVisibleLength == 0);
+  assert(canFind(colorProgOut, "\033[K"));
 
   // Test ConsoleProgressReporter with optsNoColor emits spaces on shorter line
-  File noColorProgOut = File.tmpfile();
-  auto noColorReporter = new ConsoleProgressReporter(
-    optsNoColor, 0, noColorProgOut, true
-  );
-  noColorReporter.update(longSp);
-  noColorReporter.update(shortSp);
-
-  noColorProgOut.rewind();
-  ubyte[] noColorBytes = new ubyte[cast(size_t) noColorProgOut.size];
-  noColorProgOut.rawRead(noColorBytes);
-  assert(canFind(cast(string) noColorBytes, "   "));
+  const noColorProgOut = captureOutput((File f) {
+    auto noColorReporter = new ConsoleProgressReporter(
+      optsNoColor, 0, f, true
+    );
+    noColorReporter.update(longSp);
+    noColorReporter.update(shortSp);
+  });
+  assert(canFind(noColorProgOut, "   "));
 }

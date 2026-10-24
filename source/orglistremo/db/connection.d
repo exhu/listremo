@@ -5,8 +5,8 @@ import orglistremo.app_version : appVersion;
 import orglistremo.config : ensureDbDirectory;
 public import orglistremo.db.repo_migration : migrateDatabase;
 import orglistremo.db.repo_migration :
-  addFreeSpaceColumn, createCoreTablesV1, createSyncLocksTable,
-  insertVersionRow, resolveDbCreationDate;
+  addFreeSpaceColumn, applyWritePragmas, createCoreTablesV1,
+  createSyncLocksTable, insertVersionRow, resolveDbCreationDate;
 import orglistremo.db.schema_version : schemaVersion;
 import std.datetime.systime : Clock;
 
@@ -18,6 +18,16 @@ struct DbOpenResult {
 
 Database openDatabase(string dbPath, uint busyTimeoutMs = 60_000) {
   return openDatabaseChecked(dbPath, busyTimeoutMs).db;
+}
+
+Database openWorkerDatabase(string dbPath, uint busyTimeoutMs = 60_000) {
+  import std.format : format;
+
+  assert(dbPath.length > 0, "dbPath cannot be empty");
+  auto db = Database(dbPath);
+  db.execute("PRAGMA foreign_keys = ON;");
+  db.execute(format("PRAGMA busy_timeout = %d;", busyTimeoutMs));
+  return db;
 }
 
 DbOpenResult openDatabaseChecked(
@@ -33,7 +43,7 @@ DbOpenResult openDatabaseChecked(
   db.execute(format("PRAGMA busy_timeout = %d;", busyTimeoutMs));
 
   if (!hasExistingTables(db)) {
-    applyWritePragmas(db, dbPath);
+    applyWritePragmas(db);
     initSchema(db);
     return DbOpenResult(db, schemaVersion, false);
   }
@@ -44,7 +54,7 @@ DbOpenResult openDatabaseChecked(
     return DbOpenResult(db, dbVer, true);
   }
 
-  applyWritePragmas(db, dbPath);
+  applyWritePragmas(db);
   return DbOpenResult(db, dbVer, false);
 }
 
@@ -71,13 +81,6 @@ int readDbSchemaVersion(ref Database db) {
 }
 
 private:
-
-void applyWritePragmas(ref Database db, string dbPath) {
-  if (dbPath != ":memory:") {
-    db.execute("PRAGMA journal_mode = WAL;");
-    db.execute("PRAGMA synchronous = NORMAL;");
-  }
-}
 
 bool hasExistingTables(ref Database db) {
   auto stmt = db.prepare(`
@@ -161,37 +164,11 @@ unittest {
 }
 
 unittest {
-  import std.file : exists, remove, tempDir;
-  import std.path : buildPath;
+  import orglistremo.internal.testutil : createLegacyV0Db, TempDir;
 
-  const tmpDbPath = buildPath(tempDir(), "listremo_v0_migration_test.db");
-  if (exists(tmpDbPath)) {
-    remove(tmpDbPath);
-  }
-  scope (exit) {
-    if (exists(tmpDbPath)) {
-      remove(tmpDbPath);
-    }
-  }
-
-  // Create a legacy v0 database (roots and entries without version table)
-  {
-    auto rawDb = Database(tmpDbPath);
-    rawDb.execute(`
-      CREATE TABLE roots (
-        id          INTEGER PRIMARY KEY AUTOINCREMENT,
-        name        TEXT NOT NULL UNIQUE,
-        path        TEXT NOT NULL,
-        created_at  INTEGER NOT NULL,
-        last_sync   INTEGER
-      );
-    `);
-    rawDb.execute(`
-      INSERT INTO roots (name, path, created_at)
-      VALUES ('legacy_root', '/mnt/legacy', 1600000000);
-    `);
-    rawDb.close();
-  }
+  TempDir tempDir = TempDir("conn_v0");
+  const tmpDbPath = tempDir.subPath("v0.db");
+  createLegacyV0Db(tmpDbPath);
 
   // Opening legacy v0 database sets read-only mode and reports version 0
   DbOpenResult v0Res = openDatabaseChecked(tmpDbPath);
@@ -229,5 +206,11 @@ unittest {
   ).oneValue!long;
   assert(rootCount == 1);
   v1Res.db.close();
+}
+
+unittest {
+  Database workerDb = openWorkerDatabase(":memory:", 5000);
+  assert(workerDb.execute("PRAGMA foreign_keys;").oneValue!int == 1);
+  assert(workerDb.execute("PRAGMA busy_timeout;").oneValue!int == 5000);
 }
 

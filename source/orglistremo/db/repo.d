@@ -2,8 +2,11 @@ module orglistremo.db.repo;
 
 import d2sqlite3 : Database, Row, SqliteType, Statement;
 import orglistremo.model :
-  DuplicateGroup, Entry, EntryType, hasGlobWildcard, hasPatternWildcard, Root,
-  RootSummary, SortField, TargetSpec, unescapePatternEscapes;
+  DuplicateGroup, emptyHash, Entry, EntryType, groupDuplicates, Root,
+  RootSummary, SortField, TargetSpec;
+import orglistremo.pattern :
+  escapeLikeLiteral, hasGlobWildcard, hasPatternWildcard, isWildcard,
+  unescapePatternEscapes, userPatternToLike;
 import std.datetime.systime : Clock;
 
 struct CachedFileEntry {
@@ -37,8 +40,12 @@ struct RootRepository {
   }
 
   long addRoot(string name, string path) {
-    assert(name.length > 0, "Root name cannot be empty");
-    assert(path.length > 0, "Root path cannot be empty");
+    import std.algorithm.searching : canFind;
+    import std.exception : enforce;
+
+    enforce!Exception(name.length > 0, "Root name cannot be empty");
+    enforce!Exception(!name.canFind(':'), "Root name cannot contain ':'");
+    enforce!Exception(path.length > 0, "Root path cannot be empty");
 
     const now = Clock.currTime.toUnixTime();
     auto stmt = db.prepare(`
@@ -53,8 +60,14 @@ struct RootRepository {
   }
 
   long insertImportedRoot(in Root srcRoot) {
-    assert(srcRoot.name.length > 0, "Root name cannot be empty");
-    assert(srcRoot.path.length > 0, "Root path cannot be empty");
+    import std.algorithm.searching : canFind;
+    import std.exception : enforce;
+
+    enforce!Exception(srcRoot.name.length > 0, "Root name cannot be empty");
+    enforce!Exception(
+      !srcRoot.name.canFind(':'), "Root name cannot contain ':'"
+    );
+    enforce!Exception(srcRoot.path.length > 0, "Root path cannot be empty");
 
     auto stmt = db.prepare(`
       INSERT INTO roots (name, path, created_at, last_sync, free_space)
@@ -78,7 +91,9 @@ struct RootRepository {
   }
 
   void updateImportedRoot(long targetRootId, in Root srcRoot) {
-    assert(srcRoot.path.length > 0, "Root path cannot be empty");
+    import std.exception : enforce;
+
+    enforce!Exception(srcRoot.path.length > 0, "Root path cannot be empty");
 
     auto stmt = db.prepare(`
       UPDATE roots
@@ -108,7 +123,10 @@ struct RootRepository {
   }
 
   bool setPath(string name, string newPath) {
-    assert(newPath.length > 0, "New path cannot be empty");
+    import std.exception : enforce;
+
+    enforce!Exception(name.length > 0, "Root name cannot be empty");
+    enforce!Exception(newPath.length > 0, "New path cannot be empty");
     auto stmt = db.prepare("UPDATE roots SET path = ? WHERE name = ?;");
     stmt.bind(1, newPath);
     stmt.bind(2, name);
@@ -192,7 +210,7 @@ struct RootRepository {
       WHERE name LIKE ? ESCAPE '\'
       ORDER BY name;
     `, freeCol));
-    stmt.bind(1, escapeLikePattern(pattern));
+    stmt.bind(1, userPatternToLike(pattern));
     auto results = stmt.execute();
     Root[] roots;
     foreach (row; results) {
@@ -249,7 +267,7 @@ struct RootRepository {
 
     auto stmt = db.prepare(sql);
     if (pattern.length > 0) {
-      stmt.bind(1, escapeLikePattern(pattern));
+      stmt.bind(1, userPatternToLike(pattern));
     }
     RootSummary[] summaries;
     auto results = stmt.execute();
@@ -370,35 +388,108 @@ struct EntryRepository {
     db.execute("COMMIT;");
   }
 
-  void saveSyncEntries(
-    long rootId,
-    in Entry[] allEntries,
-    long syncTimestamp,
-    ulong freeSpace = 0,
-    bool hasFreeSpace = false
-  ) {
-    saveSyncEntries(
-      rootId, allEntries, allEntries, syncTimestamp, freeSpace, hasFreeSpace
-    );
+  void ensureStagingTable() {
+    db.execute(`
+      CREATE TEMP TABLE IF NOT EXISTS sync_staged_entries (
+        root_id     INTEGER NOT NULL,
+        rel_path    TEXT NOT NULL,
+        parent_path TEXT,
+        name        TEXT NOT NULL,
+        is_dir      INTEGER NOT NULL,
+        size        INTEGER NOT NULL,
+        mtime       INTEGER NOT NULL,
+        sha256      TEXT NOT NULL,
+        PRIMARY KEY(root_id, rel_path)
+      );
+    `);
   }
 
-  void saveSyncEntries(
+  void stageEntriesBatch(long rootId, in Entry[] batch) {
+    if (batch.length == 0) {
+      return;
+    }
+    ensureStagingTable();
+    auto stmt = db.prepare(`
+      INSERT INTO temp.sync_staged_entries (
+        root_id, rel_path, parent_path, name, is_dir, size, mtime, sha256
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(root_id, rel_path) DO UPDATE SET
+        parent_path = excluded.parent_path,
+        name = excluded.name,
+        is_dir = excluded.is_dir,
+        size = excluded.size,
+        mtime = excluded.mtime,
+        sha256 = excluded.sha256;
+    `);
+
+    foreach (ref const e; batch) {
+      stmt.reset();
+      stmt.bind(1, rootId);
+      stmt.bind(2, e.relPath);
+      if (e.parentPath is null || e.parentPath.length == 0) {
+        stmt.bind(3, null);
+      } else {
+        stmt.bind(3, e.parentPath);
+      }
+      stmt.bind(4, e.name);
+      stmt.bind(5, e.isDir ? 1 : 0);
+      stmt.bind(6, e.size);
+      stmt.bind(7, e.mtime);
+      stmt.bind(8, e.sha256);
+      stmt.execute();
+    }
+  }
+
+  void clearStagedEntries(long rootId) {
+    ensureStagingTable();
+    auto stmt = db.prepare(
+      "DELETE FROM temp.sync_staged_entries WHERE root_id = ?;"
+    );
+    stmt.bind(1, rootId);
+    stmt.execute();
+  }
+
+  void commitStagedSync(
     long rootId,
-    in Entry[] allEntries,
-    in Entry[] remainingEntries,
     long syncTimestamp,
     ulong freeSpace = 0,
     bool hasFreeSpace = false
   ) {
+    ensureStagingTable();
     db.execute("BEGIN IMMEDIATE;");
     scope (failure) {
       db.execute("ROLLBACK;");
     }
 
-    deleteStaleEntries(rootId, allEntries);
-    if (remainingEntries.length > 0) {
-      upsertEntries(rootId, remainingEntries);
-    }
+    auto delStmt = db.prepare(`
+      DELETE FROM entries
+      WHERE root_id = ?
+        AND rel_path NOT IN (
+          SELECT rel_path FROM temp.sync_staged_entries WHERE root_id = ?
+        );
+    `);
+    delStmt.bind(1, rootId);
+    delStmt.bind(2, rootId);
+    delStmt.execute();
+
+    auto upsertStmt = db.prepare(`
+      INSERT INTO entries (
+        root_id, rel_path, parent_path, name, is_dir, size, mtime, sha256
+      )
+      SELECT
+        root_id, rel_path, parent_path, name, is_dir, size, mtime, sha256
+      FROM temp.sync_staged_entries
+      WHERE root_id = ?
+      ON CONFLICT(root_id, rel_path) DO UPDATE SET
+        parent_path = excluded.parent_path,
+        name = excluded.name,
+        is_dir = excluded.is_dir,
+        size = excluded.size,
+        mtime = excluded.mtime,
+        sha256 = excluded.sha256;
+    `);
+    upsertStmt.bind(1, rootId);
+    upsertStmt.execute();
 
     if (hasFreeSpace) {
       auto syncStmt = db.prepare(`
@@ -409,15 +500,39 @@ struct EntryRepository {
       syncStmt.bind(3, rootId);
       syncStmt.execute();
     } else {
-      auto syncStmt = db.prepare(`
-        UPDATE roots SET last_sync = ? WHERE id = ?;
-      `);
+      auto syncStmt = db.prepare(
+        "UPDATE roots SET last_sync = ? WHERE id = ?;"
+      );
       syncStmt.bind(1, syncTimestamp);
       syncStmt.bind(2, rootId);
       syncStmt.execute();
     }
 
     db.execute("COMMIT;");
+    clearStagedEntries(rootId);
+  }
+
+  void saveSyncEntries(
+    long rootId,
+    in Entry[] allEntries,
+    long syncTimestamp,
+    ulong freeSpace = 0,
+    bool hasFreeSpace = false
+  ) {
+    stageEntriesBatch(rootId, allEntries);
+    commitStagedSync(rootId, syncTimestamp, freeSpace, hasFreeSpace);
+  }
+
+  void saveSyncEntries(
+    long rootId,
+    in Entry[] allEntries,
+    in Entry[] remainingEntries,
+    long syncTimestamp,
+    ulong freeSpace = 0,
+    bool hasFreeSpace = false
+  ) {
+    stageEntriesBatch(rootId, allEntries);
+    commitStagedSync(rootId, syncTimestamp, freeSpace, hasFreeSpace);
   }
 
   Entry[] listEntries(
@@ -491,16 +606,16 @@ struct EntryRepository {
         }
       } else {
         if (isSubpathPattern) {
-          stmt.bind(paramIdx++, escapeLikePattern(filter.subpath));
+          stmt.bind(paramIdx++, userPatternToLike(filter.subpath));
         } else {
           const unescaped = unescapePatternEscapes(filter.subpath);
           stmt.bind(paramIdx++, unescaped);
-          stmt.bind(paramIdx++, escapeLike(unescaped) ~ "/%");
+          stmt.bind(paramIdx++, escapeLikeLiteral(unescaped) ~ "/%");
         }
       }
     }
     if (filter.hashPattern.length > 0) {
-      stmt.bind(paramIdx++, filter.hashPattern);
+      stmt.bind(paramIdx++, userPatternToLike(filter.hashPattern));
     }
 
     return readEntries(stmt);
@@ -574,7 +689,7 @@ struct EntryRepository {
     if (filter.useGlob) {
       stmt.bind(paramIdx++, rootPattern);
     } else {
-      stmt.bind(paramIdx++, escapeLikePattern(rootPattern));
+      stmt.bind(paramIdx++, userPatternToLike(rootPattern));
     }
     if (hasSubpath) {
       if (filter.useGlob) {
@@ -586,16 +701,16 @@ struct EntryRepository {
         }
       } else {
         if (isSubpathPattern) {
-          stmt.bind(paramIdx++, escapeLikePattern(filter.subpath));
+          stmt.bind(paramIdx++, userPatternToLike(filter.subpath));
         } else {
           const unescaped = unescapePatternEscapes(filter.subpath);
           stmt.bind(paramIdx++, unescaped);
-          stmt.bind(paramIdx++, escapeLike(unescaped) ~ "/%");
+          stmt.bind(paramIdx++, escapeLikeLiteral(unescaped) ~ "/%");
         }
       }
     }
     if (filter.hashPattern.length > 0) {
-      stmt.bind(paramIdx++, filter.hashPattern);
+      stmt.bind(paramIdx++, userPatternToLike(filter.hashPattern));
     }
 
     return readEntries(stmt);
@@ -609,33 +724,8 @@ struct EntryRepository {
     return queryGroupedEntries(filter, "COUNT(*) = 1");
   }
 
-  DuplicateGroup[] groupDuplicates(in Entry[] entries) {
-    DuplicateGroup[] groups;
-    if (entries.length == 0) {
-      return groups;
-    }
-
-    DuplicateGroup currentGroup;
-    currentGroup.sha256 = entries[0].sha256;
-    currentGroup.size = entries[0].size;
-    currentGroup.isDir = entries[0].isDir;
-    currentGroup.entries ~= entries[0];
-
-    foreach (i; 1 .. entries.length) {
-      if (entries[i].sha256 == currentGroup.sha256 &&
-          entries[i].isDir == currentGroup.isDir) {
-        currentGroup.entries ~= entries[i];
-      } else {
-        groups ~= currentGroup;
-        currentGroup = DuplicateGroup();
-        currentGroup.sha256 = entries[i].sha256;
-        currentGroup.size = entries[i].size;
-        currentGroup.isDir = entries[i].isDir;
-        currentGroup.entries ~= entries[i];
-      }
-    }
-    groups ~= currentGroup;
-    return groups;
+  static DuplicateGroup[] groupDuplicates(in Entry[] entries) {
+    return .groupDuplicates(entries);
   }
 
 private:
@@ -745,7 +835,7 @@ private:
 
     if (filter.skipEmpty) {
       s ~= " AND " ~ entryPrefix ~ "size > 0 AND " ~ entryPrefix ~
-        "sha256 != '0'";
+        "sha256 != '" ~ emptyHash ~ "'";
     }
 
     if (filter.targets.length > 0) {
@@ -846,7 +936,7 @@ private:
       if (filter.useGlob) {
         stmt.bind(idx++, filter.rootPattern);
       } else {
-        stmt.bind(idx++, escapeLikePattern(filter.rootPattern));
+        stmt.bind(idx++, userPatternToLike(filter.rootPattern));
       }
     }
 
@@ -865,7 +955,7 @@ private:
     if (useGlob) {
       stmt.bind(idx++, rootPattern);
     } else {
-      stmt.bind(idx++, escapeLikePattern(rootPattern));
+      stmt.bind(idx++, userPatternToLike(rootPattern));
     }
     if (subpath.length > 0) {
       bindSubpath(stmt, idx, subpath, useGlob);
@@ -878,9 +968,7 @@ private:
     string subpath,
     bool useGlob
   ) {
-    const isPattern = useGlob
-      ? hasGlobWildcard(subpath)
-      : hasPatternWildcard(subpath);
+    const isPattern = isWildcard(subpath, useGlob);
     if (useGlob) {
       if (isPattern) {
         stmt.bind(idx++, subpath);
@@ -890,11 +978,11 @@ private:
       }
     } else {
       if (isPattern) {
-        stmt.bind(idx++, escapeLikePattern(subpath));
+        stmt.bind(idx++, userPatternToLike(subpath));
       } else {
         const unescaped = unescapePatternEscapes(subpath);
         stmt.bind(idx++, unescaped);
-        stmt.bind(idx++, escapeLike(unescaped) ~ "/%");
+        stmt.bind(idx++, escapeLikeLiteral(unescaped) ~ "/%");
       }
     }
   }
@@ -929,46 +1017,6 @@ private:
     }
     return entries;
   }
-}
-
-string escapeLikePattern(string s) {
-  string res;
-  size_t i = 0;
-  while (i < s.length) {
-    const c = s[i];
-    if (c == '\\') {
-      if (i + 1 < s.length && s[i + 1] == '%') {
-        res ~= "\\%";
-        i += 2;
-        continue;
-      }
-      if (i + 1 < s.length && s[i + 1] == '\\') {
-        res ~= "\\\\";
-        i += 2;
-        continue;
-      }
-      res ~= "\\\\";
-      i++;
-    } else if (c == '_') {
-      res ~= "\\_";
-      i++;
-    } else {
-      res ~= c;
-      i++;
-    }
-  }
-  return res;
-}
-
-string escapeLike(string s) {
-  string res;
-  foreach (c; s) {
-    if (c == '%' || c == '_' || c == '\\') {
-      res ~= '\\';
-    }
-    res ~= c;
-  }
-  return res;
 }
 
 unittest {
@@ -1198,11 +1246,11 @@ unittest {
   assert(foundPct.length == 1);
   assert(foundPct[0].name == "100%free.txt");
 
-  // Test escapeLikePattern
-  assert(escapeLikePattern("abc%def") == "abc%def");
-  assert(escapeLikePattern("abc\\%def") == "abc\\%def");
-  assert(escapeLikePattern("abc_def") == "abc\\_def");
-  assert(escapeLikePattern("abc\\\\%def") == "abc\\\\%def");
+  // Test userPatternToLike
+  assert(userPatternToLike("abc%def") == "abc%def");
+  assert(userPatternToLike("abc\\%def") == "abc\\%def");
+  assert(userPatternToLike("abc_def") == "abc\\_def");
+  assert(userPatternToLike("abc\\\\%def") == "abc\\\\%def");
 
   // Test findByGlob on roots
   const globRoots = rootRepo.findByGlob("r*");
@@ -1252,11 +1300,16 @@ unittest {
   const hashLikeEntries = entryRepo.listEntries("%", fHashLike);
   assert(hashLikeEntries.length >= 4); // hA, hB, hC, hash_dup
 
-  // Single-character wildcard '_' in hash LIKE pattern
+  // BUG-16: '_' in hash pattern is escaped to match literal '_'
   ListEntriesFilter fHashUnderscore;
-  fHashUnderscore.hashPattern = "h_";
-  const hashUnderEntries = entryRepo.listEntries("r1", fHashUnderscore);
-  assert(hashUnderEntries.length == 3); // hA, hB, hC
+  fHashUnderscore.hashPattern = "hash_dup";
+  const hashUnderEntries = entryRepo.listEntries("%", fHashUnderscore);
+  assert(hashUnderEntries.length == 1); // matches literal "hash_dup" in r2
+  assert(hashUnderEntries[0].sha256 == "hash_dup");
+
+  ListEntriesFilter fHashNoWildcard;
+  fHashNoWildcard.hashPattern = "h_";
+  assert(entryRepo.listEntries("r1", fHashNoWildcard).length == 0);
 
   // Combine GLOB subpath and hash LIKE pattern
   ListEntriesFilter fGlobAndHash;
@@ -1345,4 +1398,44 @@ unittest {
   ];
   fOverlapDup.skipEmpty = true;
   assert(entryRepo.listDuplicates(fOverlapDup).length == 0);
+
+  // Test RootRepository validation with enforce
+  import std.exception : assertThrown;
+  assertThrown!Exception(rootRepo.addRoot("", "/mnt/test"));
+  assertThrown!Exception(rootRepo.addRoot("r:colon", "/mnt/test"));
+  assertThrown!Exception(rootRepo.addRoot("valid", ""));
+  assertThrown!Exception(rootRepo.setPath("", "/mnt/test"));
+  assertThrown!Exception(rootRepo.setPath("r1", ""));
+
+  // Test stageEntriesBatch, clearStagedEntries, commitStagedSync
+  const rStaging = rootRepo.addRoot("r_stage", "/mnt/stage");
+  Entry[] stageBatch = [
+    Entry(0, rStaging, "r_stage", "file1.txt", ".", "file1.txt",
+      false, 100, 1000, "h_stage1"),
+    Entry(0, rStaging, "r_stage", "file2.txt", ".", "file2.txt",
+      false, 200, 1000, "h_stage2")
+  ];
+  entryRepo.stageEntriesBatch(rStaging, stageBatch);
+  // Live entries table has 0 entries before commit
+  assert(entryRepo.listEntries(rStaging).length == 0);
+
+  // Commit staged entries
+  entryRepo.commitStagedSync(rStaging, 3000);
+  assert(entryRepo.listEntries(rStaging).length == 2);
+
+  // Sync update with set-based stale deletion: stage only file2 and new file3
+  Entry[] updateBatch = [
+    Entry(0, rStaging, "r_stage", "file2.txt", ".", "file2.txt",
+      false, 250, 1001, "h_stage2_v2"),
+    Entry(0, rStaging, "r_stage", "file3.txt", ".", "file3.txt",
+      false, 300, 1001, "h_stage3")
+  ];
+  entryRepo.stageEntriesBatch(rStaging, updateBatch);
+  entryRepo.commitStagedSync(rStaging, 4000);
+
+  // Verify file1 is deleted, file2 is updated, file3 is added
+  const updatedList = entryRepo.listEntries(rStaging);
+  assert(updatedList.length == 2);
+  assert(updatedList[0].relPath == "file2.txt" && updatedList[0].size == 250);
+  assert(updatedList[1].relPath == "file3.txt" && updatedList[1].size == 300);
 }

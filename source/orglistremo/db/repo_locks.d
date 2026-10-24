@@ -1,27 +1,8 @@
 module orglistremo.db.repo_locks;
 
 import d2sqlite3 : Database, Row;
+import orglistremo.internal.os : isPidAlive;
 import std.process : thisProcessID;
-
-version (Posix) {
-  import core.stdc.errno : errno, ESRCH;
-  import core.sys.posix.signal : kill;
-
-  bool isPidAlive(int pid) {
-    if (pid <= 0) {
-      return false;
-    }
-    const res = kill(pid, 0);
-    if (res == 0) {
-      return true;
-    }
-    return errno != ESRCH;
-  }
-} else {
-  bool isPidAlive(int pid) {
-    return pid > 0;
-  }
-}
 
 struct SyncLockInfo {
   long rootId;
@@ -80,7 +61,27 @@ struct SyncLockRepository {
     return true;
   }
 
-  bool releaseLock(long rootId) {
+  bool releaseLock(long rootId, int pid, string hostname) {
+    db.execute("BEGIN IMMEDIATE;");
+    scope (failure) {
+      db.execute("ROLLBACK;");
+    }
+
+    auto stmt = db.prepare(`
+      DELETE FROM sync_locks
+      WHERE root_id = ? AND pid = ? AND hostname = ?;
+    `);
+    stmt.bind(1, rootId);
+    stmt.bind(2, pid);
+    stmt.bind(3, hostname);
+    stmt.execute();
+    const bool changed = db.changes > 0;
+
+    db.execute("COMMIT;");
+    return changed;
+  }
+
+  bool breakLock(long rootId) {
     db.execute("BEGIN IMMEDIATE;");
     scope (failure) {
       db.execute("ROLLBACK;");
@@ -89,14 +90,10 @@ struct SyncLockRepository {
     auto stmt = db.prepare("DELETE FROM sync_locks WHERE root_id = ?;");
     stmt.bind(1, rootId);
     stmt.execute();
-    const changed = db.changes > 0;
+    const bool changed = db.changes > 0;
 
     db.execute("COMMIT;");
     return changed;
-  }
-
-  bool breakLock(long rootId) {
-    return releaseLock(rootId);
   }
 
   bool getLock(long rootId, out SyncLockInfo info) {
@@ -160,12 +157,24 @@ unittest {
   assert(repo.getLock(rootId, queried));
   assert(queried.pid == myPid);
 
-  // Release lock
-  assert(repo.releaseLock(rootId));
+  // Release lock with mismatched PID or hostname fails
+  assert(!repo.releaseLock(rootId, 99999, "myhost"));
+  assert(!repo.releaseLock(rootId, myPid, "wronghost"));
+  assert(repo.getLock(rootId, queried));
+
+  // Release lock with matching credentials succeeds
+  assert(repo.releaseLock(rootId, myPid, "myhost"));
   assert(!repo.getLock(rootId, queried));
 
   // Re-acquire works
   assert(repo.acquireLock(rootId, myPid, "myhost", 1700000030, existing));
+
+  // Break lock works unconditionally
+  assert(repo.breakLock(rootId));
+  assert(!repo.getLock(rootId, queried));
+
+  // Re-acquire after break works
+  assert(repo.acquireLock(rootId, myPid, "myhost", 1700000040, existing));
 
   // Cascade delete on root removal
   db.execute("DELETE FROM roots WHERE id = ?;", rootId);

@@ -1,8 +1,7 @@
 module orglistremo.db.backup;
 
+import d2sqlite3 : Database;
 import orglistremo.config : ensureDbDirectory;
-import orglistremo.model : OutputFormat;
-import orglistremo.output.console : OutputOptions;
 import std.stdio : stderr, stdout, writefln;
 
 string proposeBackupPath(string dbPath) {
@@ -61,26 +60,58 @@ bool promptBackupPath(
   }
 }
 
-bool writeDatabaseBackup(
-  string dbPath,
-  string backupPath,
-  in OutputOptions opts
-) {
-  import std.file : copy;
+void writeDatabaseBackup(ref Database db, string backupPath) {
+  import orglistremo.config : ensureDbDirectory;
+  import std.file : exists, remove;
 
-  try {
-    ensureDbDirectory(backupPath);
-    copy(dbPath, backupPath);
-    if (opts.format == OutputFormat.console) {
-      writefln("Saved database backup to '%s'.", backupPath);
-    }
-    return true;
-  } catch (Exception e) {
-    stderr.writefln(
-      "Error: Failed to write backup file '%s': %s",
-      backupPath,
-      e.msg
-    );
-    return false;
+  ensureDbDirectory(backupPath);
+  if (exists(backupPath)) {
+    remove(backupPath);
   }
+
+  const bool isQueryOnly =
+    db.execute("PRAGMA query_only;").oneValue!int != 0;
+  if (isQueryOnly) {
+    db.execute("PRAGMA query_only = OFF;");
+  }
+  scope (exit) {
+    if (isQueryOnly) {
+      db.execute("PRAGMA query_only = ON;");
+    }
+  }
+
+  db.execute("VACUUM INTO ?;", backupPath);
+}
+
+unittest {
+  import orglistremo.internal.testutil : TempDir;
+  import std.file : exists;
+
+  TempDir tempDir = TempDir("backup");
+  const testDb = tempDir.subPath("src.db");
+  const testBkp = tempDir.subPath("dst.db");
+
+  auto db = Database(testDb);
+  db.execute("PRAGMA journal_mode = WAL;");
+  db.execute("CREATE TABLE t (x INTEGER);");
+  db.execute("INSERT INTO t VALUES (42);");
+
+  // Backup active WAL database
+  writeDatabaseBackup(db, testBkp);
+  assert(exists(testBkp));
+
+  // Overwrite existing backup
+  writeDatabaseBackup(db, testBkp);
+  assert(exists(testBkp));
+
+  // Verify backup contains data
+  auto bkpDb = Database(testBkp);
+  assert(bkpDb.execute("SELECT x FROM t").oneValue!int == 42);
+  bkpDb.close();
+
+  // Test query_only connection backup and restoration
+  db.execute("PRAGMA query_only = ON;");
+  writeDatabaseBackup(db, testBkp);
+  assert(db.execute("PRAGMA query_only;").oneValue!int != 0);
+  db.close();
 }

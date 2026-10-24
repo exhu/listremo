@@ -94,22 +94,27 @@ string escapeCsvField(string val) {
     return val;
   }
 
-  string escaped = "\"";
+  import std.array : Appender, appender;
+  Appender!string app = appender!string();
+  app.reserve(val.length + 8);
+  app.put('"');
   foreach (c; val) {
     if (c == '"') {
-      escaped ~= "\"\"";
+      app.put("\"\"");
     } else {
-      escaped ~= c;
+      app.put(c);
     }
   }
-  escaped ~= "\"";
-  return escaped;
+  app.put('"');
+  return app.data;
 }
 
 unittest {
+  import orglistremo.internal.testutil : captureOutput;
   import orglistremo.model : Root;
 
   assert(escapeCsvField("simple") == "simple");
+  assert(escapeCsvField("simple").ptr is "simple".ptr);
   assert(escapeCsvField("with,comma") == "\"with,comma\"");
   assert(escapeCsvField("with\"quote") == "\"with\"\"quote\"");
   assert(escapeCsvField("line\nbreak") == "\"line\nbreak\"");
@@ -127,27 +132,26 @@ unittest {
     RootSummary(r2, 0, 0, 0)
   ];
 
-  File tmpRoots = File.tmpfile();
-  printCsvRoots(roots, tmpRoots);
-  tmpRoots.rewind();
+  const rootsCsv = captureOutput((File f) {
+    printCsvRoots(roots, f);
+  });
+  import std.string : endsWith, splitLines, strip;
+  const rootLines = rootsCsv.splitLines();
+  assert(rootLines.length >= 3);
   assert(
-    tmpRoots.readln() ==
-    "name,path,last_sync,file_count,dir_count,total_size,free_space\n"
+    rootLines[0] ==
+    "name,path,last_sync,file_count,dir_count,total_size,free_space"
   );
-  const lineR1 = tmpRoots.readln();
-  assert(lineR1.length > 0);
-  import std.string : endsWith, strip;
-  assert(lineR1.strip().endsWith(",5000"));
-  const lineR2 = tmpRoots.readln();
-  assert(lineR2.length > 0);
-  assert(lineR2.strip().endsWith(","));
+  assert(rootLines[1].strip().endsWith(",5000"));
+  assert(rootLines[2].strip().endsWith(","));
 
   // Test printCsvEntries
   Entry e = Entry(
     1, 1, "r1", "doc.txt", ".", "doc.txt", false, 10, 1700000000, "abc"
   );
-  File tmpEntries = File.tmpfile();
-  printCsvEntries([e], tmpEntries);
+  captureOutput((File f) {
+    printCsvEntries([e], f);
+  });
 
   // Test printCsvDuplicates
   DuplicateGroup dg;
@@ -155,10 +159,12 @@ unittest {
   dg.size = 10;
   dg.isDir = false;
   dg.entries = [e];
-  File tmpDups = File.tmpfile();
-  printCsvDuplicates([dg], tmpDups);
+  captureOutput((File f) {
+    printCsvDuplicates([dg], f);
+  });
 
   // Test printCsvUnique
-  File tmpUniq = File.tmpfile();
-  printCsvUnique([e], tmpUniq);
+  captureOutput((File f) {
+    printCsvUnique([e], f);
+  });
 }
