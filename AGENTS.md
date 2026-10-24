@@ -12,3 +12,7 @@
   changes or bug fixes.
 - Update CHANGELOG.md with a brief description of new features or changes when
   introducing changes.
+- When asked to review code produce improvement plan as markdown file with
+meaningful name in `reviews` directory, do not overwrite any existing file, use
+current short git hash in the produced doc. Review plan must mention any
+confusing, duplicated, buggy, slow code findings, and codestyle violations.
