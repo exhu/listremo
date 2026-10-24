@@ -1,4 +1,8 @@
-- fix what is in prompts/opus-review.md
+- fix what is in reviews/2026-10-24-merged-plan-gemini-4-argon-2af79c7.md
+ Tip
+  │ Since executing all 5 phases is a multi-step effort across the codebase, you can use /teamwork to have multiple agents
+  │ execute independent workstreams, or /goal to run the phased refactoring and verification end-to-end.
+
 
 - separate app: support thumbnailer as external app to gradually or
 selectively add thumbnails, e.g. list a path to rescan adding missing or
