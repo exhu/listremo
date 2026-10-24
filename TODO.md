@@ -26,3 +26,5 @@ paths in thumbs.db may yield better performance.
 - review source code (partially done)
 
 - backlog: display tree list as xml?
+
+- move backup logic to a module make sure it's not duplicated for import, migrate
