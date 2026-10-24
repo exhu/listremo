@@ -13,7 +13,8 @@
 - Update CHANGELOG.md with a brief description of new features or changes when
   introducing changes.
 - When asked to review code produce improvement plan as markdown file with
-meaningful name in `reviews` directory, do not overwrite any existing
-file. Review plan must mention current git hash and branch of working copy, the
-LLM model which performed the review, and any confusing, duplicated, buggy, slow
-code findings, and codestyle violations.
+unique name in `reviews` directory (e.g. `<date><model_name_version><short git
+hash>.md`), do not overwrite any existing file. Review plan must mention current
+git hash and branch of working copy, the LLM model which performed the review,
+and any confusing, duplicated, buggy, slow code findings, and codestyle
+violations.
