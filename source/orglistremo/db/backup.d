@@ -4,6 +4,8 @@ import d2sqlite3 : Database;
 import orglistremo.config : ensureDbDirectory;
 import std.stdio : stderr, stdout, writefln;
 
+package(orglistremo):
+
 string proposeBackupPath(string dbPath) {
   import std.algorithm.searching : endsWith;
   import std.file : exists;
@@ -61,7 +63,6 @@ bool promptBackupPath(
 }
 
 void writeDatabaseBackup(ref Database db, string backupPath) {
-  import orglistremo.config : ensureDbDirectory;
   import std.file : exists, remove;
 
   ensureDbDirectory(backupPath);
@@ -91,7 +92,7 @@ unittest {
   const testDb = tempDir.subPath("src.db");
   const testBkp = tempDir.subPath("dst.db");
 
-  auto db = Database(testDb);
+  Database db = Database(testDb);
   db.execute("PRAGMA journal_mode = WAL;");
   db.execute("CREATE TABLE t (x INTEGER);");
   db.execute("INSERT INTO t VALUES (42);");
@@ -105,7 +106,7 @@ unittest {
   assert(exists(testBkp));
 
   // Verify backup contains data
-  auto bkpDb = Database(testBkp);
+  Database bkpDb = Database(testBkp);
   assert(bkpDb.execute("SELECT x FROM t").oneValue!int == 42);
   bkpDb.close();
 

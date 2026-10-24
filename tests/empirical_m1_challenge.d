@@ -1,4 +1,4 @@
-module tests.empirical_m1_challenge;
+module orglistremo.empirical_m1_challenge;
 
 import core.atomic : atomicOp, atomicLoad;
 import core.sync.mutex : Mutex;
@@ -10,7 +10,7 @@ import orglistremo.db.connection :
   DbOpenResult, openDatabaseChecked, openWorkerDatabase, readDbSchemaVersion;
 import orglistremo.db.repo : EntryRepository, RootRepository;
 import orglistremo.db.repo_locks : SyncLockInfo, SyncLockRepository;
-import orglistremo.db.repo_migration : migrateDatabase;
+import orglistremo.db.migration : migrateDatabase;
 import orglistremo.db.schema_version : schemaVersion;
 import orglistremo.model : Entry, Root;
 import std.datetime.systime : Clock;

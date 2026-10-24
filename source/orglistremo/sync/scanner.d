@@ -419,7 +419,7 @@ unittest {
   }
 
   // Verify empty.txt has hash "0"
-  const entries = entryRepo.listEntries(rootId);
+  const entries = entryRepo.listEntriesByRootId(rootId);
   bool foundEmptyFile = false;
   bool foundEmptyDir = false;
   foreach (ref e; entries) {
@@ -450,7 +450,7 @@ unittest {
 
   SyncResult res3 = syncRoot(db, root, false);
   assert(res3.fileCount == 2);
-  const entriesAfterDel = entryRepo.listEntries(rootId);
+  const entriesAfterDel = entryRepo.listEntriesByRootId(rootId);
   foreach (ref e; entriesAfterDel) {
     assert(e.relPath != "empty.txt");
   }
@@ -547,7 +547,7 @@ unittest {
   assert(permRes.errors.length == 2);
   assert(reportedIssues.length == 2);
 
-  const permEntries = entryRepo.listEntries(permRootId);
+  const permEntries = entryRepo.listEntriesByRootId(permRootId);
   bool foundGood = false;
   bool foundBad = false;
   foreach (ref e; permEntries) {
@@ -566,7 +566,7 @@ unittest {
   batchOpts.batchSize = 1;
   SyncResult batchRes = syncRoot(db, root, batchOpts);
   assert(batchRes.fileCount == 2);
-  assert(entryRepo.listEntries(rootId).length > 0);
+  assert(entryRepo.listEntriesByRootId(rootId).length > 0);
 }
 
 unittest {

@@ -1,9 +1,19 @@
-module orglistremo.db.repo_migration;
+module orglistremo.db.migration;
 
-import d2sqlite3 : Database, SqliteType;
+import d2sqlite3 : Database, ResultRange, SqliteType, Statement;
 import orglistremo.app_version : appVersion;
+import orglistremo.db.internal.schema : tableExists;
 import orglistremo.db.schema_version : schemaVersion;
+import orglistremo.db.transaction : withTransaction;
 import std.datetime.systime : Clock;
+
+package(orglistremo):
+
+struct VersionRow {
+  int targetVersion;
+  long creationDate;
+  long modificationDate;
+}
 
 void applyWritePragmas(ref Database db) {
   db.execute("PRAGMA journal_mode = WAL;");
@@ -33,52 +43,27 @@ void migrateDatabase(ref Database db, int fromVersion) {
     }
   }
 
-  db.execute("BEGIN IMMEDIATE;");
-  scope (failure) {
-    db.execute("ROLLBACK;");
-  }
-
-  const now = Clock.currTime.toUnixTime();
-  const creationDate = resolveDbCreationDate(db, now);
-
-  for (int v = fromVersion; v < schemaVersion; v++) {
-    switch (v) {
-      case 0:
-        migrateFrom0to1(db, creationDate, now);
-        break;
-      case 1:
-        migrateFrom1to2(db, now);
-        break;
-      case 2:
-        migrateFrom2to3(db, now);
-        break;
-      default:
-        import std.format : format;
-        throw new Exception(
-          format("Unhandled migration step from version %d", v)
-        );
-    }
-  }
-
-  db.execute("COMMIT;");
+  withTransaction(db, {
+    runMigrationSteps(db, fromVersion);
+  });
   applyWritePragmas(db);
 }
 
 void migrateFrom0to1(ref Database db, long creationDate, long now) {
   createCoreTablesV1(db);
-  insertVersionRow(db, 1, creationDate, now);
+  insertVersionRow(db, VersionRow(1, creationDate, now));
 }
 
 void migrateFrom1to2(ref Database db, long now) {
   createSyncLocksTable(db);
   const creationDate = resolveDbCreationDate(db, now);
-  insertVersionRow(db, 2, creationDate, now);
+  insertVersionRow(db, VersionRow(2, creationDate, now));
 }
 
 void migrateFrom2to3(ref Database db, long now) {
   addFreeSpaceColumn(db);
   const creationDate = resolveDbCreationDate(db, now);
-  insertVersionRow(db, 3, creationDate, now);
+  insertVersionRow(db, VersionRow(3, creationDate, now));
 }
 
 void addFreeSpaceColumn(ref Database db) {
@@ -132,6 +117,84 @@ void createCoreTablesV1(ref Database db) {
     );
   `);
 
+  createEntryIndexes(db);
+}
+
+long resolveDbCreationDate(ref Database db, long fallbackNow) {
+  if (tableExists(db, "version")) {
+    Statement verStmt = db.prepare(`
+      SELECT creation_date FROM version
+      ORDER BY id ASC
+      LIMIT 1;
+    `);
+    ResultRange verRes = verStmt.execute();
+    if (!verRes.empty) {
+      return verRes.front.peek!long(0);
+    }
+  }
+
+  if (tableExists(db, "roots")) {
+    Statement minStmt = db.prepare("SELECT MIN(created_at) FROM roots;");
+    ResultRange minRes = minStmt.execute();
+    if (!minRes.empty && minRes.front[0].type != SqliteType.NULL) {
+      return minRes.front[0].as!long;
+    }
+  }
+
+  return fallbackNow;
+}
+
+void insertVersionRow(ref Database db, in VersionRow row) {
+  Statement stmt = db.prepare(`
+    INSERT INTO version (
+      schema_version, app_version, creation_date, modification_date
+    ) VALUES (?, ?, ?, ?);
+  `);
+  stmt.bind(1, row.targetVersion);
+  stmt.bind(2, appVersion);
+  stmt.bind(3, row.creationDate);
+  stmt.bind(4, row.modificationDate);
+  stmt.execute();
+}
+
+void insertVersionRow(
+  ref Database db,
+  int targetVersion,
+  long creationDate,
+  long modificationDate
+) {
+  insertVersionRow(
+    db, VersionRow(targetVersion, creationDate, modificationDate)
+  );
+}
+
+private:
+
+void runMigrationSteps(ref Database db, int fromVersion) {
+  const now = Clock.currTime.toUnixTime();
+  const creationDate = resolveDbCreationDate(db, now);
+
+  for (int v = fromVersion; v < schemaVersion; v++) {
+    switch (v) {
+      case 0:
+        migrateFrom0to1(db, creationDate, now);
+        break;
+      case 1:
+        migrateFrom1to2(db, now);
+        break;
+      case 2:
+        migrateFrom2to3(db, now);
+        break;
+      default:
+        import std.format : format;
+        throw new Exception(
+          format("Unhandled migration step from version %d", v)
+        );
+    }
+  }
+}
+
+void createEntryIndexes(ref Database db) {
   db.execute(`
     CREATE INDEX IF NOT EXISTS idx_entries_root_id
     ON entries(root_id);
@@ -150,65 +213,13 @@ void createCoreTablesV1(ref Database db) {
   `);
 }
 
-long resolveDbCreationDate(ref Database db, long fallbackNow) {
-  auto verTableStmt = db.prepare(`
-    SELECT 1 FROM sqlite_master
-    WHERE type = 'table' AND name = 'version'
-    LIMIT 1;
-  `);
-  if (!verTableStmt.execute().empty) {
-    auto verStmt = db.prepare(`
-      SELECT creation_date FROM version
-      ORDER BY id ASC
-      LIMIT 1;
-    `);
-    auto verRes = verStmt.execute();
-    if (!verRes.empty) {
-      return verRes.front.peek!long(0);
-    }
-  }
-
-  auto rootTableStmt = db.prepare(`
-    SELECT 1 FROM sqlite_master
-    WHERE type = 'table' AND name = 'roots'
-    LIMIT 1;
-  `);
-  if (!rootTableStmt.execute().empty) {
-    auto minStmt = db.prepare("SELECT MIN(created_at) FROM roots;");
-    auto minRes = minStmt.execute();
-    if (!minRes.empty && minRes.front[0].type != SqliteType.NULL) {
-      return minRes.front[0].as!long;
-    }
-  }
-
-  return fallbackNow;
-}
-
-void insertVersionRow(
-  ref Database db,
-  int targetVersion,
-  long creationDate,
-  long modificationDate
-) {
-  auto stmt = db.prepare(`
-    INSERT INTO version (
-      schema_version, app_version, creation_date, modification_date
-    ) VALUES (?, ?, ?, ?);
-  `);
-  stmt.bind(1, targetVersion);
-  stmt.bind(2, appVersion);
-  stmt.bind(3, creationDate);
-  stmt.bind(4, modificationDate);
-  stmt.execute();
-}
-
 unittest {
   import orglistremo.internal.testutil : createLegacyV0Db, LegacyV0Options;
 
-  auto db = Database(":memory:");
+  Database db = Database(":memory:");
   createLegacyV0Db(db, LegacyV0Options("r1", "/path/1", 1700000000));
 
-  // Migrate from 0 to 2
+  // Migrate from 0 to 3
   migrateDatabase(db, 0);
 
   const ver = db.execute(
@@ -233,10 +244,10 @@ unittest {
 }
 
 unittest {
-  auto db = Database(":memory:");
+  Database db = Database(":memory:");
   // Create v1 database
   createCoreTablesV1(db);
-  insertVersionRow(db, 1, 1600000000, 1600000000);
+  insertVersionRow(db, VersionRow(1, 1600000000, 1600000000));
 
   // Migrate from 1 to 3
   migrateDatabase(db, 1);
@@ -253,11 +264,11 @@ unittest {
 }
 
 unittest {
-  auto db = Database(":memory:");
+  Database db = Database(":memory:");
   // Create v2 database
   createCoreTablesV1(db);
   createSyncLocksTable(db);
-  insertVersionRow(db, 2, 1600000000, 1600000000);
+  insertVersionRow(db, VersionRow(2, 1600000000, 1600000000));
 
   db.execute(`
     INSERT INTO roots (name, path, created_at)
@@ -281,7 +292,7 @@ unittest {
 }
 
 unittest {
-  auto db = Database(":memory:");
+  Database db = Database(":memory:");
   applyWritePragmas(db);
   assert(db.execute("PRAGMA synchronous;").oneValue!int == 1);
 

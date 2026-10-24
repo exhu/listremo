@@ -6,7 +6,8 @@ import orglistremo.config : resolveDbPath;
 import orglistremo.db.backup :
   promptBackupPath, proposeBackupPath, writeDatabaseBackup;
 import orglistremo.db.connection :
-  DbOpenResult, migrateDatabase, openDatabase, openDatabaseChecked;
+  DbOpenResult, openDatabase, openDatabaseChecked;
+import orglistremo.db.migration : migrateDatabase;
 import orglistremo.db.repo :
   EntryRepository, HashQueryFilter, ListEntriesFilter, RootRepository;
 import orglistremo.db.repo_locks :
@@ -1109,7 +1110,7 @@ int handleListCommand(
     filter.useGlob = listArgs.useGlob;
     filter.hashPattern = listArgs.hasHash ? listArgs.hashPattern : null;
 
-    const batch = entryRepo.listEntries(spec.rootName, filter);
+    const batch = entryRepo.listEntriesByPattern(spec.rootName, filter);
     foreach (ref e; batch) {
       if (e.id !in seenIds) {
         seenIds[e.id] = true;
@@ -1201,9 +1202,6 @@ bool resolveHashQueryFilter(
   filter.typeFilter = args.typeFilter;
   filter.skipEmpty = args.skipEmpty;
   filter.useGlob = args.useGlob;
-  filter.hasRoot = false;
-  filter.rootPattern = null;
-  filter.subpath = null;
 
   if (args.targets.length == 0) {
     return true;
@@ -1522,7 +1520,7 @@ unittest {
     ) == 1
   );
   // Verify ok.txt was cataloged
-  const rEntries = entryRepo.listEntries(rTemp.id);
+  const rEntries = entryRepo.listEntriesByRootId(rTemp.id);
   bool foundOk = false;
   foreach (ref e; rEntries) {
     if (e.relPath == "ok.txt") {

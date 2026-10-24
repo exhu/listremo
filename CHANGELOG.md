@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.12.0
+
+- Consolidated database transaction management via `withTransaction` in
+  `db/transaction.d` across repositories, schema migrations, and root imports.
+- Extracted schema existence helpers (`tableExists`, `columnExists`) into
+  `db/internal/schema.d` and SQL query/binding helpers (`entrySelectSql`,
+  `bindNullable`, `buildSubpathSql`, `bindSubpath`) into `db/internal/sql.d`.
+- Renamed `db/repo_migration.d` to `db/migration.d`, added `db/package.d`
+  subsystem facade, and removed `public import` re-export from `connection.d`.
+- Cached `roots.free_space` column detection per `RootRepository` instance and
+  deduplicated root queries via `selectRoots` and lock row reading via
+  `readLockRow`.
+- Consolidated `EntryRepository` listing into `listEntriesByRootId` and
+  `listEntriesByPattern` backed by `queryEntries`, refactored duplicate/unique
+  queries to use a `WITH scoped_entries` CTE, and removed legacy fields from
+  `HashQueryFilter`.
+- Enforced `codestyle.md` across `db/` (`package(orglistremo)` visibility,
+  methods before fields, explicit `Statement`/`ResultRange`/`Row` types,
+  parameter structs, and <= 50-line functions).
+
 ## 0.11
 
 - Extracted test helpers into `internal/testutil.d` (`TempDir`,

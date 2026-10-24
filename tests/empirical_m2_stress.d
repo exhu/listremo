@@ -314,7 +314,7 @@ void testBug16HashUnderscoreMatching(string dbPath) {
   // Test 1: Exact hash with underscore matches ONLY literal underscore
   ListEntriesFilter fExact;
   fExact.hashPattern = "hash_dup_123";
-  const exactRes = entryRepo.listEntries("root1", fExact);
+  const exactRes = entryRepo.listEntriesByPattern("root1", fExact);
   recordAssertion(
     exactRes.length == 1 && exactRes[0].sha256 == "hash_dup_123",
     "bug16_exact_underscore",
@@ -324,7 +324,7 @@ void testBug16HashUnderscoreMatching(string dbPath) {
   // Test 2: Hash with underscore prefix + % wildcard
   ListEntriesFilter fWildcard;
   fWildcard.hashPattern = "hash_dup_%";
-  const wildRes = entryRepo.listEntries("root1", fWildcard);
+  const wildRes = entryRepo.listEntriesByPattern("root1", fWildcard);
   recordAssertion(
     wildRes.length == 2 &&
     wildRes[0].sha256.canFind("hash_dup_") &&
@@ -350,7 +350,7 @@ void testBug16HashUnderscoreMatching(string dbPath) {
   // Test 3: Double underscore vs single underscore
   ListEntriesFilter fDouble;
   fDouble.hashPattern = "sha256__double";
-  const doubleRes = entryRepo.listEntries("root1", fDouble);
+  const doubleRes = entryRepo.listEntriesByPattern("root1", fDouble);
   recordAssertion(
     doubleRes.length == 1 && doubleRes[0].sha256 == "sha256__double",
     "bug16_double_underscore",
@@ -361,7 +361,7 @@ void testBug16HashUnderscoreMatching(string dbPath) {
   // If '_' were wildcard, "sha256_single" would match "sha256Xsingle"
   ListEntriesFilter fSingle;
   fSingle.hashPattern = "sha256_single";
-  const singleRes = entryRepo.listEntries("root1", fSingle);
+  const singleRes = entryRepo.listEntriesByPattern("root1", fSingle);
   recordAssertion(
     singleRes.length == 1 && singleRes[0].sha256 == "sha256_single",
     "bug16_single_underscore_strict",
@@ -372,7 +372,7 @@ void testBug16HashUnderscoreMatching(string dbPath) {
   // unless literal
   ListEntriesFilter fShort;
   fShort.hashPattern = "h_";
-  const shortRes = entryRepo.listEntries("root1", fShort);
+  const shortRes = entryRepo.listEntriesByPattern("root1", fShort);
   recordAssertion(
     shortRes.length == 0,
     "bug16_h_underscore_no_wildcard",
@@ -382,7 +382,7 @@ void testBug16HashUnderscoreMatching(string dbPath) {
   // Test 6: Global '%' query
   ListEntriesFilter fAll;
   fAll.hashPattern = "%";
-  const allRes = entryRepo.listEntries("root1", fAll);
+  const allRes = entryRepo.listEntriesByPattern("root1", fAll);
   recordAssertion(
     allRes.length == testEntries.length,
     "bug16_percent_multi_wildcard",

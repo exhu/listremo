@@ -1,18 +1,30 @@
 module orglistremo.db.repo;
 
-import d2sqlite3 : Database, Row, SqliteType, Statement;
+import d2sqlite3 : Database, ResultRange, Row, SqliteType, Statement;
+import orglistremo.db.internal.schema : columnExists;
+import orglistremo.db.internal.sql :
+  bindNullable, bindSubpath, buildEntrySortSql, buildSubpathSql,
+  buildTypeFilterSql, entrySelectSql;
+import orglistremo.db.transaction : withTransaction;
 import orglistremo.model :
   DuplicateGroup, emptyHash, Entry, EntryType, groupDuplicates, Root,
   RootSummary, SortField, TargetSpec;
-import orglistremo.pattern :
-  escapeLikeLiteral, hasGlobWildcard, hasPatternWildcard, isWildcard,
-  unescapePatternEscapes, userPatternToLike;
+import orglistremo.pattern : userPatternToLike;
 import std.datetime.systime : Clock;
+
+package(orglistremo):
 
 struct CachedFileEntry {
   ulong size;
   long mtime;
   string sha256;
+}
+
+struct SyncSaveParams {
+  long rootId;
+  long timestamp;
+  ulong freeSpace = 0;
+  bool hasFreeSpace = false;
 }
 
 struct ListEntriesFilter {
@@ -24,10 +36,6 @@ struct ListEntriesFilter {
 }
 
 struct HashQueryFilter {
-  bool hasRoot = false;
-  long rootId = 0;
-  string rootPattern = null;
-  string subpath = null;
   TargetSpec[] targets;
   EntryType typeFilter = EntryType.file;
   bool skipEmpty = false;
@@ -48,7 +56,7 @@ struct RootRepository {
     enforce!Exception(path.length > 0, "Root path cannot be empty");
 
     const now = Clock.currTime.toUnixTime();
-    auto stmt = db.prepare(`
+    Statement stmt = db.prepare(`
       INSERT INTO roots (name, path, created_at)
       VALUES (?, ?, ?);
     `);
@@ -69,23 +77,15 @@ struct RootRepository {
     );
     enforce!Exception(srcRoot.path.length > 0, "Root path cannot be empty");
 
-    auto stmt = db.prepare(`
+    Statement stmt = db.prepare(`
       INSERT INTO roots (name, path, created_at, last_sync, free_space)
       VALUES (?, ?, ?, ?, ?);
     `);
     stmt.bind(1, srcRoot.name);
     stmt.bind(2, srcRoot.path);
     stmt.bind(3, srcRoot.createdAt);
-    if (srcRoot.hasLastSync) {
-      stmt.bind(4, srcRoot.lastSync);
-    } else {
-      stmt.bind(4, null);
-    }
-    if (srcRoot.hasFreeSpace) {
-      stmt.bind(5, srcRoot.freeSpace);
-    } else {
-      stmt.bind(5, null);
-    }
+    bindNullable(stmt, 4, srcRoot.hasLastSync, srcRoot.lastSync);
+    bindNullable(stmt, 5, srcRoot.hasFreeSpace, srcRoot.freeSpace);
     stmt.execute();
     return db.lastInsertRowid;
   }
@@ -95,28 +95,20 @@ struct RootRepository {
 
     enforce!Exception(srcRoot.path.length > 0, "Root path cannot be empty");
 
-    auto stmt = db.prepare(`
+    Statement stmt = db.prepare(`
       UPDATE roots
       SET path = ?, last_sync = ?, free_space = ?
       WHERE id = ?;
     `);
     stmt.bind(1, srcRoot.path);
-    if (srcRoot.hasLastSync) {
-      stmt.bind(2, srcRoot.lastSync);
-    } else {
-      stmt.bind(2, null);
-    }
-    if (srcRoot.hasFreeSpace) {
-      stmt.bind(3, srcRoot.freeSpace);
-    } else {
-      stmt.bind(3, null);
-    }
+    bindNullable(stmt, 2, srcRoot.hasLastSync, srcRoot.lastSync);
+    bindNullable(stmt, 3, srcRoot.hasFreeSpace, srcRoot.freeSpace);
     stmt.bind(4, targetRootId);
     stmt.execute();
   }
 
   bool removeRoot(string name) {
-    auto stmt = db.prepare("DELETE FROM roots WHERE name = ?;");
+    Statement stmt = db.prepare("DELETE FROM roots WHERE name = ?;");
     stmt.bind(1, name);
     stmt.execute();
     return db.changes > 0;
@@ -127,7 +119,7 @@ struct RootRepository {
 
     enforce!Exception(name.length > 0, "Root name cannot be empty");
     enforce!Exception(newPath.length > 0, "New path cannot be empty");
-    auto stmt = db.prepare("UPDATE roots SET path = ? WHERE name = ?;");
+    Statement stmt = db.prepare("UPDATE roots SET path = ? WHERE name = ?;");
     stmt.bind(1, newPath);
     stmt.bind(2, name);
     stmt.execute();
@@ -135,43 +127,44 @@ struct RootRepository {
   }
 
   bool findByName(string name, out Root root) {
-    import std.format : format;
-
-    const freeCol = hasFreeSpaceColumn()
-      ? "free_space"
-      : "NULL AS free_space";
-    auto stmt = db.prepare(format(`
-      SELECT id, name, path, created_at, last_sync, %s
-      FROM roots
-      WHERE name = ?;
-    `, freeCol));
-    stmt.bind(1, name);
-    auto results = stmt.execute();
-    if (results.empty) {
+    Root[] found = selectRoots("WHERE name = ?", (ref Statement stmt) {
+      stmt.bind(1, name);
+    });
+    if (found.length == 0) {
       return false;
     }
-    root = readRootRow(results.front);
+    root = found[0];
     return true;
   }
 
   bool findById(long id, out Root root) {
-    import std.format : format;
-
-    const freeCol = hasFreeSpaceColumn()
-      ? "free_space"
-      : "NULL AS free_space";
-    auto stmt = db.prepare(format(`
-      SELECT id, name, path, created_at, last_sync, %s
-      FROM roots
-      WHERE id = ?;
-    `, freeCol));
-    stmt.bind(1, id);
-    auto results = stmt.execute();
-    if (results.empty) {
+    Root[] found = selectRoots("WHERE id = ?", (ref Statement stmt) {
+      stmt.bind(1, id);
+    });
+    if (found.length == 0) {
       return false;
     }
-    root = readRootRow(results.front);
+    root = found[0];
     return true;
+  }
+
+  void updateLastSync(in SyncSaveParams params) {
+    if (params.hasFreeSpace) {
+      Statement stmt = db.prepare(
+        "UPDATE roots SET last_sync = ?, free_space = ? WHERE id = ?;"
+      );
+      stmt.bind(1, params.timestamp);
+      stmt.bind(2, params.freeSpace);
+      stmt.bind(3, params.rootId);
+      stmt.execute();
+    } else {
+      Statement stmt = db.prepare(
+        "UPDATE roots SET last_sync = ? WHERE id = ?;"
+      );
+      stmt.bind(1, params.timestamp);
+      stmt.bind(2, params.rootId);
+      stmt.execute();
+    }
   }
 
   void updateLastSync(
@@ -180,64 +173,27 @@ struct RootRepository {
     ulong freeSpace = 0,
     bool hasFreeSpace = false
   ) {
-    if (hasFreeSpace) {
-      auto stmt = db.prepare(
-        "UPDATE roots SET last_sync = ?, free_space = ? WHERE id = ?;"
-      );
-      stmt.bind(1, timestamp);
-      stmt.bind(2, freeSpace);
-      stmt.bind(3, rootId);
-      stmt.execute();
-    } else {
-      auto stmt = db.prepare(
-        "UPDATE roots SET last_sync = ? WHERE id = ?;"
-      );
-      stmt.bind(1, timestamp);
-      stmt.bind(2, rootId);
-      stmt.execute();
-    }
+    updateLastSync(
+      SyncSaveParams(rootId, timestamp, freeSpace, hasFreeSpace)
+    );
   }
 
   Root[] findByPattern(string pattern) {
-    import std.format : format;
-
-    const freeCol = hasFreeSpaceColumn()
-      ? "free_space"
-      : "NULL AS free_space";
-    auto stmt = db.prepare(format(`
-      SELECT id, name, path, created_at, last_sync, %s
-      FROM roots
-      WHERE name LIKE ? ESCAPE '\'
-      ORDER BY name;
-    `, freeCol));
-    stmt.bind(1, userPatternToLike(pattern));
-    auto results = stmt.execute();
-    Root[] roots;
-    foreach (row; results) {
-      roots ~= readRootRow(row);
-    }
-    return roots;
+    return selectRoots(
+      "WHERE name LIKE ? ESCAPE '\\' ORDER BY name",
+      (ref Statement stmt) {
+        stmt.bind(1, userPatternToLike(pattern));
+      }
+    );
   }
 
   Root[] findByGlob(string pattern) {
-    import std.format : format;
-
-    const freeCol = hasFreeSpaceColumn()
-      ? "free_space"
-      : "NULL AS free_space";
-    auto stmt = db.prepare(format(`
-      SELECT id, name, path, created_at, last_sync, %s
-      FROM roots
-      WHERE name GLOB ?
-      ORDER BY name;
-    `, freeCol));
-    stmt.bind(1, pattern);
-    auto results = stmt.execute();
-    Root[] roots;
-    foreach (row; results) {
-      roots ~= readRootRow(row);
-    }
-    return roots;
+    return selectRoots(
+      "WHERE name GLOB ? ORDER BY name",
+      (ref Statement stmt) {
+        stmt.bind(1, pattern);
+      }
+    );
   }
 
   RootSummary[] listRoots(string pattern = null) {
@@ -265,13 +221,13 @@ struct RootRepository {
     }
     sql ~= " GROUP BY r.id ORDER BY r.name;";
 
-    auto stmt = db.prepare(sql);
+    Statement stmt = db.prepare(sql);
     if (pattern.length > 0) {
       stmt.bind(1, userPatternToLike(pattern));
     }
     RootSummary[] summaries;
-    auto results = stmt.execute();
-    foreach (row; results) {
+    ResultRange results = stmt.execute();
+    foreach (Row row; results) {
       RootSummary summary;
       summary.root = readRootRow(row);
       summary.fileCount = row.peek!ulong(6);
@@ -283,16 +239,43 @@ struct RootRepository {
   }
 
 private:
-  Database db;
+  enum ColumnCache : byte {
+    unknown,
+    absent,
+    present
+  }
+
+  Root[] selectRoots(
+    string whereClause,
+    scope void delegate(ref Statement) bind = null
+  ) {
+    import std.format : format;
+
+    const freeCol = hasFreeSpaceColumn()
+      ? "free_space"
+      : "NULL AS free_space";
+    Statement stmt = db.prepare(format(`
+      SELECT id, name, path, created_at, last_sync, %s
+      FROM roots
+      %s;
+    `, freeCol, whereClause));
+    if (bind !is null) {
+      bind(stmt);
+    }
+    Root[] roots;
+    ResultRange results = stmt.execute();
+    foreach (Row row; results) {
+      roots ~= readRootRow(row);
+    }
+    return roots;
+  }
 
   bool hasFreeSpaceColumn() {
-    auto stmt = db.prepare("PRAGMA table_info(roots);");
-    foreach (row; stmt.execute()) {
-      if (row.peek!string(1) == "free_space") {
-        return true;
-      }
+    if (freeSpaceCache == ColumnCache.unknown) {
+      const exists = columnExists(db, "roots", "free_space");
+      freeSpaceCache = exists ? ColumnCache.present : ColumnCache.absent;
     }
-    return false;
+    return freeSpaceCache == ColumnCache.present;
   }
 
   static Root readRootRow(Row row) {
@@ -308,7 +291,7 @@ private:
       r.lastSync = 0;
       r.hasLastSync = false;
     }
-    if (row.length > 5 && row[5].type != SqliteType.NULL) {
+    if (row[5].type != SqliteType.NULL) {
       r.freeSpace = row[5].as!ulong;
       r.hasFreeSpace = true;
     } else {
@@ -317,6 +300,9 @@ private:
     }
     return r;
   }
+
+  Database db;
+  ColumnCache freeSpaceCache = ColumnCache.unknown;
 }
 
 struct EntryRepository {
@@ -326,14 +312,14 @@ struct EntryRepository {
 
   CachedFileEntry[string] getFileEntriesMap(long rootId) {
     CachedFileEntry[string] cache;
-    auto stmt = db.prepare(`
+    Statement stmt = db.prepare(`
       SELECT rel_path, size, mtime, sha256
       FROM entries
       WHERE root_id = ? AND is_dir = 0;
     `);
     stmt.bind(1, rootId);
-    auto results = stmt.execute();
-    foreach (row; results) {
+    ResultRange results = stmt.execute();
+    foreach (Row row; results) {
       const relPath = row.peek!string(0);
       const size = row.peek!ulong(1);
       const mtime = row.peek!long(2);
@@ -344,31 +330,33 @@ struct EntryRepository {
   }
 
   bool hasCatalogedEntries(long rootId) {
-    auto stmt = db.prepare(`
+    Statement stmt = db.prepare(`
       SELECT 1 FROM entries
       WHERE root_id = ? AND rel_path != '.'
       LIMIT 1;
     `);
     stmt.bind(1, rootId);
-    return !stmt.execute().empty;
+    ResultRange results = stmt.execute();
+    return !results.empty;
   }
 
   bool[string] getEntryPathsSet(long rootId) {
     bool[string] paths;
-    auto stmt = db.prepare(`
+    Statement stmt = db.prepare(`
       SELECT rel_path
       FROM entries
       WHERE root_id = ? AND rel_path != '.';
     `);
     stmt.bind(1, rootId);
-    foreach (row; stmt.execute()) {
+    ResultRange results = stmt.execute();
+    foreach (Row row; results) {
       paths[row.peek!string(0)] = true;
     }
     return paths;
   }
 
   void replaceRootEntries(long rootId, in Entry[] entries) {
-    auto delStmt = db.prepare("DELETE FROM entries WHERE root_id = ?;");
+    Statement delStmt = db.prepare("DELETE FROM entries WHERE root_id = ?;");
     delStmt.bind(1, rootId);
     delStmt.execute();
     if (entries.length > 0) {
@@ -380,12 +368,9 @@ struct EntryRepository {
     if (batch.length == 0) {
       return;
     }
-    db.execute("BEGIN IMMEDIATE;");
-    scope (failure) {
-      db.execute("ROLLBACK;");
-    }
-    upsertEntries(rootId, batch);
-    db.execute("COMMIT;");
+    withTransaction(db, {
+      upsertEntries(rootId, batch);
+    });
   }
 
   void ensureStagingTable() {
@@ -409,7 +394,7 @@ struct EntryRepository {
       return;
     }
     ensureStagingTable();
-    auto stmt = db.prepare(`
+    Statement stmt = db.prepare(`
       INSERT INTO temp.sync_staged_entries (
         root_id, rel_path, parent_path, name, is_dir, size, mtime, sha256
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -421,32 +406,26 @@ struct EntryRepository {
         mtime = excluded.mtime,
         sha256 = excluded.sha256;
     `);
-
-    foreach (ref const e; batch) {
-      stmt.reset();
-      stmt.bind(1, rootId);
-      stmt.bind(2, e.relPath);
-      if (e.parentPath is null || e.parentPath.length == 0) {
-        stmt.bind(3, null);
-      } else {
-        stmt.bind(3, e.parentPath);
-      }
-      stmt.bind(4, e.name);
-      stmt.bind(5, e.isDir ? 1 : 0);
-      stmt.bind(6, e.size);
-      stmt.bind(7, e.mtime);
-      stmt.bind(8, e.sha256);
-      stmt.execute();
-    }
+    bindAndExecuteEntryBatch(stmt, rootId, batch);
   }
 
   void clearStagedEntries(long rootId) {
     ensureStagingTable();
-    auto stmt = db.prepare(
+    Statement stmt = db.prepare(
       "DELETE FROM temp.sync_staged_entries WHERE root_id = ?;"
     );
     stmt.bind(1, rootId);
     stmt.execute();
+  }
+
+  void commitStagedSync(in SyncSaveParams params) {
+    ensureStagingTable();
+    withTransaction(db, {
+      deleteUnstagedEntries(params.rootId);
+      upsertFromStaging(params.rootId);
+      RootRepository(db).updateLastSync(params);
+    });
+    clearStagedEntries(params.rootId);
   }
 
   void commitStagedSync(
@@ -455,13 +434,107 @@ struct EntryRepository {
     ulong freeSpace = 0,
     bool hasFreeSpace = false
   ) {
-    ensureStagingTable();
-    db.execute("BEGIN IMMEDIATE;");
-    scope (failure) {
-      db.execute("ROLLBACK;");
-    }
+    commitStagedSync(
+      SyncSaveParams(rootId, syncTimestamp, freeSpace, hasFreeSpace)
+    );
+  }
 
-    auto delStmt = db.prepare(`
+  void saveSyncEntries(in SyncSaveParams params, in Entry[] allEntries) {
+    stageEntriesBatch(params.rootId, allEntries);
+    commitStagedSync(params);
+  }
+
+  void saveSyncEntries(
+    long rootId,
+    in Entry[] allEntries,
+    long syncTimestamp,
+    ulong freeSpace = 0,
+    bool hasFreeSpace = false
+  ) {
+    saveSyncEntries(
+      SyncSaveParams(rootId, syncTimestamp, freeSpace, hasFreeSpace),
+      allEntries
+    );
+  }
+
+  void saveSyncEntries(
+    long rootId,
+    in Entry[] allEntries,
+    in Entry[] remainingEntries,
+    long syncTimestamp,
+    ulong freeSpace = 0,
+    bool hasFreeSpace = false
+  ) {
+    saveSyncEntries(
+      SyncSaveParams(rootId, syncTimestamp, freeSpace, hasFreeSpace),
+      allEntries
+    );
+  }
+
+  Entry[] listEntriesByRootId(
+    long rootId,
+    in ListEntriesFilter filter = ListEntriesFilter.init
+  ) {
+    return queryEntries(
+      "WHERE e.root_id = ?",
+      filter,
+      false,
+      (ref Statement stmt, ref int idx) {
+        stmt.bind(idx++, rootId);
+      }
+    );
+  }
+
+  Entry[] listEntriesByPattern(
+    string rootPattern,
+    in ListEntriesFilter filter = ListEntriesFilter.init
+  ) {
+    const string whereRoot = filter.useGlob
+      ? "WHERE r.name GLOB ?"
+      : "WHERE r.name LIKE ? ESCAPE '\\'";
+    return queryEntries(
+      whereRoot,
+      filter,
+      true,
+      (ref Statement stmt, ref int idx) {
+        if (filter.useGlob) {
+          stmt.bind(idx++, rootPattern);
+        } else {
+          stmt.bind(idx++, userPatternToLike(rootPattern));
+        }
+      }
+    );
+  }
+
+  Entry[] listEntries(
+    long rootId,
+    in ListEntriesFilter filter = ListEntriesFilter.init
+  ) {
+    return listEntriesByRootId(rootId, filter);
+  }
+
+  Entry[] listEntries(
+    string rootPattern,
+    in ListEntriesFilter filter = ListEntriesFilter.init
+  ) {
+    return listEntriesByPattern(rootPattern, filter);
+  }
+
+  Entry[] listDuplicates(in HashQueryFilter filter = HashQueryFilter.init) {
+    return queryGroupedEntries(filter, "COUNT(*) > 1");
+  }
+
+  Entry[] listUnique(in HashQueryFilter filter = HashQueryFilter.init) {
+    return queryGroupedEntries(filter, "COUNT(*) = 1");
+  }
+
+  static DuplicateGroup[] groupDuplicates(in Entry[] entries) {
+    return .groupDuplicates(entries);
+  }
+
+private:
+  void deleteUnstagedEntries(long rootId) {
+    Statement delStmt = db.prepare(`
       DELETE FROM entries
       WHERE root_id = ?
         AND rel_path NOT IN (
@@ -471,8 +544,10 @@ struct EntryRepository {
     delStmt.bind(1, rootId);
     delStmt.bind(2, rootId);
     delStmt.execute();
+  }
 
-    auto upsertStmt = db.prepare(`
+  void upsertFromStaging(long rootId) {
+    Statement upsertStmt = db.prepare(`
       INSERT INTO entries (
         root_id, rel_path, parent_path, name, is_dir, size, mtime, sha256
       )
@@ -490,280 +565,10 @@ struct EntryRepository {
     `);
     upsertStmt.bind(1, rootId);
     upsertStmt.execute();
-
-    if (hasFreeSpace) {
-      auto syncStmt = db.prepare(`
-        UPDATE roots SET last_sync = ?, free_space = ? WHERE id = ?;
-      `);
-      syncStmt.bind(1, syncTimestamp);
-      syncStmt.bind(2, freeSpace);
-      syncStmt.bind(3, rootId);
-      syncStmt.execute();
-    } else {
-      auto syncStmt = db.prepare(
-        "UPDATE roots SET last_sync = ? WHERE id = ?;"
-      );
-      syncStmt.bind(1, syncTimestamp);
-      syncStmt.bind(2, rootId);
-      syncStmt.execute();
-    }
-
-    db.execute("COMMIT;");
-    clearStagedEntries(rootId);
-  }
-
-  void saveSyncEntries(
-    long rootId,
-    in Entry[] allEntries,
-    long syncTimestamp,
-    ulong freeSpace = 0,
-    bool hasFreeSpace = false
-  ) {
-    stageEntriesBatch(rootId, allEntries);
-    commitStagedSync(rootId, syncTimestamp, freeSpace, hasFreeSpace);
-  }
-
-  void saveSyncEntries(
-    long rootId,
-    in Entry[] allEntries,
-    in Entry[] remainingEntries,
-    long syncTimestamp,
-    ulong freeSpace = 0,
-    bool hasFreeSpace = false
-  ) {
-    stageEntriesBatch(rootId, allEntries);
-    commitStagedSync(rootId, syncTimestamp, freeSpace, hasFreeSpace);
-  }
-
-  Entry[] listEntries(
-    long rootId,
-    in ListEntriesFilter filter = ListEntriesFilter.init
-  ) {
-    string sql = `
-      SELECT
-        e.id, e.root_id, r.name, e.rel_path, e.parent_path,
-        e.name, e.is_dir, e.size, e.mtime, e.sha256
-      FROM entries e
-      JOIN roots r ON r.id = e.root_id
-      WHERE e.root_id = ?
-    `;
-
-    if (filter.typeFilter == EntryType.file) {
-      sql ~= " AND e.is_dir = 0";
-    } else if (filter.typeFilter == EntryType.dir) {
-      sql ~= " AND e.is_dir = 1";
-    }
-
-    const hasSubpath = filter.subpath.length > 0;
-    const isSubpathPattern = hasSubpath && (
-      filter.useGlob
-        ? hasGlobWildcard(filter.subpath)
-        : hasPatternWildcard(filter.subpath)
-    );
-    if (hasSubpath) {
-      if (filter.useGlob) {
-        if (isSubpathPattern) {
-          sql ~= " AND e.rel_path GLOB ?";
-        } else {
-          sql ~= " AND (e.rel_path = ? OR e.rel_path GLOB ?)";
-        }
-      } else {
-        if (isSubpathPattern) {
-          sql ~= " AND e.rel_path LIKE ? ESCAPE '\\'";
-        } else {
-          sql ~= " AND (e.rel_path = ? OR e.rel_path LIKE ? ESCAPE '\\')";
-        }
-      }
-    }
-
-    if (filter.hashPattern.length > 0) {
-      sql ~= " AND e.sha256 LIKE ? ESCAPE '\\'";
-    }
-
-    switch (filter.sort) {
-      case SortField.size:
-        sql ~= " ORDER BY e.size DESC, e.rel_path ASC";
-        break;
-      case SortField.mtime:
-        sql ~= " ORDER BY e.mtime DESC, e.rel_path ASC";
-        break;
-      case SortField.path:
-      default:
-        sql ~= " ORDER BY e.rel_path ASC";
-        break;
-    }
-
-    auto stmt = db.prepare(sql);
-    int paramIdx = 1;
-    stmt.bind(paramIdx++, rootId);
-    if (hasSubpath) {
-      if (filter.useGlob) {
-        if (isSubpathPattern) {
-          stmt.bind(paramIdx++, filter.subpath);
-        } else {
-          stmt.bind(paramIdx++, filter.subpath);
-          stmt.bind(paramIdx++, filter.subpath ~ "/*");
-        }
-      } else {
-        if (isSubpathPattern) {
-          stmt.bind(paramIdx++, userPatternToLike(filter.subpath));
-        } else {
-          const unescaped = unescapePatternEscapes(filter.subpath);
-          stmt.bind(paramIdx++, unescaped);
-          stmt.bind(paramIdx++, escapeLikeLiteral(unescaped) ~ "/%");
-        }
-      }
-    }
-    if (filter.hashPattern.length > 0) {
-      stmt.bind(paramIdx++, userPatternToLike(filter.hashPattern));
-    }
-
-    return readEntries(stmt);
-  }
-
-  Entry[] listEntries(
-    string rootPattern,
-    in ListEntriesFilter filter = ListEntriesFilter.init
-  ) {
-    string sql = `
-      SELECT
-        e.id, e.root_id, r.name, e.rel_path, e.parent_path,
-        e.name, e.is_dir, e.size, e.mtime, e.sha256
-      FROM entries e
-      JOIN roots r ON r.id = e.root_id
-    `;
-
-    if (filter.useGlob) {
-      sql ~= " WHERE r.name GLOB ?";
-    } else {
-      sql ~= " WHERE r.name LIKE ? ESCAPE '\\'";
-    }
-
-    if (filter.typeFilter == EntryType.file) {
-      sql ~= " AND e.is_dir = 0";
-    } else if (filter.typeFilter == EntryType.dir) {
-      sql ~= " AND e.is_dir = 1";
-    }
-
-    const hasSubpath = filter.subpath.length > 0;
-    const isSubpathPattern = hasSubpath && (
-      filter.useGlob
-        ? hasGlobWildcard(filter.subpath)
-        : hasPatternWildcard(filter.subpath)
-    );
-    if (hasSubpath) {
-      if (filter.useGlob) {
-        if (isSubpathPattern) {
-          sql ~= " AND e.rel_path GLOB ?";
-        } else {
-          sql ~= " AND (e.rel_path = ? OR e.rel_path GLOB ?)";
-        }
-      } else {
-        if (isSubpathPattern) {
-          sql ~= " AND e.rel_path LIKE ? ESCAPE '\\'";
-        } else {
-          sql ~= " AND (e.rel_path = ? OR e.rel_path LIKE ? ESCAPE '\\')";
-        }
-      }
-    }
-
-    if (filter.hashPattern.length > 0) {
-      sql ~= " AND e.sha256 LIKE ? ESCAPE '\\'";
-    }
-
-    switch (filter.sort) {
-      case SortField.size:
-        sql ~= " ORDER BY e.size DESC, r.name ASC, e.rel_path ASC";
-        break;
-      case SortField.mtime:
-        sql ~= " ORDER BY e.mtime DESC, r.name ASC, e.rel_path ASC";
-        break;
-      case SortField.path:
-      default:
-        sql ~= " ORDER BY r.name ASC, e.rel_path ASC";
-        break;
-    }
-
-    auto stmt = db.prepare(sql);
-    int paramIdx = 1;
-    if (filter.useGlob) {
-      stmt.bind(paramIdx++, rootPattern);
-    } else {
-      stmt.bind(paramIdx++, userPatternToLike(rootPattern));
-    }
-    if (hasSubpath) {
-      if (filter.useGlob) {
-        if (isSubpathPattern) {
-          stmt.bind(paramIdx++, filter.subpath);
-        } else {
-          stmt.bind(paramIdx++, filter.subpath);
-          stmt.bind(paramIdx++, filter.subpath ~ "/*");
-        }
-      } else {
-        if (isSubpathPattern) {
-          stmt.bind(paramIdx++, userPatternToLike(filter.subpath));
-        } else {
-          const unescaped = unescapePatternEscapes(filter.subpath);
-          stmt.bind(paramIdx++, unescaped);
-          stmt.bind(paramIdx++, escapeLikeLiteral(unescaped) ~ "/%");
-        }
-      }
-    }
-    if (filter.hashPattern.length > 0) {
-      stmt.bind(paramIdx++, userPatternToLike(filter.hashPattern));
-    }
-
-    return readEntries(stmt);
-  }
-
-  Entry[] listDuplicates(in HashQueryFilter filter = HashQueryFilter.init) {
-    return queryGroupedEntries(filter, "COUNT(*) > 1");
-  }
-
-  Entry[] listUnique(in HashQueryFilter filter = HashQueryFilter.init) {
-    return queryGroupedEntries(filter, "COUNT(*) = 1");
-  }
-
-  static DuplicateGroup[] groupDuplicates(in Entry[] entries) {
-    return .groupDuplicates(entries);
-  }
-
-private:
-  Database db;
-
-  void deleteStaleEntries(long rootId, in Entry[] newEntries) {
-    bool[string] newPaths;
-    foreach (ref e; newEntries) {
-      newPaths[e.relPath] = true;
-    }
-
-    auto existingStmt = db.prepare(`
-      SELECT rel_path FROM entries WHERE root_id = ?;
-    `);
-    existingStmt.bind(1, rootId);
-    string[] stalePaths;
-    foreach (row; existingStmt.execute()) {
-      const path = row.peek!string(0);
-      if (path !in newPaths) {
-        stalePaths ~= path;
-      }
-    }
-
-    if (stalePaths.length > 0) {
-      auto delStmt = db.prepare(`
-        DELETE FROM entries WHERE root_id = ? AND rel_path = ?;
-      `);
-      foreach (path; stalePaths) {
-        delStmt.reset();
-        delStmt.bind(1, rootId);
-        delStmt.bind(2, path);
-        delStmt.execute();
-      }
-    }
   }
 
   void upsertEntries(long rootId, in Entry[] newEntries) {
-    auto upsertStmt = db.prepare(`
+    Statement upsertStmt = db.prepare(`
       INSERT INTO entries (
         root_id, rel_path, parent_path, name, is_dir, size, mtime, sha256
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -775,49 +580,83 @@ private:
         mtime = excluded.mtime,
         sha256 = excluded.sha256;
     `);
+    bindAndExecuteEntryBatch(upsertStmt, rootId, newEntries);
+  }
 
-    foreach (ref e; newEntries) {
-      upsertStmt.reset();
-      upsertStmt.bind(1, rootId);
-      upsertStmt.bind(2, e.relPath);
-      if (e.parentPath is null || e.parentPath.length == 0) {
-        upsertStmt.bind(3, null);
-      } else {
-        upsertStmt.bind(3, e.parentPath);
-      }
-      upsertStmt.bind(4, e.name);
-      upsertStmt.bind(5, e.isDir ? 1 : 0);
-      upsertStmt.bind(6, e.size);
-      upsertStmt.bind(7, e.mtime);
-      upsertStmt.bind(8, e.sha256);
-      upsertStmt.execute();
+  static void bindAndExecuteEntryBatch(
+    ref Statement stmt,
+    long rootId,
+    in Entry[] entries
+  ) {
+    foreach (ref const e; entries) {
+      stmt.reset();
+      stmt.bind(1, rootId);
+      stmt.bind(2, e.relPath);
+      bindNullable(
+        stmt,
+        3,
+        e.parentPath !is null && e.parentPath.length > 0,
+        e.parentPath
+      );
+      stmt.bind(4, e.name);
+      stmt.bind(5, e.isDir ? 1 : 0);
+      stmt.bind(6, e.size);
+      stmt.bind(7, e.mtime);
+      stmt.bind(8, e.sha256);
+      stmt.execute();
     }
+  }
+
+  Entry[] queryEntries(
+    string whereRootClause,
+    in ListEntriesFilter filter,
+    bool includeRootInSort,
+    scope void delegate(ref Statement, ref int) bindRoot
+  ) {
+    string sql = entrySelectSql ~ " " ~ whereRootClause;
+    sql ~= buildTypeFilterSql(filter.typeFilter, "e.");
+
+    if (filter.subpath.length > 0) {
+      sql ~= " AND " ~ buildSubpathSql(filter.subpath, filter.useGlob, "e.");
+    }
+    if (filter.hashPattern.length > 0) {
+      sql ~= " AND e.sha256 LIKE ? ESCAPE '\\'";
+    }
+    sql ~= buildEntrySortSql(filter.sort, includeRootInSort);
+
+    Statement stmt = db.prepare(sql);
+    int paramIdx = 1;
+    bindRoot(stmt, paramIdx);
+    if (filter.subpath.length > 0) {
+      bindSubpath(stmt, paramIdx, filter.subpath, filter.useGlob);
+    }
+    if (filter.hashPattern.length > 0) {
+      stmt.bind(paramIdx++, userPatternToLike(filter.hashPattern));
+    }
+
+    return readEntries(stmt);
   }
 
   Entry[] queryGroupedEntries(
     in HashQueryFilter filter,
     string havingClause
   ) {
-    const outerFilters = buildFilterSql(filter, "e.", "r.");
-    const innerFilters = buildFilterSql(filter, "e_sub.", "r_sub.");
-
-    const sql = "SELECT " ~
-      "e.id, e.root_id, r.name, e.rel_path, e.parent_path, " ~
-      "e.name, e.is_dir, e.size, e.mtime, e.sha256 " ~
-      "FROM entries e " ~
-      "JOIN roots r ON r.id = e.root_id " ~
-      "WHERE " ~ outerFilters ~
-      " AND (e.is_dir, e.sha256) IN (" ~
-        "SELECT e_sub.is_dir, e_sub.sha256 FROM entries e_sub " ~
-        "JOIN roots r_sub ON r_sub.id = e_sub.root_id " ~
-        "WHERE " ~ innerFilters ~ " " ~
-        "GROUP BY e_sub.is_dir, e_sub.sha256 " ~
+    const filterSql = buildFilterSql(filter, "e.", "r.");
+    const sql = "WITH scoped_entries AS (" ~
+      entrySelectSql ~
+      " WHERE " ~ filterSql ~
+      ") " ~
+      "SELECT * FROM scoped_entries " ~
+      "WHERE (is_dir, sha256) IN (" ~
+        "SELECT is_dir, sha256 FROM scoped_entries " ~
+        "GROUP BY is_dir, sha256 " ~
         "HAVING " ~ havingClause ~
       ") " ~
-      "ORDER BY e.size DESC, e.is_dir, e.sha256, r.name, e.rel_path ASC";
+      "ORDER BY size DESC, is_dir, sha256, name, rel_path ASC";
 
-    auto stmt = db.prepare(sql);
-    bindDuplicateOrUniqueParams(stmt, filter);
+    Statement stmt = db.prepare(sql);
+    int idx = 1;
+    bindFilters(stmt, idx, filter);
     return readEntries(stmt);
   }
 
@@ -827,11 +666,7 @@ private:
     string rootPrefix
   ) {
     string s = entryPrefix ~ "rel_path != '.'";
-    if (filter.typeFilter == EntryType.file) {
-      s ~= " AND " ~ entryPrefix ~ "is_dir = 0";
-    } else if (filter.typeFilter == EntryType.dir) {
-      s ~= " AND " ~ entryPrefix ~ "is_dir = 1";
-    }
+    s ~= buildTypeFilterSql(filter.typeFilter, entryPrefix);
 
     if (filter.skipEmpty) {
       s ~= " AND " ~ entryPrefix ~ "size > 0 AND " ~ entryPrefix ~
@@ -839,44 +674,30 @@ private:
     }
 
     if (filter.targets.length > 0) {
-      s ~= " AND (";
-      foreach (i, ref t; filter.targets) {
-        if (i > 0) {
-          s ~= " OR ";
-        }
-        s ~= "(" ~ buildSingleTargetSql(
-          t.rootName,
-          t.hasSubpath ? t.subpath : null,
-          filter.useGlob,
-          entryPrefix,
-          rootPrefix
-        ) ~ ")";
-      }
-      s ~= ")";
-      return s;
+      s ~= " AND (" ~ buildTargetsSql(filter, entryPrefix, rootPrefix) ~ ")";
     }
+    return s;
+  }
 
-    if (filter.hasRoot) {
-      s ~= " AND " ~ entryPrefix ~ "root_id = ?";
-    } else if (filter.rootPattern.length > 0) {
-      if (filter.useGlob) {
-        s ~= " AND " ~ rootPrefix ~ "name GLOB ?";
-      } else {
-        s ~= " AND " ~ rootPrefix ~ "name LIKE ? ESCAPE '\\'";
+  static string buildTargetsSql(
+    in HashQueryFilter filter,
+    string entryPrefix,
+    string rootPrefix
+  ) {
+    string s;
+    foreach (i, ref const t; filter.targets) {
+      if (i > 0) {
+        s ~= " OR ";
       }
-    }
-
-    if (filter.subpath.length > 0) {
-      s ~= " AND " ~ buildSubpathSql(
-        filter.subpath, filter.useGlob, entryPrefix
-      );
+      s ~= "(" ~
+        buildSingleTargetSql(t, filter.useGlob, entryPrefix, rootPrefix) ~
+        ")";
     }
     return s;
   }
 
   static string buildSingleTargetSql(
-    string rootPattern,
-    string subpath,
+    in TargetSpec target,
     bool useGlob,
     string entryPrefix,
     string rootPrefix
@@ -884,32 +705,10 @@ private:
     string s = useGlob
       ? (rootPrefix ~ "name GLOB ?")
       : (rootPrefix ~ "name LIKE ? ESCAPE '\\'");
-    if (subpath.length > 0) {
-      s ~= " AND " ~ buildSubpathSql(subpath, useGlob, entryPrefix);
+    if (target.hasSubpath && target.subpath.length > 0) {
+      s ~= " AND " ~ buildSubpathSql(target.subpath, useGlob, entryPrefix);
     }
     return s;
-  }
-
-  static string buildSubpathSql(
-    string subpath,
-    bool useGlob,
-    string entryPrefix
-  ) {
-    const isPattern = useGlob
-      ? hasGlobWildcard(subpath)
-      : hasPatternWildcard(subpath);
-    if (useGlob) {
-      if (isPattern) {
-        return entryPrefix ~ "rel_path GLOB ?";
-      }
-      return "(" ~ entryPrefix ~ "rel_path = ? OR " ~
-        entryPrefix ~ "rel_path GLOB ?)";
-    }
-    if (isPattern) {
-      return entryPrefix ~ "rel_path LIKE ? ESCAPE '\\'";
-    }
-    return "(" ~ entryPrefix ~ "rel_path = ? OR " ~
-      entryPrefix ~ "rel_path LIKE ? ESCAPE '\\')";
   }
 
   static void bindFilters(
@@ -917,89 +716,31 @@ private:
     ref int idx,
     in HashQueryFilter filter
   ) {
-    if (filter.targets.length > 0) {
-      foreach (ref t; filter.targets) {
-        bindSingleTarget(
-          stmt,
-          idx,
-          t.rootName,
-          t.hasSubpath ? t.subpath : null,
-          filter.useGlob
-        );
-      }
-      return;
-    }
-
-    if (filter.hasRoot) {
-      stmt.bind(idx++, filter.rootId);
-    } else if (filter.rootPattern.length > 0) {
-      if (filter.useGlob) {
-        stmt.bind(idx++, filter.rootPattern);
-      } else {
-        stmt.bind(idx++, userPatternToLike(filter.rootPattern));
-      }
-    }
-
-    if (filter.subpath.length > 0) {
-      bindSubpath(stmt, idx, filter.subpath, filter.useGlob);
+    foreach (ref const t; filter.targets) {
+      bindSingleTarget(stmt, idx, t, filter.useGlob);
     }
   }
 
   static void bindSingleTarget(
     ref Statement stmt,
     ref int idx,
-    string rootPattern,
-    string subpath,
+    in TargetSpec target,
     bool useGlob
   ) {
     if (useGlob) {
-      stmt.bind(idx++, rootPattern);
+      stmt.bind(idx++, target.rootName);
     } else {
-      stmt.bind(idx++, userPatternToLike(rootPattern));
+      stmt.bind(idx++, userPatternToLike(target.rootName));
     }
-    if (subpath.length > 0) {
-      bindSubpath(stmt, idx, subpath, useGlob);
+    if (target.hasSubpath && target.subpath.length > 0) {
+      bindSubpath(stmt, idx, target.subpath, useGlob);
     }
-  }
-
-  static void bindSubpath(
-    ref Statement stmt,
-    ref int idx,
-    string subpath,
-    bool useGlob
-  ) {
-    const isPattern = isWildcard(subpath, useGlob);
-    if (useGlob) {
-      if (isPattern) {
-        stmt.bind(idx++, subpath);
-      } else {
-        stmt.bind(idx++, subpath);
-        stmt.bind(idx++, subpath ~ "/*");
-      }
-    } else {
-      if (isPattern) {
-        stmt.bind(idx++, userPatternToLike(subpath));
-      } else {
-        const unescaped = unescapePatternEscapes(subpath);
-        stmt.bind(idx++, unescaped);
-        stmt.bind(idx++, escapeLikeLiteral(unescaped) ~ "/%");
-      }
-    }
-  }
-
-  static void bindDuplicateOrUniqueParams(
-    ref Statement stmt,
-    in HashQueryFilter filter
-  ) {
-    int idx = 1;
-    bindFilters(stmt, idx, filter);
-    bindFilters(stmt, idx, filter);
   }
 
   static Entry[] readEntries(ref Statement stmt) {
     Entry[] entries;
-    auto results = stmt.execute();
-    foreach (row; results) {
+    ResultRange results = stmt.execute();
+    foreach (Row row; results) {
       Entry e;
       e.id = row.peek!long(0);
       e.rootId = row.peek!long(1);
@@ -1017,6 +758,8 @@ private:
     }
     return entries;
   }
+
+  Database db;
 }
 
 unittest {
@@ -1049,16 +792,15 @@ unittest {
   assert(cache["f1.txt"].size == 60);
   assert(cache["f1.txt"].sha256 == "hash1");
 
-  // Test listEntries
-  const list = entryRepo.listEntries(
+  // Test listEntriesByRootId
+  const list = entryRepo.listEntriesByRootId(
     r1, ListEntriesFilter(null, EntryType.all)
   );
   assert(list.length == 4);
 
   // Test duplicates within r1 (none)
   HashQueryFilter fR1;
-  fR1.hasRoot = true;
-  fR1.rootId = r1;
+  fR1.targets = [TargetSpec.parse("r1")];
   const dupsR1 = entryRepo.listDuplicates(fR1);
   assert(dupsR1.length == 0);
 
@@ -1093,16 +835,20 @@ unittest {
   entryRepo.saveSyncEntries(r1, subtreeEntries, 3000);
 
   // Subpath "photos" should only return photos, photos/a.jpg, photos/b.jpg
-  const subList = entryRepo.listEntries(r1, ListEntriesFilter("photos"));
+  const subList = entryRepo.listEntriesByRootId(
+    r1, ListEntriesFilter("photos")
+  );
   assert(subList.length == 3);
 
   // Subpath with file only
-  const fileSub = entryRepo.listEntries(r1, ListEntriesFilter("photos/a.jpg"));
+  const fileSub = entryRepo.listEntriesByRootId(
+    r1, ListEntriesFilter("photos/a.jpg")
+  );
   assert(fileSub.length == 1);
   assert(fileSub[0].name == "a.jpg");
 
   // Sorting by size descending
-  const sortedSize = entryRepo.listEntries(
+  const sortedSize = entryRepo.listEntriesByRootId(
     r1, ListEntriesFilter(null, EntryType.all, SortField.size)
   );
   assert(sortedSize[0].size >= sortedSize[$ - 1].size);
@@ -1113,8 +859,7 @@ unittest {
   // When typeFilter == EntryType.all, empty file and empty dir
   // must NOT collide!
   HashQueryFilter fZeroAll;
-  fZeroAll.hasRoot = true;
-  fZeroAll.rootId = r1;
+  fZeroAll.targets = [TargetSpec.parse("r1")];
   fZeroAll.typeFilter = EntryType.all;
   fZeroAll.skipEmpty = false;
   const dupsZeroAll = entryRepo.listDuplicates(fZeroAll);
@@ -1133,8 +878,7 @@ unittest {
 
   // Duplicates within r1 with skipEmpty: zero1 and zero2 are skipped
   HashQueryFilter fSkipZero;
-  fSkipZero.hasRoot = true;
-  fSkipZero.rootId = r1;
+  fSkipZero.targets = [TargetSpec.parse("r1")];
   fSkipZero.typeFilter = EntryType.file;
   fSkipZero.skipEmpty = true;
   const dupsSkipZero = entryRepo.listDuplicates(fSkipZero);
@@ -1164,7 +908,7 @@ unittest {
   ];
   Entry[] remaining = [allBatch[$ - 1]];
   entryRepo.saveSyncEntries(rBatch, allBatch, remaining, 5000);
-  assert(entryRepo.listEntries(rBatch).length == 3);
+  assert(entryRepo.listEntriesByRootId(rBatch).length == 3);
 
   // Test free_space in RootRepository
   Root rCheck;
@@ -1172,13 +916,16 @@ unittest {
   assert(!rCheck.hasFreeSpace);
   assert(rCheck.freeSpace == 0);
 
-  rootRepo.updateLastSync(rBatch, 6000, 1024 * 1024 * 50, true);
+  rootRepo.updateLastSync(
+    SyncSaveParams(rBatch, 6000, 1024 * 1024 * 50, true)
+  );
   assert(rootRepo.findByName("r_batch", rCheck));
   assert(rCheck.hasFreeSpace);
   assert(rCheck.freeSpace == 1024 * 1024 * 50);
 
   entryRepo.saveSyncEntries(
-    rBatch, allBatch, 7000, 1024 * 1024 * 80, true
+    SyncSaveParams(rBatch, 7000, 1024 * 1024 * 80, true),
+    allBatch
   );
   assert(rootRepo.findByName("r_batch", rCheck));
   assert(rCheck.hasFreeSpace);
@@ -1219,11 +966,11 @@ unittest {
   const noSummaries = rootRepo.listRoots("nonexistent%");
   assert(noSummaries.length == 0);
 
-  // Test listEntries by rootPattern
-  const allEntriesAcrossRoots = entryRepo.listEntries("%");
+  // Test listEntriesByPattern
+  const allEntriesAcrossRoots = entryRepo.listEntriesByPattern("%");
   assert(allEntriesAcrossRoots.length > 0);
 
-  const jpgEntries = entryRepo.listEntries(
+  const jpgEntries = entryRepo.listEntriesByPattern(
     "r1", ListEntriesFilter("%.jpg")
   );
   assert(jpgEntries.length == 3);
@@ -1240,7 +987,7 @@ unittest {
     )
   ];
   entryRepo.saveSyncEntries(rPctId, pctEntries, 8000);
-  const foundPct = entryRepo.listEntries(
+  const foundPct = entryRepo.listEntriesByPattern(
     "100\\%disk", ListEntriesFilter("100\\%free.txt")
   );
   assert(foundPct.length == 1);
@@ -1264,59 +1011,61 @@ unittest {
   // SQLite GLOB is case-sensitive: "R*" should match no lowercase roots
   assert(rootRepo.findByGlob("R*").length == 0);
 
-  // Test listEntries with useGlob
+  // Test listEntriesByPattern with useGlob
   ListEntriesFilter fGlobJpg;
   fGlobJpg.subpath = "*.jpg";
   fGlobJpg.useGlob = true;
-  const globJpgEntries = entryRepo.listEntries("r1", fGlobJpg);
+  const globJpgEntries = entryRepo.listEntriesByPattern("r1", fGlobJpg);
   assert(globJpgEntries.length == 3);
 
   ListEntriesFilter fGlobCase;
   fGlobCase.subpath = "*.JPG";
   fGlobCase.useGlob = true;
-  assert(entryRepo.listEntries("r1", fGlobCase).length == 0);
+  assert(entryRepo.listEntriesByPattern("r1", fGlobCase).length == 0);
 
   // Subpath without wildcards in GLOB mode matches directory and subtree
   ListEntriesFilter fGlobSub;
   fGlobSub.subpath = "photos";
   fGlobSub.useGlob = true;
-  const globSubEntries = entryRepo.listEntries("r1", fGlobSub);
+  const globSubEntries = entryRepo.listEntriesByPattern("r1", fGlobSub);
   assert(globSubEntries.length == 3);
 
-  // Test listEntries with hashPattern (LIKE operator)
+  // Test listEntriesByPattern with hashPattern (LIKE operator)
   ListEntriesFilter fHashExact;
   fHashExact.hashPattern = "hA";
-  const hAEntries = entryRepo.listEntries("r1", fHashExact);
+  const hAEntries = entryRepo.listEntriesByPattern("r1", fHashExact);
   assert(hAEntries.length == 1);
   assert(hAEntries[0].name == "a.jpg");
 
   ListEntriesFilter fHashZero;
   fHashZero.hashPattern = "0";
-  const zeroEntries = entryRepo.listEntries("r1", fHashZero);
+  const zeroEntries = entryRepo.listEntriesByPattern("r1", fHashZero);
   assert(zeroEntries.length == 3);
 
   ListEntriesFilter fHashLike;
   fHashLike.hashPattern = "h%";
-  const hashLikeEntries = entryRepo.listEntries("%", fHashLike);
+  const hashLikeEntries = entryRepo.listEntriesByPattern("%", fHashLike);
   assert(hashLikeEntries.length >= 4); // hA, hB, hC, hash_dup
 
   // BUG-16: '_' in hash pattern is escaped to match literal '_'
   ListEntriesFilter fHashUnderscore;
   fHashUnderscore.hashPattern = "hash_dup";
-  const hashUnderEntries = entryRepo.listEntries("%", fHashUnderscore);
+  const hashUnderEntries = entryRepo.listEntriesByPattern(
+    "%", fHashUnderscore
+  );
   assert(hashUnderEntries.length == 1); // matches literal "hash_dup" in r2
   assert(hashUnderEntries[0].sha256 == "hash_dup");
 
   ListEntriesFilter fHashNoWildcard;
   fHashNoWildcard.hashPattern = "h_";
-  assert(entryRepo.listEntries("r1", fHashNoWildcard).length == 0);
+  assert(entryRepo.listEntriesByPattern("r1", fHashNoWildcard).length == 0);
 
   // Combine GLOB subpath and hash LIKE pattern
   ListEntriesFilter fGlobAndHash;
   fGlobAndHash.subpath = "photos/*.jpg";
   fGlobAndHash.useGlob = true;
   fGlobAndHash.hashPattern = "hA";
-  const combined = entryRepo.listEntries("r1", fGlobAndHash);
+  const combined = entryRepo.listEntriesByPattern("r1", fGlobAndHash);
   assert(combined.length == 1);
   assert(combined[0].name == "a.jpg");
 
@@ -1329,7 +1078,7 @@ unittest {
 
   // Test listDuplicates with LIKE rootPattern (r1 and r2 match r%)
   HashQueryFilter fDupLike;
-  fDupLike.rootPattern = "r%";
+  fDupLike.targets = [TargetSpec.parse("r%")];
   fDupLike.skipEmpty = true;
   const dupLike = entryRepo.listDuplicates(fDupLike);
   assert(dupLike.length == 2);
@@ -1338,7 +1087,7 @@ unittest {
 
   // Test listDuplicates with GLOB rootPattern
   HashQueryFilter fDupGlob;
-  fDupGlob.rootPattern = "r[12]";
+  fDupGlob.targets = [TargetSpec.parse("r[12]", true)];
   fDupGlob.useGlob = true;
   fDupGlob.skipEmpty = true;
   const dupGlob = entryRepo.listDuplicates(fDupGlob);
@@ -1347,28 +1096,26 @@ unittest {
 
   // In r1 alone, hA is unique (no duplicates in r1 with skipEmpty)
   HashQueryFilter fDupR1;
-  fDupR1.rootPattern = "r1";
+  fDupR1.targets = [TargetSpec.parse("r1")];
   fDupR1.skipEmpty = true;
   assert(entryRepo.listDuplicates(fDupR1).length == 0);
 
   // Test listDuplicates with subpath GLOB
   HashQueryFilter fDupSubGlob;
-  fDupSubGlob.rootPattern = "r1";
-  fDupSubGlob.subpath = "photos/*.jpg";
+  fDupSubGlob.targets = [TargetSpec.parse("r1:/photos/*.jpg", true)];
   fDupSubGlob.useGlob = true;
   assert(entryRepo.listDuplicates(fDupSubGlob).length == 0);
 
   // Test listUnique with LIKE rootPattern
   HashQueryFilter fUniqLike;
-  fUniqLike.rootPattern = "r1";
-  fUniqLike.subpath = "photos";
+  fUniqLike.targets = [TargetSpec.parse("r1:/photos")];
   fUniqLike.skipEmpty = true;
   const uniqPhotos = entryRepo.listUnique(fUniqLike);
   assert(uniqPhotos.length == 2); // a.jpg and b.jpg
 
   // Test listUnique with GLOB rootPattern and case-sensitivity
   HashQueryFilter fUniqCase;
-  fUniqCase.rootPattern = "R*";
+  fUniqCase.targets = [TargetSpec.parse("R*", true)];
   fUniqCase.useGlob = true;
   assert(entryRepo.listUnique(fUniqCase).length == 0);
 
@@ -1417,11 +1164,11 @@ unittest {
   ];
   entryRepo.stageEntriesBatch(rStaging, stageBatch);
   // Live entries table has 0 entries before commit
-  assert(entryRepo.listEntries(rStaging).length == 0);
+  assert(entryRepo.listEntriesByRootId(rStaging).length == 0);
 
   // Commit staged entries
   entryRepo.commitStagedSync(rStaging, 3000);
-  assert(entryRepo.listEntries(rStaging).length == 2);
+  assert(entryRepo.listEntriesByRootId(rStaging).length == 2);
 
   // Sync update with set-based stale deletion: stage only file2 and new file3
   Entry[] updateBatch = [
@@ -1434,7 +1181,7 @@ unittest {
   entryRepo.commitStagedSync(rStaging, 4000);
 
   // Verify file1 is deleted, file2 is updated, file3 is added
-  const updatedList = entryRepo.listEntries(rStaging);
+  const updatedList = entryRepo.listEntriesByRootId(rStaging);
   assert(updatedList.length == 2);
   assert(updatedList[0].relPath == "file2.txt" && updatedList[0].size == 250);
   assert(updatedList[1].relPath == "file3.txt" && updatedList[1].size == 300);

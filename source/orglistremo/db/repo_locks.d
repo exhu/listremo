@@ -1,8 +1,11 @@
 module orglistremo.db.repo_locks;
 
-import d2sqlite3 : Database, Row;
+import d2sqlite3 : Database, ResultRange, Row, Statement;
+import orglistremo.db.transaction : withTransaction;
 import orglistremo.internal.os : isPidAlive;
 import std.process : thisProcessID;
+
+package(orglistremo):
 
 struct SyncLockInfo {
   long rootId;
@@ -11,9 +14,40 @@ struct SyncLockInfo {
   string hostname;
 }
 
+struct LockRequest {
+  long rootId;
+  int pid;
+  string hostname;
+  long startedAt;
+}
+
 struct SyncLockRepository {
   this(Database db) {
     this.db = db;
+  }
+
+  bool acquireLock(in LockRequest req, out SyncLockInfo existing) {
+    bool acquired = false;
+    SyncLockInfo found;
+    withTransaction(db, {
+      if (getLock(req.rootId, found)) {
+        return;
+      }
+      Statement insertStmt = db.prepare(`
+        INSERT INTO sync_locks (root_id, pid, started_at, hostname)
+        VALUES (?, ?, ?, ?);
+      `);
+      insertStmt.bind(1, req.rootId);
+      insertStmt.bind(2, req.pid);
+      insertStmt.bind(3, req.startedAt);
+      insertStmt.bind(4, req.hostname);
+      insertStmt.execute();
+      acquired = true;
+    });
+    if (!acquired) {
+      existing = found;
+    }
+    return acquired;
   }
 
   bool acquireLock(
@@ -23,109 +57,74 @@ struct SyncLockRepository {
     long startedAt,
     out SyncLockInfo existing
   ) {
-    db.execute("BEGIN IMMEDIATE;");
-    scope (failure) {
-      db.execute("ROLLBACK;");
-    }
-
-    auto checkStmt = db.prepare(`
-      SELECT pid, started_at, hostname
-      FROM sync_locks
-      WHERE root_id = ?;
-    `);
-    checkStmt.bind(1, rootId);
-    auto results = checkStmt.execute();
-    if (!results.empty) {
-      auto row = results.front;
-      existing = SyncLockInfo(
-        rootId,
-        row.peek!int(0),
-        row.peek!long(1),
-        row.peek!string(2)
-      );
-      db.execute("ROLLBACK;");
-      return false;
-    }
-
-    auto insertStmt = db.prepare(`
-      INSERT INTO sync_locks (root_id, pid, started_at, hostname)
-      VALUES (?, ?, ?, ?);
-    `);
-    insertStmt.bind(1, rootId);
-    insertStmt.bind(2, pid);
-    insertStmt.bind(3, startedAt);
-    insertStmt.bind(4, hostname);
-    insertStmt.execute();
-
-    db.execute("COMMIT;");
-    return true;
+    return acquireLock(
+      LockRequest(rootId, pid, hostname, startedAt), existing
+    );
   }
 
   bool releaseLock(long rootId, int pid, string hostname) {
-    db.execute("BEGIN IMMEDIATE;");
-    scope (failure) {
-      db.execute("ROLLBACK;");
-    }
-
-    auto stmt = db.prepare(`
-      DELETE FROM sync_locks
-      WHERE root_id = ? AND pid = ? AND hostname = ?;
-    `);
-    stmt.bind(1, rootId);
-    stmt.bind(2, pid);
-    stmt.bind(3, hostname);
-    stmt.execute();
-    const bool changed = db.changes > 0;
-
-    db.execute("COMMIT;");
+    bool changed = false;
+    withTransaction(db, {
+      Statement stmt = db.prepare(`
+        DELETE FROM sync_locks
+        WHERE root_id = ? AND pid = ? AND hostname = ?;
+      `);
+      stmt.bind(1, rootId);
+      stmt.bind(2, pid);
+      stmt.bind(3, hostname);
+      stmt.execute();
+      changed = db.changes > 0;
+    });
     return changed;
   }
 
   bool breakLock(long rootId) {
-    db.execute("BEGIN IMMEDIATE;");
-    scope (failure) {
-      db.execute("ROLLBACK;");
-    }
-
-    auto stmt = db.prepare("DELETE FROM sync_locks WHERE root_id = ?;");
-    stmt.bind(1, rootId);
-    stmt.execute();
-    const bool changed = db.changes > 0;
-
-    db.execute("COMMIT;");
+    bool changed = false;
+    withTransaction(db, {
+      Statement stmt = db.prepare(
+        "DELETE FROM sync_locks WHERE root_id = ?;"
+      );
+      stmt.bind(1, rootId);
+      stmt.execute();
+      changed = db.changes > 0;
+    });
     return changed;
   }
 
   bool getLock(long rootId, out SyncLockInfo info) {
-    auto stmt = db.prepare(`
+    Statement stmt = db.prepare(`
       SELECT pid, started_at, hostname
       FROM sync_locks
       WHERE root_id = ?;
     `);
     stmt.bind(1, rootId);
-    auto results = stmt.execute();
+    ResultRange results = stmt.execute();
     if (results.empty) {
       return false;
     }
-    auto row = results.front;
-    info = SyncLockInfo(
+    Row row = results.front;
+    info = readLockRow(rootId, row);
+    return true;
+  }
+
+private:
+  static SyncLockInfo readLockRow(long rootId, Row row) {
+    return SyncLockInfo(
       rootId,
       row.peek!int(0),
       row.peek!long(1),
       row.peek!string(2)
     );
-    return true;
   }
 
-private:
   Database db;
 }
 
 unittest {
-  import orglistremo.db.repo_migration :
+  import orglistremo.db.migration :
     createCoreTablesV1, createSyncLocksTable;
 
-  auto db = Database(":memory:");
+  Database db = Database(":memory:");
   db.execute("PRAGMA foreign_keys = ON;");
   createCoreTablesV1(db);
   createSyncLocksTable(db);
@@ -142,11 +141,19 @@ unittest {
   // Initial acquire succeeds
   const myPid = thisProcessID;
   assert(isPidAlive(myPid));
-  assert(repo.acquireLock(rootId, myPid, "myhost", 1700000010, existing));
+  assert(
+    repo.acquireLock(
+      LockRequest(rootId, myPid, "myhost", 1700000010), existing
+    )
+  );
 
   // Second acquire fails and reports existing info
   SyncLockInfo conflict;
-  assert(!repo.acquireLock(rootId, 99999, "otherhost", 1700000020, conflict));
+  assert(
+    !repo.acquireLock(
+      LockRequest(rootId, 99999, "otherhost", 1700000020), conflict
+    )
+  );
   assert(conflict.rootId == rootId);
   assert(conflict.pid == myPid);
   assert(conflict.hostname == "myhost");

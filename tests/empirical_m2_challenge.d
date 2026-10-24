@@ -9,7 +9,7 @@ import core.thread : Thread, ThreadGroup;
 import core.time : dur;
 import d2sqlite3 : Database, Statement;
 import orglistremo.db.connection : openDatabaseChecked, readDbSchemaVersion;
-import orglistremo.db.repo_migration : migrateDatabase;
+import orglistremo.db.migration : migrateDatabase;
 import orglistremo.db.schema_version : schemaVersion;
 import orglistremo.internal.os :
   getDeviceFreeSpace, getLocalHostName, getTerminalWidth, isPidAlive,

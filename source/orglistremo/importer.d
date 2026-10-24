@@ -6,6 +6,7 @@ import orglistremo.app : DbContext, printReadOnlyError;
 import orglistremo.db.backup : promptBackupPath, writeDatabaseBackup;
 import orglistremo.db.connection : readDbSchemaVersion;
 import orglistremo.db.repo : EntryRepository, RootRepository;
+import orglistremo.db.transaction : withTransaction;
 import orglistremo.model :
   Entry, OutputFormat, Root;
 import orglistremo.pattern : hasPatternWildcard;
@@ -108,42 +109,37 @@ ImportSummary executeImportRoots(
     return summary;
   }
 
-  targetDb.execute("BEGIN IMMEDIATE;");
-  scope (failure) {
-    targetDb.execute("ROLLBACK;");
-  }
+  withTransaction(targetDb, {
+    RootRepository dstRootRepo = RootRepository(targetDb);
+    EntryRepository dstEntryRepo = EntryRepository(targetDb);
+    EntryRepository srcEntryRepo = EntryRepository(sourceDb);
 
-  RootRepository dstRootRepo = RootRepository(targetDb);
-  EntryRepository dstEntryRepo = EntryRepository(targetDb);
-  EntryRepository srcEntryRepo = EntryRepository(sourceDb);
+    Root[] newRoots;
+    ExistingRootPair[] existingPairs;
 
-  Root[] newRoots;
-  ExistingRootPair[] existingPairs;
-
-  foreach (ref srcRoot; sourceRoots) {
-    Root dstRoot;
-    if (dstRootRepo.findByName(srcRoot.name, dstRoot)) {
-      existingPairs ~= ExistingRootPair(srcRoot, dstRoot);
-    } else {
-      newRoots ~= srcRoot;
+    foreach (ref srcRoot; sourceRoots) {
+      Root dstRoot;
+      if (dstRootRepo.findByName(srcRoot.name, dstRoot)) {
+        existingPairs ~= ExistingRootPair(srcRoot, dstRoot);
+      } else {
+        newRoots ~= srcRoot;
+      }
     }
-  }
 
-  // 1. Import new roots and their entries
-  foreach (ref srcRoot; newRoots) {
-    importNewRoot(
-      dstRootRepo, dstEntryRepo, srcEntryRepo, srcRoot, summary
-    );
-  }
+    // 1. Import new roots and their entries
+    foreach (ref srcRoot; newRoots) {
+      importNewRoot(
+        dstRootRepo, dstEntryRepo, srcEntryRepo, srcRoot, summary
+      );
+    }
 
-  // 2. Update existing roots if allowed and more recent
-  foreach (ref pair; existingPairs) {
-    processExistingRoot(
-      dstRootRepo, dstEntryRepo, srcEntryRepo, pair, noUpdate, summary
-    );
-  }
-
-  targetDb.execute("COMMIT;");
+    // 2. Update existing roots if allowed and more recent
+    foreach (ref pair; existingPairs) {
+      processExistingRoot(
+        dstRootRepo, dstEntryRepo, srcEntryRepo, pair, noUpdate, summary
+      );
+    }
+  });
   return summary;
 }
 
@@ -350,7 +346,7 @@ void importNewRoot(
   ref ImportSummary summary
 ) {
   const newRootId = dstRootRepo.insertImportedRoot(srcRoot);
-  const srcEntries = srcEntryRepo.listEntries(srcRoot.id);
+  const srcEntries = srcEntryRepo.listEntriesByRootId(srcRoot.id);
   dstEntryRepo.replaceRootEntries(newRootId, srcEntries);
 
   foreach (ref e; srcEntries) {
@@ -389,7 +385,7 @@ void processExistingRoot(
   }
 
   const existingPaths = dstEntryRepo.getEntryPathsSet(pair.dstRoot.id);
-  const srcEntries = srcEntryRepo.listEntries(pair.srcRoot.id);
+  const srcEntries = srcEntryRepo.listEntriesByRootId(pair.srcRoot.id);
 
   foreach (ref e; srcEntries) {
     if (e.relPath == "." || (e.relPath in existingPaths)) {
@@ -578,7 +574,7 @@ unittest {
   assert(dstNew.path == "/src/new_root");
   assert(dstNew.hasLastSync && dstNew.lastSync == 4000);
   assert(dstNew.hasFreeSpace && dstNew.freeSpace == 4096);
-  const newEntriesList = dstEntries.listEntries(dstNew.id);
+  const newEntriesList = dstEntries.listEntriesByRootId(dstNew.id);
   assert(newEntriesList.length == 4);
 
   // Verify root_update was updated in dstDb
@@ -588,7 +584,7 @@ unittest {
   assert(dstUpdAfter.path == "/src/new_path");
   assert(dstUpdAfter.lastSync == 6000);
   assert(dstUpdAfter.freeSpace == 9999);
-  const updEntriesList = dstEntries.listEntries(dstUpdId);
+  const updEntriesList = dstEntries.listEntriesByRootId(dstUpdId);
   assert(updEntriesList.length == 4);
 
   // Verify root_keep was untouched
@@ -596,7 +592,7 @@ unittest {
   assert(dstRoots.findByName("root_keep", dstKeepAfter));
   assert(dstKeepAfter.path == "/dst/keep");
   assert(dstKeepAfter.lastSync == 5000);
-  assert(dstEntries.listEntries(dstKeepId).length == 2);
+  assert(dstEntries.listEntriesByRootId(dstKeepId).length == 2);
 
   // Test printImportSummary output
   import orglistremo.internal.testutil : captureOutput;

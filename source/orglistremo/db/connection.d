@@ -1,14 +1,16 @@
 module orglistremo.db.connection;
 
-import d2sqlite3 : Database, SqliteType;
+import d2sqlite3 : Database, ResultRange, Statement;
 import orglistremo.app_version : appVersion;
 import orglistremo.config : ensureDbDirectory;
-public import orglistremo.db.repo_migration : migrateDatabase;
-import orglistremo.db.repo_migration :
+import orglistremo.db.internal.schema : tableExists;
+import orglistremo.db.migration :
   addFreeSpaceColumn, applyWritePragmas, createCoreTablesV1,
-  createSyncLocksTable, insertVersionRow, resolveDbCreationDate;
+  createSyncLocksTable, insertVersionRow, VersionRow;
 import orglistremo.db.schema_version : schemaVersion;
 import std.datetime.systime : Clock;
+
+package(orglistremo):
 
 struct DbOpenResult {
   Database db;
@@ -24,7 +26,7 @@ Database openWorkerDatabase(string dbPath, uint busyTimeoutMs = 60_000) {
   import std.format : format;
 
   assert(dbPath.length > 0, "dbPath cannot be empty");
-  auto db = Database(dbPath);
+  Database db = Database(dbPath);
   db.execute("PRAGMA foreign_keys = ON;");
   db.execute(format("PRAGMA busy_timeout = %d;", busyTimeoutMs));
   return db;
@@ -37,7 +39,7 @@ DbOpenResult openDatabaseChecked(
   assert(dbPath.length > 0, "dbPath cannot be empty");
   ensureDbDirectory(dbPath);
 
-  auto db = Database(dbPath);
+  Database db = Database(dbPath);
   db.execute("PRAGMA foreign_keys = ON;");
   import std.format : format;
   db.execute(format("PRAGMA busy_timeout = %d;", busyTimeoutMs));
@@ -59,21 +61,16 @@ DbOpenResult openDatabaseChecked(
 }
 
 int readDbSchemaVersion(ref Database db) {
-  auto tableStmt = db.prepare(`
-    SELECT 1 FROM sqlite_master
-    WHERE type = 'table' AND name = 'version'
-    LIMIT 1;
-  `);
-  if (tableStmt.execute().empty) {
+  if (!tableExists(db, "version")) {
     return 0;
   }
 
-  auto verStmt = db.prepare(`
+  Statement verStmt = db.prepare(`
     SELECT schema_version FROM version
     ORDER BY id DESC
     LIMIT 1;
   `);
-  auto results = verStmt.execute();
+  ResultRange results = verStmt.execute();
   if (results.empty) {
     return 0;
   }
@@ -83,12 +80,13 @@ int readDbSchemaVersion(ref Database db) {
 private:
 
 bool hasExistingTables(ref Database db) {
-  auto stmt = db.prepare(`
+  Statement stmt = db.prepare(`
     SELECT 1 FROM sqlite_master
     WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
     LIMIT 1;
   `);
-  return !stmt.execute().empty;
+  ResultRange results = stmt.execute();
+  return !results.empty;
 }
 
 void initSchema(ref Database db) {
@@ -110,7 +108,9 @@ void insertCurrentVersionRow(
   long creationDate,
   long modificationDate
 ) {
-  insertVersionRow(db, schemaVersion, creationDate, modificationDate);
+  insertVersionRow(
+    db, VersionRow(schemaVersion, creationDate, modificationDate)
+  );
 }
 
 unittest {
@@ -164,6 +164,7 @@ unittest {
 }
 
 unittest {
+  import orglistremo.db.migration : migrateDatabase;
   import orglistremo.internal.testutil : createLegacyV0Db, TempDir;
 
   TempDir tempDir = TempDir("conn_v0");
@@ -213,4 +214,3 @@ unittest {
   assert(workerDb.execute("PRAGMA foreign_keys;").oneValue!int == 1);
   assert(workerDb.execute("PRAGMA busy_timeout;").oneValue!int == 5000);
 }
-

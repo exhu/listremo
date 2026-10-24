@@ -1,4 +1,4 @@
-module tests.stress_strings_cli;
+module orglistremo.stress_strings_cli;
 
 import core.sys.posix.sys.stat : chmod;
 import core.time : dur;
