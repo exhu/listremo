@@ -1,6 +1,3 @@
-- check if all from reviews/2026-10-24-merged-plan-gemini-4-argon-2af79c7.md
-has been implemented
-
 - separate app: support thumbnailer as external app to gradually or
 selectively add thumbnails, e.g. list a path to rescan adding missing or
 regenerating outdated (or forced) thumbnails, it's a good idea to have a
