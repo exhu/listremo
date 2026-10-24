@@ -1,3 +1,5 @@
+- fix what is in prompts/opus-review.md
+
 - separate app: support thumbnailer as external app to gradually or
 selectively add thumbnails, e.g. list a path to rescan adding missing or
 regenerating outdated (or forced) thumbnails, it's a good idea to have a
