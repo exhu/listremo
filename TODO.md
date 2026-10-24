@@ -4,9 +4,11 @@ Command should write a backup like it does for `migrate` command (and no-backup 
 import new roots, and their files, then update existing roots only if the
 imported ones have more recent synchronization date.
 Implement `--no-update` option that skips update, and allows only new roots being added.
+Also multiple roots to import can be optionally specified the same way as for `root list` command, then
+only matching roots are imported/updated.
 Note the fields that need to be unique for the existing table cannot be copied from the imported database
 as is, e.g. new ids will be needed. Implement import command in a separate D module.
-Display summary on finish: report which new roots were imported, which were updated, which were not updated
+The command must display summary on finish: report which new roots were imported, which were updated, which were not updated
 because older sync date or skipped via --no-update option. Also print summary on how many new files and dirs
 were added. Display how much time the import process has taken.
 
