@@ -19,7 +19,15 @@ import std.getopt : config, getopt;
 import std.stdio : stderr, writefln, writeln;
 
 version (unittest) {
-  // main is excluded so the unit test runner provides its own entry point
+  import orglistremo.app_version;
+  import orglistremo.db;
+  import orglistremo.internal.assets;
+  import orglistremo.internal.os;
+  import orglistremo.internal.testutil;
+  import orglistremo.model;
+  import orglistremo.output;
+  import orglistremo.pattern;
+  import orglistremo.sync;
 } else {
   int main(string[] args) {
     return runApp(args);
@@ -227,7 +235,8 @@ unittest {
   import orglistremo.db.backup : proposeBackupPath, writeDatabaseBackup;
   import orglistremo.db.connection : openDatabase, readDbSchemaVersion;
   import orglistremo.db.repo : EntryRepository, RootRepository;
-  import orglistremo.db.repo_locks : SyncLockInfo, SyncLockRepository;
+  import orglistremo.db.repo_locks :
+    LockRequest, SyncLockInfo, SyncLockRepository;
   import orglistremo.internal.os : getLocalHostName;
   import orglistremo.internal.testutil :
     createLegacyV0Db, LegacyV0Options, TempDir;
@@ -434,7 +443,8 @@ unittest {
 
   assert(
     lockRepo.acquireLock(
-      lockRoot.id, thisProcessID, getLocalHostName(), 1700000000, existing
+      LockRequest(lockRoot.id, thisProcessID, getLocalHostName(), 1700000000),
+      existing
     )
   );
   assert(dispatchCommand(roCtx, ["sync", "lock_root"], testOpts) == 1);
@@ -447,7 +457,8 @@ unittest {
   version (Posix) {
     assert(
       lockRepo.acquireLock(
-        lockRoot.id, 99_999_999, getLocalHostName(), 1700000000, existing
+        LockRequest(lockRoot.id, 99_999_999, getLocalHostName(), 1700000000),
+        existing
       )
     );
     assert(dispatchCommand(roCtx, ["sync", "lock_root"], testOpts) == 0);

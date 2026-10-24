@@ -9,7 +9,8 @@ import orglistremo.db.backup : writeDatabaseBackup;
 import orglistremo.db.connection :
   DbOpenResult, openDatabaseChecked, openWorkerDatabase, readDbSchemaVersion;
 import orglistremo.db.repo : EntryRepository, RootRepository;
-import orglistremo.db.repo_locks : SyncLockInfo, SyncLockRepository;
+import orglistremo.db.repo_locks :
+  LockRequest, SyncLockInfo, SyncLockRepository;
 import orglistremo.db.migration : migrateDatabase;
 import orglistremo.db.schema_version : schemaVersion;
 import orglistremo.model : Entry, Root;
@@ -203,8 +204,9 @@ void testLockOwnershipStress(string workDir) {
   SyncLockInfo existing;
 
   // 1. Process A acquires lock
-  const bool acqA =
-    repo.acquireLock(rootId, 1001, "host-alpha", 1700000010, existing);
+  const bool acqA = repo.acquireLock(
+    LockRequest(rootId, 1001, "host-alpha", 1700000010), existing
+  );
   recordAssertion(acqA, "BUG-07.1", "Process A acquired lock");
 
   // 2. Mismatched PID / Hostname release attempts MUST FAIL
@@ -243,8 +245,9 @@ void testLockOwnershipStress(string workDir) {
   recordAssertion(broken, "BUG-07.6", "breakLock broke lock unconditionally");
 
   // Process B acquires lock
-  const bool acqB =
-    repo.acquireLock(rootId, 2002, "host-beta", 1700000020, existing);
+  const bool acqB = repo.acquireLock(
+    LockRequest(rootId, 2002, "host-beta", 1700000020), existing
+  );
   recordAssertion(acqB, "BUG-07.7", "Process B acquired lock after break");
 
   // Process A terminates and attempts to release its old lock
@@ -293,7 +296,9 @@ void testLockOwnershipStress(string workDir) {
       tDb.execute("PRAGMA busy_timeout = 10000;");
       auto tRepo = SyncLockRepository(tDb);
       SyncLockInfo tInfo;
-      if (tRepo.acquireLock(rootId, threadPid, threadHost, 1700000000, tInfo)) {
+      if (tRepo.acquireLock(
+        LockRequest(rootId, threadPid, threadHost, 1700000000), tInfo
+      )) {
         atomicOp!"+="(acqWinners, 1);
       } else {
         atomicOp!"+="(acqLosers, 1);
@@ -312,8 +317,9 @@ void testLockOwnershipStress(string workDir) {
   // 5. Hostname with SQL injection payload and special chars
   repo.breakLock(rootId);
   const string evilHost = "'; DROP TABLE sync_locks; -- '\"\\";
-  const bool evilAcq =
-    repo.acquireLock(rootId, 7777, evilHost, 1700000000, existing);
+  const bool evilAcq = repo.acquireLock(
+    LockRequest(rootId, 7777, evilHost, 1700000000), existing
+  );
   recordAssertion(
     evilAcq,
     "BUG-07.13",

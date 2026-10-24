@@ -4,7 +4,7 @@ import d2sqlite3 : Database, ResultRange, Row, SqliteType, Statement;
 import orglistremo.db.internal.schema : columnExists;
 import orglistremo.db.internal.sql :
   bindNullable, bindSubpath, buildEntrySortSql, buildSubpathSql,
-  buildTypeFilterSql, entrySelectSql;
+  buildTypeFilterSql, entrySelectSql, NullableValue, SubpathQuery;
 import orglistremo.db.transaction : withTransaction;
 import orglistremo.model :
   DuplicateGroup, emptyHash, Entry, EntryType, groupDuplicates, Root,
@@ -84,8 +84,12 @@ struct RootRepository {
     stmt.bind(1, srcRoot.name);
     stmt.bind(2, srcRoot.path);
     stmt.bind(3, srcRoot.createdAt);
-    bindNullable(stmt, 4, srcRoot.hasLastSync, srcRoot.lastSync);
-    bindNullable(stmt, 5, srcRoot.hasFreeSpace, srcRoot.freeSpace);
+    bindNullable(
+      stmt, 4, NullableValue!long(srcRoot.hasLastSync, srcRoot.lastSync)
+    );
+    bindNullable(
+      stmt, 5, NullableValue!ulong(srcRoot.hasFreeSpace, srcRoot.freeSpace)
+    );
     stmt.execute();
     return db.lastInsertRowid;
   }
@@ -101,8 +105,12 @@ struct RootRepository {
       WHERE id = ?;
     `);
     stmt.bind(1, srcRoot.path);
-    bindNullable(stmt, 2, srcRoot.hasLastSync, srcRoot.lastSync);
-    bindNullable(stmt, 3, srcRoot.hasFreeSpace, srcRoot.freeSpace);
+    bindNullable(
+      stmt, 2, NullableValue!long(srcRoot.hasLastSync, srcRoot.lastSync)
+    );
+    bindNullable(
+      stmt, 3, NullableValue!ulong(srcRoot.hasFreeSpace, srcRoot.freeSpace)
+    );
     stmt.bind(4, targetRootId);
     stmt.execute();
   }
@@ -167,15 +175,8 @@ struct RootRepository {
     }
   }
 
-  void updateLastSync(
-    long rootId,
-    long timestamp,
-    ulong freeSpace = 0,
-    bool hasFreeSpace = false
-  ) {
-    updateLastSync(
-      SyncSaveParams(rootId, timestamp, freeSpace, hasFreeSpace)
-    );
+  void updateLastSync(long rootId, long timestamp) {
+    updateLastSync(SyncSaveParams(rootId, timestamp));
   }
 
   Root[] findByPattern(string pattern) {
@@ -434,15 +435,8 @@ struct EntryRepository {
     clearStagedEntries(params.rootId);
   }
 
-  void commitStagedSync(
-    long rootId,
-    long syncTimestamp,
-    ulong freeSpace = 0,
-    bool hasFreeSpace = false
-  ) {
-    commitStagedSync(
-      SyncSaveParams(rootId, syncTimestamp, freeSpace, hasFreeSpace)
-    );
+  void commitStagedSync(long rootId, long syncTimestamp) {
+    commitStagedSync(SyncSaveParams(rootId, syncTimestamp));
   }
 
   void saveSyncEntries(in SyncSaveParams params, in Entry[] allEntries) {
@@ -453,26 +447,10 @@ struct EntryRepository {
   void saveSyncEntries(
     long rootId,
     in Entry[] allEntries,
-    long syncTimestamp,
-    ulong freeSpace = 0,
-    bool hasFreeSpace = false
+    long syncTimestamp
   ) {
     saveSyncEntries(
-      SyncSaveParams(rootId, syncTimestamp, freeSpace, hasFreeSpace),
-      allEntries
-    );
-  }
-
-  void saveSyncEntries(
-    long rootId,
-    in Entry[] allEntries,
-    in Entry[] remainingEntries,
-    long syncTimestamp,
-    ulong freeSpace = 0,
-    bool hasFreeSpace = false
-  ) {
-    saveSyncEntries(
-      SyncSaveParams(rootId, syncTimestamp, freeSpace, hasFreeSpace),
+      SyncSaveParams(rootId, syncTimestamp),
       allEntries
     );
   }
@@ -482,9 +460,7 @@ struct EntryRepository {
     in ListEntriesFilter filter = ListEntriesFilter.init
   ) {
     return queryEntries(
-      "WHERE e.root_id = ?",
-      filter,
-      false,
+      EntryQuerySpec("WHERE e.root_id = ?", filter, false),
       (ref Statement stmt, ref int idx) {
         stmt.bind(idx++, rootId);
       }
@@ -499,9 +475,7 @@ struct EntryRepository {
       ? "WHERE r.name GLOB ?"
       : "WHERE r.name LIKE ? ESCAPE '\\'";
     return queryEntries(
-      whereRoot,
-      filter,
-      true,
+      EntryQuerySpec(whereRoot, filter, true),
       (ref Statement stmt, ref int idx) {
         if (filter.useGlob) {
           stmt.bind(idx++, rootPattern);
@@ -601,8 +575,10 @@ private:
       bindNullable(
         stmt,
         3,
-        e.parentPath !is null && e.parentPath.length > 0,
-        e.parentPath
+        NullableValue!string(
+          e.parentPath !is null && e.parentPath.length > 0,
+          e.parentPath
+        )
       );
       stmt.bind(4, e.name);
       stmt.bind(5, e.isDir ? 1 : 0);
@@ -613,31 +589,37 @@ private:
     }
   }
 
+  struct EntryQuerySpec {
+    string whereRootClause;
+    ListEntriesFilter filter;
+    bool includeRootInSort;
+  }
+
   Entry[] queryEntries(
-    string whereRootClause,
-    in ListEntriesFilter filter,
-    bool includeRootInSort,
+    in EntryQuerySpec spec,
     scope void delegate(ref Statement, ref int) bindRoot
   ) {
-    string sql = entrySelectSql ~ " " ~ whereRootClause;
-    sql ~= buildTypeFilterSql(filter.typeFilter, "e.");
+    string sql = entrySelectSql ~ " " ~ spec.whereRootClause;
+    sql ~= buildTypeFilterSql(spec.filter.typeFilter, "e.");
 
-    if (filter.subpath.length > 0) {
-      sql ~= " AND " ~ buildSubpathSql(filter.subpath, filter.useGlob, "e.");
+    if (spec.filter.subpath.length > 0) {
+      const sq = SubpathQuery(spec.filter.subpath, spec.filter.useGlob);
+      sql ~= " AND " ~ buildSubpathSql(sq, "e.");
     }
-    if (filter.hashPattern.length > 0) {
+    if (spec.filter.hashPattern.length > 0) {
       sql ~= " AND e.sha256 LIKE ? ESCAPE '\\'";
     }
-    sql ~= buildEntrySortSql(filter.sort, includeRootInSort);
+    sql ~= buildEntrySortSql(spec.filter.sort, spec.includeRootInSort);
 
     Statement stmt = db.prepare(sql);
     int paramIdx = 1;
     bindRoot(stmt, paramIdx);
-    if (filter.subpath.length > 0) {
-      bindSubpath(stmt, paramIdx, filter.subpath, filter.useGlob);
+    if (spec.filter.subpath.length > 0) {
+      const sq = SubpathQuery(spec.filter.subpath, spec.filter.useGlob);
+      bindSubpath(stmt, paramIdx, sq);
     }
-    if (filter.hashPattern.length > 0) {
-      stmt.bind(paramIdx++, userPatternToLike(filter.hashPattern));
+    if (spec.filter.hashPattern.length > 0) {
+      stmt.bind(paramIdx++, userPatternToLike(spec.filter.hashPattern));
     }
 
     return readEntries(stmt);
@@ -695,24 +677,30 @@ private:
       if (i > 0) {
         s ~= " OR ";
       }
+      const pfx = SqlTablePrefixes(entryPrefix, rootPrefix);
       s ~= "(" ~
-        buildSingleTargetSql(t, filter.useGlob, entryPrefix, rootPrefix) ~
+        buildSingleTargetSql(t, filter.useGlob, pfx) ~
         ")";
     }
     return s;
   }
 
+  struct SqlTablePrefixes {
+    string entryPrefix;
+    string rootPrefix;
+  }
+
   static string buildSingleTargetSql(
     in TargetSpec target,
     bool useGlob,
-    string entryPrefix,
-    string rootPrefix
+    in SqlTablePrefixes pfx
   ) {
     string s = useGlob
-      ? (rootPrefix ~ "name GLOB ?")
-      : (rootPrefix ~ "name LIKE ? ESCAPE '\\'");
+      ? (pfx.rootPrefix ~ "name GLOB ?")
+      : (pfx.rootPrefix ~ "name LIKE ? ESCAPE '\\'");
     if (target.hasSubpath && target.subpath.length > 0) {
-      s ~= " AND " ~ buildSubpathSql(target.subpath, useGlob, entryPrefix);
+      const sq = SubpathQuery(target.subpath, useGlob);
+      s ~= " AND " ~ buildSubpathSql(sq, pfx.entryPrefix);
     }
     return s;
   }
@@ -723,23 +711,28 @@ private:
     in HashQueryFilter filter
   ) {
     foreach (ref const t; filter.targets) {
-      bindSingleTarget(stmt, idx, t, filter.useGlob);
+      bindSingleTarget(stmt, idx, TargetBindParams(t, filter.useGlob));
     }
+  }
+
+  struct TargetBindParams {
+    TargetSpec target;
+    bool useGlob;
   }
 
   static void bindSingleTarget(
     ref Statement stmt,
     ref int idx,
-    in TargetSpec target,
-    bool useGlob
+    in TargetBindParams params
   ) {
-    if (useGlob) {
-      stmt.bind(idx++, target.rootName);
+    if (params.useGlob) {
+      stmt.bind(idx++, params.target.rootName);
     } else {
-      stmt.bind(idx++, userPatternToLike(target.rootName));
+      stmt.bind(idx++, userPatternToLike(params.target.rootName));
     }
-    if (target.hasSubpath && target.subpath.length > 0) {
-      bindSubpath(stmt, idx, target.subpath, useGlob);
+    if (params.target.hasSubpath && params.target.subpath.length > 0) {
+      const sq = SubpathQuery(params.target.subpath, params.useGlob);
+      bindSubpath(stmt, idx, sq);
     }
   }
 
@@ -912,8 +905,7 @@ unittest {
   Entry[] allBatch = batch1 ~ [
     Entry(0, rBatch, "r_batch", ".", null, ".", true, 0, 1000, "hdir")
   ];
-  Entry[] remaining = [allBatch[$ - 1]];
-  entryRepo.saveSyncEntries(rBatch, allBatch, remaining, 5000);
+  entryRepo.saveSyncEntries(rBatch, allBatch, 5000);
   assert(entryRepo.listEntriesByRootId(rBatch).length == 3);
 
   // Test free_space in RootRepository

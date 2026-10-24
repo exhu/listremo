@@ -2,7 +2,7 @@ module orglistremo.cli.query_cmd;
 
 import d2sqlite3 : Database;
 import orglistremo.cli.args : ArgCursor, parseChoice;
-import orglistremo.cli.roots : resolveRoots, RootLookupOptions;
+import orglistremo.cli.roots : resolveRoots, RootLookupOptions, RootQuery;
 import orglistremo.db.repo :
   EntryRepository, HashQueryFilter, ListEntriesFilter, RootRepository;
 import orglistremo.model :
@@ -88,12 +88,11 @@ int handleListCommand(
 
   RootRepository rootRepo = RootRepository(db);
   TargetSpec[] specs;
-  if (!resolveTargetSpecs(
-    rootRepo,
+  const TargetSpecRequest specReq = TargetSpecRequest(
     listArgs.targets.length > 0 ? listArgs.targets : [""],
-    listArgs.useGlob,
-    specs
-  )) {
+    listArgs.useGlob
+  );
+  if (!resolveTargetSpecs(rootRepo, specReq, specs)) {
     return 1;
   }
 
@@ -215,17 +214,23 @@ void sortEntries(Entry[] entries, SortField sortField) {
 
 private:
 
+struct TargetSpecRequest {
+  const(string)[] rawTargets;
+  bool useGlob;
+}
+
 bool resolveTargetSpecs(
   ref RootRepository rootRepo,
-  in string[] rawTargets,
-  bool useGlob,
+  in TargetSpecRequest req,
   out TargetSpec[] specs
 ) {
-  const RootLookupOptions lookupOpts = RootLookupOptions(useGlob, null);
-  foreach (t; rawTargets) {
-    const TargetSpec spec = TargetSpec.parse(t, useGlob);
+  const RootLookupOptions lookupOpts = RootLookupOptions(req.useGlob, null);
+  foreach (t; req.rawTargets) {
+    const TargetSpec spec = TargetSpec.parse(t, req.useGlob);
     Root[] matched;
-    if (!resolveRoots(rootRepo, spec.rootName, matched, lookupOpts)) {
+    if (!resolveRoots(
+      rootRepo, RootQuery(spec.rootName, lookupOpts), matched
+    )) {
       return false;
     }
     specs ~= spec;
@@ -273,9 +278,8 @@ bool resolveHashQueryFilter(
   if (args.targets.length == 0) {
     return true;
   }
-  return resolveTargetSpecs(
-    rootRepo, args.targets, args.useGlob, filter.targets
-  );
+  const TargetSpecRequest req = TargetSpecRequest(args.targets, args.useGlob);
+  return resolveTargetSpecs(rootRepo, req, filter.targets);
 }
 
 unittest {

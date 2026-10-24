@@ -108,17 +108,6 @@ bool backupIfRequested(
 }
 
 bool backupIfRequested(
-  ref Database db,
-  string dbPath,
-  bool noBackup,
-  in OutputOptions opts = OutputOptions.init
-) {
-  return backupIfRequested(
-    db, BackupRequest(dbPath, noBackup, opts, "Migration")
-  );
-}
-
-bool backupIfRequested(
   ref DbContext ctx,
   in BackupRequest req
 ) {

@@ -296,18 +296,11 @@ bool syncSingleRoot(
   ref SyncRunContext runCtx
 ) {
   SyncLockRepository lockRepo = SyncLockRepository(db);
-  LockRequest lockReq = LockRequest(
-    root.id,
-    thisProcessID,
-    getLocalHostName(),
-    Clock.currTime.toUnixTime()
-  );
-
-  if (!acquireRootLock(lockRepo, root, lockReq, runCtx)) {
+  if (!acquireRootLock(lockRepo, root, runCtx)) {
     return false;
   }
   scope (exit) {
-    lockRepo.releaseLock(lockReq.rootId, lockReq.pid, lockReq.hostname);
+    lockRepo.releaseLock(root.id, thisProcessID, getLocalHostName());
   }
 
   runCtx.syncStarted = true;
@@ -324,9 +317,14 @@ bool syncSingleRoot(
 bool acquireRootLock(
   ref SyncLockRepository lockRepo,
   const ref Root root,
-  in LockRequest req,
   ref SyncRunContext runCtx
 ) {
+  const LockRequest req = LockRequest(
+    root.id,
+    thisProcessID,
+    getLocalHostName(),
+    Clock.currTime.toUnixTime()
+  );
   SyncLockInfo existing;
   bool acquired = lockRepo.acquireLock(req, existing);
   if (!acquired && runCtx.syncArgs.breakLock) {
@@ -382,7 +380,7 @@ bool executeScan(
   syncOpts.force = runCtx.syncArgs.forceFlag;
   syncOpts.forceHash = runCtx.syncArgs.forceHash;
   if (runCtx.reporter !is null) {
-    syncOpts.onProgress = &runCtx.reporter.onProgress;
+    syncOpts.onProgress = &runCtx.reporter.update;
   }
   syncOpts.onIssue = (const ref SyncIssue issue) {
     syncLog(runCtx.logMutex, {

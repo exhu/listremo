@@ -65,6 +65,12 @@ int handleMigrateCommand(
     return 1;
   }
 
+  return runMigration(ctx, opts);
+}
+
+private:
+
+int runMigration(ref DbContext ctx, in OutputOptions opts) {
   try {
     const int prevVersion = ctx.dbSchemaVersion;
     migrateDatabase(ctx.db, prevVersion);

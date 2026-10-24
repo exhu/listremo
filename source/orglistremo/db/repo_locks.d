@@ -50,18 +50,6 @@ struct SyncLockRepository {
     return acquired;
   }
 
-  bool acquireLock(
-    long rootId,
-    int pid,
-    string hostname,
-    long startedAt,
-    out SyncLockInfo existing
-  ) {
-    return acquireLock(
-      LockRequest(rootId, pid, hostname, startedAt), existing
-    );
-  }
-
   bool releaseLock(long rootId, int pid, string hostname) {
     bool changed = false;
     withTransaction(db, {
@@ -174,14 +162,22 @@ unittest {
   assert(!repo.getLock(rootId, queried));
 
   // Re-acquire works
-  assert(repo.acquireLock(rootId, myPid, "myhost", 1700000030, existing));
+  assert(
+    repo.acquireLock(
+      LockRequest(rootId, myPid, "myhost", 1700000030), existing
+    )
+  );
 
   // Break lock works unconditionally
   assert(repo.breakLock(rootId));
   assert(!repo.getLock(rootId, queried));
 
   // Re-acquire after break works
-  assert(repo.acquireLock(rootId, myPid, "myhost", 1700000040, existing));
+  assert(
+    repo.acquireLock(
+      LockRequest(rootId, myPid, "myhost", 1700000040), existing
+    )
+  );
 
   // Cascade delete on root removal
   db.execute("DELETE FROM roots WHERE id = ?;", rootId);

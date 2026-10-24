@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.14.0
+
+- Externalized HTML report CSS and JavaScript into `assets/orglistremo/`
+  (`report.css`, `report.js`) embedded at compile time via
+  `source/orglistremo/internal/assets.d`.
+- Cleaned up `output/` subsystem (`html.d`, `console.d`, `formatter.d`),
+  extracting `writePageHeader`, `writeTreePageHeader`, `HtmlTreeNode.setMeta`,
+  and `dispatchFormat`, and added `output/package.d`.
+- Cleaned up `sync/` subsystem (`hasher.d`, `scanner.d`), returning
+  `DirectoryHashResult` from `hashDirectory`, extracting `ScannerContext`
+  helpers (`joinRelPath`, `makeProgress`, `appendEntry`), and added
+  `sync/package.d`.
+- Completed full `codestyle.md` audit across all `source/orglistremo/` modules
+  (<= 50 lines per function, <= 3 parameters per function, methods before
+  fields, explicit types, and 80-column limit).
+
 ## 0.13.0
 
 - Extracted cross-cutting output options (`OutputFormat`, `ColorMode`,

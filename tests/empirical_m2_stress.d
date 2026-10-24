@@ -23,7 +23,7 @@ import orglistremo.pattern :
   escapeLikeLiteral, hasGlobWildcard, hasPatternWildcard, isWildcard,
   NamePattern, unescapePatternEscapes, userPatternToLike;
 import orglistremo.sync.hasher :
-  ChildRecord, hashDirectory, hashFile;
+  ChildRecord, DirectoryHashResult, hashDirectory, hashFile;
 import std.algorithm.searching : canFind;
 import std.file : exists, write;
 import std.format : format;
@@ -436,14 +436,12 @@ void testEmptyHashConsistency(string workDir) {
     format("hashFile for 0-byte file returned '%s'", hashOfEmptyFile)
   );
 
-  string dirHash;
-  ulong dirSize;
-  hashDirectory([], dirHash, dirSize);
+  const DirectoryHashResult emptyDirRes = hashDirectory([]);
   recordAssertion(
-    dirHash == emptyHash && dirSize == 0,
+    emptyDirRes.sha256 == emptyHash && emptyDirRes.totalSize == 0,
     "hasher_empty_directory",
     format("hashDirectory for 0 children returned hash='%s', size=%d",
-           dirHash, dirSize)
+           emptyDirRes.sha256, emptyDirRes.totalSize)
   );
 
   // 4. Units formatHash

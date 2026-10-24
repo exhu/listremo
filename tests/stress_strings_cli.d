@@ -216,7 +216,8 @@ void testBug08TruncatePathLeft() {
   OutputOptions opts;
   const tempLog = "/tmp/listremo_console_progress_test.log";
   File f = File(tempLog, "w");
-  auto reporter = new ConsoleProgressReporter(opts, 0, f, true);
+  auto reporter = new ConsoleProgressReporter(opts, 0, f);
+  reporter.enableTtyForTest();
 
   SyncProgress sp;
   sp.phase = SyncPhase.scanning;
@@ -230,7 +231,7 @@ void testBug08TruncatePathLeft() {
     sp.currentPath = p;
     reporter.update(sp);
   }
-  reporter.finish();
+  reporter.clear();
   f.close();
 
   // Read log and validate all lines are valid UTF-8

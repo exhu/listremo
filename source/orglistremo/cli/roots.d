@@ -25,40 +25,58 @@ void reportNoRootMatch(
   }
 }
 
+struct RootQuery {
+  string pattern;
+  RootLookupOptions opts;
+}
+
 bool resolveRoots(
   ref RootRepository rootRepo,
-  string pattern,
-  out Root[] matched,
-  in RootLookupOptions opts = RootLookupOptions.init
+  in RootQuery query,
+  out Root[] matched
 ) {
-  matched = opts.useGlob
-    ? rootRepo.findByGlob(pattern)
-    : rootRepo.findByPattern(pattern);
+  matched = query.opts.useGlob
+    ? rootRepo.findByGlob(query.pattern)
+    : rootRepo.findByPattern(query.pattern);
   if (matched.length > 0) {
     return true;
   }
-  reportNoRootMatch(pattern, opts.useGlob, opts.dbLabel);
+  reportNoRootMatch(query.pattern, query.opts.useGlob, query.opts.dbLabel);
   return false;
 }
 
 bool resolveRoots(
   ref RootRepository rootRepo,
-  in string[] patterns,
-  out Root[] matched,
-  in RootLookupOptions opts = RootLookupOptions.init
+  string pattern,
+  out Root[] matched
 ) {
-  if (patterns.length == 0) {
-    const string wildcard = opts.useGlob ? "*" : "%";
-    matched = opts.useGlob
+  return resolveRoots(
+    rootRepo, RootQuery(pattern, RootLookupOptions.init), matched
+  );
+}
+
+struct MultiRootQuery {
+  string[] patterns;
+  RootLookupOptions opts;
+}
+
+bool resolveRoots(
+  ref RootRepository rootRepo,
+  in MultiRootQuery query,
+  out Root[] matched
+) {
+  if (query.patterns.length == 0) {
+    const string wildcard = query.opts.useGlob ? "*" : "%";
+    matched = query.opts.useGlob
       ? rootRepo.findByGlob(wildcard)
       : rootRepo.findByPattern(wildcard);
     return true;
   }
 
   bool[long] seenIds;
-  foreach (pattern; patterns) {
+  foreach (pattern; query.patterns) {
     Root[] found;
-    if (!resolveRoots(rootRepo, pattern, found, opts)) {
+    if (!resolveRoots(rootRepo, RootQuery(pattern, query.opts), found)) {
       return false;
     }
     foreach (ref r; found) {
@@ -69,6 +87,16 @@ bool resolveRoots(
     }
   }
   return true;
+}
+
+bool resolveRoots(
+  ref RootRepository rootRepo,
+  in string[] patterns,
+  out Root[] matched
+) {
+  return resolveRoots(
+    rootRepo, MultiRootQuery(patterns.dup, RootLookupOptions.init), matched
+  );
 }
 
 unittest {

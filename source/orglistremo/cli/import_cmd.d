@@ -5,9 +5,11 @@ import d2sqlite3 : Database;
 import orglistremo.cli.args : ArgCursor;
 import orglistremo.cli.context :
    backupIfRequested, BackupRequest, DbContext, requireWritable;
-import orglistremo.cli.roots : resolveRoots, RootLookupOptions;
+import orglistremo.cli.roots :
+  MultiRootQuery, resolveRoots, RootLookupOptions;
 import orglistremo.db.connection : readDbSchemaVersion;
-import orglistremo.db.repo : EntryRepository, RootRepository;
+import orglistremo.db.repo :
+  EntryRepository, RootRepository, SyncSaveParams;
 import orglistremo.db.transaction : withTransaction;
 import orglistremo.model : Entry, Root;
 import orglistremo.output.options : OutputFormat, OutputOptions;
@@ -71,9 +73,10 @@ bool resolveImportSourceRoots(
   const RootLookupOptions lookupOpts = RootLookupOptions(
     false, importArgs.sourceDbPath
   );
-  return resolveRoots(
-    srcRootRepo, importArgs.rootPatterns, matchedRoots, lookupOpts
+  const MultiRootQuery query = MultiRootQuery(
+    importArgs.rootPatterns.dup, lookupOpts
   );
+  return resolveRoots(srcRootRepo, query, matchedRoots);
 }
 
 struct ImportExecConfig {
@@ -202,15 +205,20 @@ int handleImportCommand(
     return 1;
   }
 
-  const ImportExecConfig execCfg = ImportExecConfig(
+  ImportExecConfig execCfg = ImportExecConfig(
     matchedRoots, importArgs.noUpdate
   );
-  return runImportExecution(ctx, sourceDb, execCfg, opts);
+  return runImportExecution(ctx.db, sourceDb, ImportExecRequest(execCfg, opts));
 }
 
 private:
 
 enum size_t importBatchSize = 1000;
+
+struct ImportExecRequest {
+  ImportExecConfig execCfg;
+  OutputOptions opts;
+}
 
 struct ImportContext {
   RootRepository dstRootRepo;
@@ -225,18 +233,17 @@ struct ExistingRootPair {
 }
 
 int runImportExecution(
-  ref DbContext ctx,
+  ref Database targetDb,
   ref Database sourceDb,
-  in ImportExecConfig execCfg,
-  in OutputOptions opts
+  in ImportExecRequest req
 ) {
   try {
     const MonoTime startMono = MonoTime.currTime;
     const ImportSummary summary = executeImportRoots(
-      ctx.db, sourceDb, execCfg
+      targetDb, sourceDb, req.execCfg
     );
     const Duration elapsed = MonoTime.currTime - startMono;
-    if (opts.format == OutputFormat.console) {
+    if (req.opts.format == OutputFormat.console) {
       printImportSummary(summary, elapsed);
     }
     return 0;
@@ -448,31 +455,25 @@ unittest {
 
   const dstKeepId = dstRoots.addRoot("root_keep", "/dst/keep");
   dstEntries.saveSyncEntries(
-    dstKeepId,
+    SyncSaveParams(dstKeepId, 5000, 1024, true),
     [
       Entry(0, dstKeepId, "root_keep", ".", null, ".", true, 10, 1000, "h_k"),
       Entry(
         0, dstKeepId, "root_keep", "k.txt", ".", "k.txt", false, 10, 1000, "hk"
       )
-    ],
-    5000,
-    1024,
-    true
+    ]
   );
 
   const dstUpdId = dstRoots.addRoot("root_update", "/dst/old_path");
   dstEntries.saveSyncEntries(
-    dstUpdId,
+    SyncSaveParams(dstUpdId, 2000, 2048, true),
     [
       Entry(0, dstUpdId, "root_update", ".", null, ".", true, 20, 1000, "h_u0"),
       Entry(
         0, dstUpdId, "root_update", "existing.txt", ".", "existing.txt",
         false, 20, 1000, "he0"
       )
-    ],
-    2000,
-    2048,
-    true
+    ]
   );
 
   const srcKeepId = srcRoots.addRoot("root_keep", "/src/keep");
@@ -489,7 +490,7 @@ unittest {
 
   const srcUpdId = srcRoots.addRoot("root_update", "/src/new_path");
   srcEntries.saveSyncEntries(
-    srcUpdId,
+    SyncSaveParams(srcUpdId, 6000, 9999, true),
     [
       Entry(0, srcUpdId, "root_update", ".", null, ".", true, 50, 1500, "h_u1"),
       Entry(
@@ -504,15 +505,12 @@ unittest {
         0, srcUpdId, "root_update", "sub/added.txt", "sub", "added.txt",
         false, 25, 1500, "hadd"
       )
-    ],
-    6000,
-    9999,
-    true
+    ]
   );
 
   const srcNewId = srcRoots.addRoot("root_new", "/src/new_root");
   srcEntries.saveSyncEntries(
-    srcNewId,
+    SyncSaveParams(srcNewId, 4000, 4096, true),
     [
       Entry(0, srcNewId, "root_new", ".", null, ".", true, 70, 1200, "h_n"),
       Entry(
@@ -526,10 +524,7 @@ unittest {
         0, srcNewId, "root_new", "b.txt", ".", "b.txt",
         false, 40, 1200, "hb"
       )
-    ],
-    4000,
-    4096,
-    true
+    ]
   );
 
   Root[] matched;

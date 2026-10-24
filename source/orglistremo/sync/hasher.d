@@ -13,6 +13,11 @@ struct ChildRecord {
   ulong size;
 }
 
+struct DirectoryHashResult {
+  string sha256;
+  ulong totalSize;
+}
+
 alias HashChunkCallback = void delegate(ulong bytesHashed, ulong totalBytes);
 
 string hashFile(
@@ -24,7 +29,7 @@ string hashFile(
     return emptyHash;
   }
 
-  auto file = File(filePath, "rb");
+  File file = File(filePath, "rb");
   SHA256 sha;
   sha.start();
 
@@ -40,33 +45,31 @@ string hashFile(
   return sha.finish().toHexString!(LetterCase.lower).idup;
 }
 
-void hashDirectory(
-  ChildRecord[] children,
-  out string outSha256,
-  out ulong outTotalSize
-) {
+/**
+ * Computes the deterministic SHA-256 hash and total byte size of a directory.
+ *
+ * Note: Sorts `children` in-place by name in lexicographical UTF-8 byte order.
+ */
+DirectoryHashResult hashDirectory(ChildRecord[] children) {
   if (children.length == 0) {
-    outSha256 = emptyHash;
-    outTotalSize = 0;
-    return;
+    return DirectoryHashResult(emptyHash, 0);
   }
 
-  // Sort children deterministically by name in lexicographical UTF-8 byte order
   children.sort!((a, b) => a.name < b.name);
 
   ulong totalSize = 0;
   SHA256 sha;
   sha.start();
 
-  foreach (ref child; children) {
+  foreach (ref const child; children) {
     totalSize += child.size;
-    const typeTag = child.isDir ? "D" : "F";
-    const line = typeTag ~ ":" ~ child.name ~ ":" ~ child.sha256 ~ "\n";
+    const string typeTag = child.isDir ? "D" : "F";
+    const string line = typeTag ~ ":" ~ child.name ~ ":" ~ child.sha256 ~ "\n";
     sha.put(cast(const(ubyte)[]) line);
   }
 
-  outTotalSize = totalSize;
-  outSha256 = sha.finish().toHexString!(LetterCase.lower).idup;
+  const string hashHex = sha.finish().toHexString!(LetterCase.lower).idup;
+  return DirectoryHashResult(hashHex, totalSize);
 }
 
 unittest {
@@ -74,12 +77,12 @@ unittest {
   import std.file : write;
 
   // Test empty file
-  const zeroHash = hashFile("/dev/null", 0);
+  const string zeroHash = hashFile("/dev/null", 0);
   assert(zeroHash == emptyHash);
 
   // Test non-empty file
   TempDir tempDir = TempDir("hasher");
-  const tmpFile = tempDir.subPath("test.txt");
+  const string tmpFile = tempDir.subPath("test.txt");
   write(tmpFile, "hello listremo\n");
   ulong callbackBytesHashed = 0;
   ulong callbackTotalBytes = 0;
@@ -90,7 +93,7 @@ unittest {
     chunkCallCount++;
   }
 
-  const computedHash = hashFile(tmpFile, 15, &onChunkTest);
+  const string computedHash = hashFile(tmpFile, 15, &onChunkTest);
   assert(computedHash.length == 64);
   assert(chunkCallCount == 1);
   assert(callbackBytesHashed == 15);
@@ -98,11 +101,9 @@ unittest {
 
   // Test empty directory
   ChildRecord[] emptyChildren;
-  string dirHash;
-  ulong dirSize;
-  hashDirectory(emptyChildren, dirHash, dirSize);
-  assert(dirHash == emptyHash);
-  assert(dirSize == 0);
+  const DirectoryHashResult emptyRes = hashDirectory(emptyChildren);
+  assert(emptyRes.sha256 == emptyHash);
+  assert(emptyRes.totalSize == 0);
 
   // Test deterministic directory hashing regardless of initial child order
   ChildRecord[] c1 = [
@@ -116,13 +117,11 @@ unittest {
     ChildRecord("b.txt", false, "hash_b", 20)
   ];
 
-  string h1, h2;
-  ulong s1, s2;
-  hashDirectory(c1, h1, s1);
-  hashDirectory(c2, h2, s2);
+  const DirectoryHashResult res1 = hashDirectory(c1);
+  const DirectoryHashResult res2 = hashDirectory(c2);
 
-  assert(h1 == h2);
-  assert(s1 == 80);
-  assert(s2 == 80);
-  assert(h1.length == 64);
+  assert(res1.sha256 == res2.sha256);
+  assert(res1.totalSize == 80);
+  assert(res2.totalSize == 80);
+  assert(res1.sha256.length == 64);
 }

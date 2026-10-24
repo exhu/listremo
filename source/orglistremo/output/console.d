@@ -1,21 +1,17 @@
 module orglistremo.output.console;
 
 import core.time : dur, Duration, MonoTime;
-import orglistremo.internal.os :
-  getTerminalWidth, isStdoutTty, isTty;
-import orglistremo.model :
-  DuplicateGroup, Entry, RootSummary;
+import orglistremo.internal.os : getTerminalWidth, isStdoutTty, isTty;
+import orglistremo.model : DuplicateGroup, Entry, RootSummary;
 import orglistremo.output.options :
   ColorMode, OutputFormat, OutputOptions, Styler;
 import orglistremo.output.units :
-  formatDuration, formatHash, formatLastSync, formatSizeHuman, formatUnixTime;
-import orglistremo.sync.progress :
-  SyncPhase, SyncProgress, SyncProgressCallback;
+  formatHash, formatLastSync, formatSizeHuman, formatUnixTime;
+import orglistremo.sync.progress : SyncPhase, SyncProgress;
 import std.format : format;
 import std.stdio : File, stdout;
 
 final class ConsoleProgressReporter {
-public:
   this(
     in OutputOptions opts,
     uint intervalMs = 1000,
@@ -28,28 +24,12 @@ public:
       && .isTty(stream.fileno);
   }
 
-  this(
-    in OutputOptions opts,
-    uint intervalMs,
-    File stream,
-    bool forceTty
-  ) {
-    this.styler = opts.styler;
-    this.interval = dur!"msecs"(intervalMs);
-    this.stream = stream;
-    this.isTty = forceTty;
-  }
-
-  void onProgress(const ref SyncProgress progress) {
-    update(progress);
-  }
-
   void update(const ref SyncProgress progress) {
     if (!isTty) {
       return;
     }
-    const now = MonoTime.currTime;
-    const phaseChanged = !hasOutput || (progress.phase != lastPhase);
+    const MonoTime now = MonoTime.currTime;
+    const bool phaseChanged = !hasOutput || (progress.phase != lastPhase);
     if (!phaseChanged && (now - lastUpdateTime) < interval) {
       return;
     }
@@ -58,7 +38,7 @@ public:
     hasOutput = true;
 
     size_t visibleLen;
-    const line = formatProgressLine(progress, visibleLen);
+    const string line = formatProgressLine(progress, visibleLen);
     renderLine(line, visibleLen);
   }
 
@@ -76,24 +56,15 @@ public:
     lastVisibleLen = 0;
   }
 
-  void finish() {
-    clear();
-  }
-
   size_t currentVisibleLength() const {
     return lastVisibleLen;
   }
 
-private:
-  Styler styler;
-  Duration interval;
-  File stream;
-  bool isTty;
-  MonoTime lastUpdateTime;
-  SyncPhase lastPhase;
-  bool hasOutput;
-  size_t lastVisibleLen;
+  package(orglistremo) void enableTtyForTest(bool enabled = true) {
+    this.isTty = enabled;
+  }
 
+private:
   void renderLine(string line, size_t visibleLen) {
     if (styler.enabled) {
       stream.writef("\r%s\033[K", line);
@@ -114,43 +85,52 @@ private:
     out size_t visibleLen
   ) const {
     if (progress.phase == SyncPhase.saving) {
-      const msg = "  Saving database entries...";
+      const string msg = "  Saving database entries...";
       visibleLen = msg.length;
       return styler.enabled ? styler.header(msg) : msg;
     }
 
-    const isHash = (progress.phase == SyncPhase.hashing);
-    const tag = isHash ? "[hash]" : "[scan]";
-    const styledTag = isHash ? styler.size(tag) : styler.header(tag);
+    const bool isHash = (progress.phase == SyncPhase.hashing);
+    const string tag = isHash ? "[hash]" : "[scan]";
+    const string styledTag = isHash ? styler.size(tag) : styler.header(tag);
 
-    const sizeStr = formatSizeHuman(progress.totalBytes);
-    const unstyledPrefix = format(
+    const string sizeStr = formatSizeHuman(progress.totalBytes);
+    const string unstyledPrefix = format(
       "  %s %d files, %d dirs (%s) | ",
       tag, progress.fileCount, progress.dirCount, sizeStr
     );
-    const styledPrefix = format(
+    const string styledPrefix = format(
       "  %s %d files, %d dirs (%s) | ",
       styledTag, progress.fileCount, progress.dirCount, sizeStr
     );
 
     string rawPath = progress.currentPath;
     if (isHash && progress.fileBytesTotal > 0) {
-      const pct = cast(int)(
+      const int pct = cast(int)(
         (progress.fileBytesHashed * 100) / progress.fileBytesTotal
       );
       rawPath = format("%s (%d%%)", progress.currentPath, pct);
     }
 
-    const termWidth = getTerminalWidth(stream.fileno);
-    const visiblePrefixLen = unstyledPrefix.length;
-    const avail = (termWidth > visiblePrefixLen + 1)
+    const uint termWidth = getTerminalWidth(stream.fileno);
+    const size_t visiblePrefixLen = unstyledPrefix.length;
+    const size_t avail = (termWidth > visiblePrefixLen + 1)
       ? termWidth - visiblePrefixLen - 1
       : 0;
-    const truncatedPath = truncatePathLeft(rawPath, avail);
+    const string truncatedPath = truncatePathLeft(rawPath, avail);
 
     visibleLen = visiblePrefixLen + truncatedPath.length;
     return styledPrefix ~ truncatedPath;
   }
+
+  Styler styler;
+  Duration interval;
+  File stream;
+  bool isTty;
+  MonoTime lastUpdateTime;
+  SyncPhase lastPhase;
+  bool hasOutput;
+  size_t lastVisibleLen;
 }
 
 bool shouldColorize(ColorMode mode) {
@@ -170,7 +150,7 @@ bool shouldColorize(ColorMode mode) {
 
 string formatEntryPath(in Entry e, in Styler styler) {
   if (e.rootName.length > 0) {
-    const rootPart = styler.root(e.rootName);
+    const string rootPart = styler.root(e.rootName);
     if (e.isDir) {
       if (e.relPath == "." || e.relPath.length == 0) {
         return rootPart ~ styler.dir(":/");
@@ -181,7 +161,7 @@ string formatEntryPath(in Entry e, in Styler styler) {
   }
 
   if (e.isDir) {
-    const p = (e.relPath == "." || e.relPath.length == 0)
+    const string p = (e.relPath == "." || e.relPath.length == 0)
       ? "/"
       : e.relPath ~ "/";
     return styler.dir(p);
@@ -210,10 +190,12 @@ void printConsoleRoots(
     options.styler.header(format("%12s", "FREE SPACE"))
   );
 
-  foreach (ref s; summaries) {
-    const rawSize = formatSizeHuman(s.totalSize);
-    const syncTimeStr = formatLastSync(s.root.lastSync, s.root.hasLastSync);
-    const freeStr = s.root.hasFreeSpace
+  foreach (ref const s; summaries) {
+    const string rawSize = formatSizeHuman(s.totalSize);
+    const string syncTimeStr = formatLastSync(
+      s.root.lastSync, s.root.hasLastSync
+    );
+    const string freeStr = s.root.hasFreeSpace
       ? formatSizeHuman(s.root.freeSpace)
       : "-";
     outStream.writefln(
@@ -248,14 +230,14 @@ void printConsoleEntries(
     options.styler.header("PATH")
   );
 
-  foreach (ref e; entries) {
-    const typeStr = e.isDir ? "DIR" : "FILE";
-    const pathStr = formatEntryPath(e, options.styler);
-    const hStr = formatHash(e.sha256, options.fullHash);
-    const sizeStr = formatSizeHuman(e.size);
-    const mtimeStr = formatUnixTime(e.mtime);
+  foreach (ref const e; entries) {
+    const string typeStr = e.isDir ? "DIR" : "FILE";
+    const string pathStr = formatEntryPath(e, options.styler);
+    const string hStr = formatHash(e.sha256, options.fullHash);
+    const string sizeStr = formatSizeHuman(e.size);
+    const string mtimeStr = formatUnixTime(e.mtime);
 
-    const typeCol = e.isDir
+    const string typeCol = e.isDir
       ? options.styler.dir(format("%-4s", typeStr))
       : format("%-4s", typeStr);
 
@@ -283,16 +265,16 @@ void printConsoleDuplicates(
   ulong totalDuplicateBytes = 0;
   ulong duplicateCopies = 0;
 
-  foreach (ref g; groups) {
-    const copies = cast(ulong) g.entries.length;
+  foreach (ref const g; groups) {
+    const ulong copies = cast(ulong) g.entries.length;
     if (copies > 1) {
       duplicateCopies += (copies - 1);
       totalDuplicateBytes += (copies - 1) * g.size;
     }
 
-    const typeStr = g.isDir ? "DIR" : "FILE";
-    const hStr = formatHash(g.sha256, options.fullHash);
-    const sizeStr = formatSizeHuman(g.size);
+    const string typeStr = g.isDir ? "DIR" : "FILE";
+    const string hStr = formatHash(g.sha256, options.fullHash);
+    const string sizeStr = formatSizeHuman(g.size);
 
     outStream.writefln(
       "[%s] SHA256: %s | Size: %s (%d copies)",
@@ -302,8 +284,8 @@ void printConsoleDuplicates(
       copies
     );
 
-    foreach (ref e; g.entries) {
-      const pathStr = formatEntryPath(e, options.styler);
+    foreach (ref const e; g.entries) {
+      const string pathStr = formatEntryPath(e, options.styler);
       outStream.writefln("  -> %s", pathStr);
     }
   }
@@ -381,19 +363,6 @@ unittest {
 
   Styler styler;
   styler.enabled = false;
-
-  assert(formatSizeHuman(500) == "500 B");
-  assert(formatSizeHuman(1024) == "1.00 KiB");
-  assert(formatSizeHuman(1048576) == "1.00 MiB");
-
-  assert(formatUnixTime(0).length == 19);
-  assert(formatUnixTime(1700000000).length == 19);
-  assert(formatLastSync(0, false) == "never");
-  assert(formatLastSync(0, true).length == 19);
-
-  assert(formatHash("0", false) == "0");
-  assert(formatHash("abcdef0123456789", false) == "abcdef012345");
-  assert(formatHash("abcdef0123456789", true) == "abcdef0123456789");
 
   // Test formatEntryPath
   Entry e1 = Entry(1, 1, "r1", "doc.txt", ".", "doc.txt", false, 10, 0, "h");
@@ -487,11 +456,10 @@ unittest {
   assert(truncatePathLeft(japanese, 2) == "スト");
   validate(truncatePathLeft(japanese, 5));
 
-  // Test ConsoleProgressReporter with forceTty = true
+  // Test ConsoleProgressReporter with enableTtyForTest(true)
   File progOut = File.tmpfile();
-  auto reporter = new ConsoleProgressReporter(
-    optsNoColor, 1000, progOut, true
-  );
+  auto reporter = new ConsoleProgressReporter(optsNoColor, 1000, progOut);
+  reporter.enableTtyForTest();
 
   SyncProgress sp1;
   sp1.phase = SyncPhase.scanning;
@@ -529,11 +497,12 @@ unittest {
   reporter.clear();
   assert(reporter.currentVisibleLength == 0);
 
-  // Test ConsoleProgressReporter with forceTty = false -> does not write
+  // Test ConsoleProgressReporter with enableTtyForTest(false) -> does not write
   File nonTtyOut = File.tmpfile();
   auto nonTtyReporter = new ConsoleProgressReporter(
-    optsNoColor, 1000, nonTtyOut, false
+    optsNoColor, 1000, nonTtyOut
   );
+  nonTtyReporter.enableTtyForTest(false);
   nonTtyReporter.update(sp1);
   assert(nonTtyReporter.currentVisibleLength == 0);
 
@@ -557,9 +526,8 @@ unittest {
   shortSp.fileBytesTotal = 1000;
 
   const colorProgOut = captureOutput((File f) {
-    auto colorReporter = new ConsoleProgressReporter(
-      optsColor, 0, f, true
-    );
+    auto colorReporter = new ConsoleProgressReporter(optsColor, 0, f);
+    colorReporter.enableTtyForTest();
     colorReporter.update(longSp);
     colorReporter.update(shortSp);
     colorReporter.clear();
@@ -570,9 +538,8 @@ unittest {
 
   // Test ConsoleProgressReporter with optsNoColor emits spaces on shorter line
   const noColorProgOut = captureOutput((File f) {
-    auto noColorReporter = new ConsoleProgressReporter(
-      optsNoColor, 0, f, true
-    );
+    auto noColorReporter = new ConsoleProgressReporter(optsNoColor, 0, f);
+    noColorReporter.enableTtyForTest();
     noColorReporter.update(longSp);
     noColorReporter.update(shortSp);
   });

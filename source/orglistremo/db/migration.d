@@ -157,17 +157,6 @@ void insertVersionRow(ref Database db, in VersionRow row) {
   stmt.execute();
 }
 
-void insertVersionRow(
-  ref Database db,
-  int targetVersion,
-  long creationDate,
-  long modificationDate
-) {
-  insertVersionRow(
-    db, VersionRow(targetVersion, creationDate, modificationDate)
-  );
-}
-
 private:
 
 void runMigrationSteps(ref Database db, int fromVersion) {
