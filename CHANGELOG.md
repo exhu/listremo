@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.13.0
+
+- Extracted cross-cutting output options (`OutputFormat`, `ColorMode`,
+  `OutputOptions`, `Styler`, `info`) into `output/options.d` and sync progress
+  structures (`SyncPhase`, `SyncProgress`, `SyncIssue` with `describe`) into
+  `sync/progress.d` to resolve subsystem layering inversions.
+- Created `cli/` subsystem (`cli/package.d`) with shared CLI helpers:
+  `cli/context.d` (`DbContext`, `requireWritable`, `promptBackupPath`,
+  `backupIfRequested`), `cli/args.d` (`ArgCursor`, `isFlag`, `parseChoice`),
+  `cli/roots.d` (`resolveRoots`, `reportNoRootMatch`), and `cli/usage.d`
+  (`usageText`, `printUsage`), breaking the cyclic dependency with `app.d` and
+  removing interactive I/O from `db/backup.d`.
+- Decomposed `app.d` subcommands into `cli/root_cmd.d`, `cli/sync_cmd.d`
+  (unifying `SyncRunResult`, `SyncRunConfig`, and splitting `syncSingleRoot`
+  into lock, scan, and reporting helpers), `cli/query_cmd.d`, and
+  `cli/migrate_cmd.d`.
+- Moved `importer.d` to `cli/import_cmd.d`, grouped import state into
+  `ImportContext`, deduplicated `countNewEntries`, clarified update summary
+  counters (`updatedFiles`, `updatedDirs`, `removedEntries`), and batched entry
+  writes via `upsertEntriesBatch`.
+
 ## 0.12.0
 
 - Consolidated database transaction management via `withTransaction` in

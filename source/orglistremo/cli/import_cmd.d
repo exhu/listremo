@@ -1,18 +1,20 @@
-module orglistremo.importer;
+module orglistremo.cli.import_cmd;
 
 import core.time : Duration, MonoTime;
 import d2sqlite3 : Database;
-import orglistremo.app : DbContext, printReadOnlyError;
-import orglistremo.db.backup : promptBackupPath, writeDatabaseBackup;
+import orglistremo.cli.args : ArgCursor;
+import orglistremo.cli.context :
+   backupIfRequested, BackupRequest, DbContext, requireWritable;
+import orglistremo.cli.roots : resolveRoots, RootLookupOptions;
 import orglistremo.db.connection : readDbSchemaVersion;
 import orglistremo.db.repo : EntryRepository, RootRepository;
 import orglistremo.db.transaction : withTransaction;
-import orglistremo.model :
-  Entry, OutputFormat, Root;
-import orglistremo.pattern : hasPatternWildcard;
-import orglistremo.output.console : OutputOptions;
+import orglistremo.model : Entry, Root;
+import orglistremo.output.options : OutputFormat, OutputOptions;
 import orglistremo.output.units : formatDuration;
 import std.stdio : File, stderr, stdout, writefln, writeln;
+
+package(orglistremo):
 
 struct ImportArgs {
   string sourceDbPath;
@@ -28,22 +30,25 @@ struct ImportSummary {
   string[] skippedNoUpdateRoots;
   ulong addedFiles;
   ulong addedDirs;
+  ulong updatedFiles;
+  ulong updatedDirs;
+  ulong removedEntries;
 }
 
 bool parseImportArgs(string[] args, out ImportArgs parsed) {
-  for (size_t i = 1; i < args.length; i++) {
-    const arg = args[i];
-    if (arg == "--no-backup") {
+  ArgCursor cur = ArgCursor(args);
+  while (!cur.empty()) {
+    if (cur.matchFlag("--no-backup")) {
       parsed.noBackup = true;
-    } else if (arg == "--no-update") {
+    } else if (cur.matchFlag("--no-update")) {
       parsed.noUpdate = true;
-    } else if (arg.length > 0 && arg[0] == '-') {
-      stderr.writefln("Unknown flag '%s' for import.", arg);
+    } else if (cur.isOption()) {
+      stderr.writefln("Unknown flag '%s' for import.", cur.front());
       return false;
     } else if (parsed.sourceDbPath.length == 0) {
-      parsed.sourceDbPath = arg;
+      parsed.sourceDbPath = cur.take();
     } else {
-      parsed.rootPatterns ~= arg;
+      parsed.rootPatterns ~= cur.take();
     }
   }
 
@@ -59,85 +64,59 @@ bool parseImportArgs(string[] args, out ImportArgs parsed) {
 
 bool resolveImportSourceRoots(
   ref Database sourceDb,
-  string sourceDbLabel,
-  in string[] rootPatterns,
+  in ImportArgs importArgs,
   out Root[] matchedRoots
 ) {
   RootRepository srcRootRepo = RootRepository(sourceDb);
-  if (rootPatterns.length == 0) {
-    matchedRoots = srcRootRepo.findByPattern("%");
-    return true;
-  }
+  const RootLookupOptions lookupOpts = RootLookupOptions(
+    false, importArgs.sourceDbPath
+  );
+  return resolveRoots(
+    srcRootRepo, importArgs.rootPatterns, matchedRoots, lookupOpts
+  );
+}
 
-  bool[long] seenIds;
-  foreach (pattern; rootPatterns) {
-    const found = srcRootRepo.findByPattern(pattern);
-    if (found.length == 0) {
-      if (hasPatternWildcard(pattern)) {
-        stderr.writefln(
-          "Error: No roots match pattern '%s' in '%s'.",
-          pattern,
-          sourceDbLabel
-        );
-      } else {
-        stderr.writefln(
-          "Error: Root '%s' not found in '%s'.",
-          pattern,
-          sourceDbLabel
-        );
-      }
-      return false;
-    }
-    foreach (ref r; found) {
-      if (r.id !in seenIds) {
-        seenIds[r.id] = true;
-        matchedRoots ~= r;
-      }
-    }
-  }
-  return true;
+struct ImportExecConfig {
+  Root[] sourceRoots;
+  bool noUpdate = false;
 }
 
 ImportSummary executeImportRoots(
   ref Database targetDb,
   ref Database sourceDb,
-  in Root[] sourceRoots,
-  bool noUpdate = false
+  in ImportExecConfig cfg
 ) {
   ImportSummary summary;
-  if (sourceRoots.length == 0) {
+  if (cfg.sourceRoots.length == 0) {
     return summary;
   }
 
   withTransaction(targetDb, {
-    RootRepository dstRootRepo = RootRepository(targetDb);
-    EntryRepository dstEntryRepo = EntryRepository(targetDb);
-    EntryRepository srcEntryRepo = EntryRepository(sourceDb);
+    ImportContext ctx = ImportContext(
+      RootRepository(targetDb),
+      EntryRepository(targetDb),
+      EntryRepository(sourceDb),
+      cfg.noUpdate
+    );
 
     Root[] newRoots;
     ExistingRootPair[] existingPairs;
 
-    foreach (ref srcRoot; sourceRoots) {
+    foreach (ref const srcRoot; cfg.sourceRoots) {
       Root dstRoot;
-      if (dstRootRepo.findByName(srcRoot.name, dstRoot)) {
+      if (ctx.dstRootRepo.findByName(srcRoot.name, dstRoot)) {
         existingPairs ~= ExistingRootPair(srcRoot, dstRoot);
       } else {
         newRoots ~= srcRoot;
       }
     }
 
-    // 1. Import new roots and their entries
-    foreach (ref srcRoot; newRoots) {
-      importNewRoot(
-        dstRootRepo, dstEntryRepo, srcEntryRepo, srcRoot, summary
-      );
+    foreach (ref const srcRoot; newRoots) {
+      importNewRoot(ctx, srcRoot, summary);
     }
 
-    // 2. Update existing roots if allowed and more recent
-    foreach (ref pair; existingPairs) {
-      processExistingRoot(
-        dstRootRepo, dstEntryRepo, srcEntryRepo, pair, noUpdate, summary
-      );
+    foreach (ref const pair; existingPairs) {
+      processExistingRoot(ctx, pair, summary);
     }
   });
   return summary;
@@ -146,13 +125,8 @@ ImportSummary executeImportRoots(
 void printImportSummary(
   in ImportSummary summary,
   Duration elapsed,
-  in OutputOptions opts,
   File outStream = stdout
 ) {
-  if (opts.format != OutputFormat.console) {
-    return;
-  }
-
   outStream.writeln("Import summary:");
   outStream.writefln(
     "  New roots imported (%d): %s",
@@ -179,6 +153,14 @@ void printImportSummary(
     summary.addedFiles,
     summary.addedDirs
   );
+  if (summary.updatedRoots.length > 0) {
+    outStream.writefln(
+      "  Updated entries: %d files, %d dirs (%d removed)",
+      summary.updatedFiles,
+      summary.updatedDirs,
+      summary.removedEntries
+    );
+  }
   outStream.writefln("  Total time: %s", formatDuration(elapsed));
 }
 
@@ -187,8 +169,7 @@ int handleImportCommand(
   string[] args,
   in OutputOptions opts
 ) {
-  if (ctx.isReadOnly) {
-    printReadOnlyError(ctx.dbSchemaVersion);
+  if (!requireWritable(ctx)) {
     return 1;
   }
 
@@ -202,12 +183,7 @@ int handleImportCommand(
   }
 
   Database sourceDb;
-  if (!openSourceDatabase(
-    importArgs.sourceDbPath,
-    ctx.dbSchemaVersion,
-    ctx.busyTimeoutMs,
-    sourceDb
-  )) {
+  if (!openSourceDatabase(ctx, importArgs.sourceDbPath, sourceDb)) {
     return 1;
   }
   scope (exit) {
@@ -215,54 +191,59 @@ int handleImportCommand(
   }
 
   Root[] matchedRoots;
-  if (!resolveImportSourceRoots(
-    sourceDb,
-    importArgs.sourceDbPath,
-    importArgs.rootPatterns,
-    matchedRoots
-  )) {
+  if (!resolveImportSourceRoots(sourceDb, importArgs, matchedRoots)) {
     return 1;
   }
 
-  if (!importArgs.noBackup && ctx.dbPath != ":memory:") {
-    string backupPath;
-    if (!promptBackupPath(ctx.dbPath, backupPath, "Import")) {
-      return 1;
-    }
-    try {
-      writeDatabaseBackup(ctx.db, backupPath);
-      if (opts.format == OutputFormat.console) {
-        writefln("Saved database backup to '%s'.", backupPath);
-      }
-    } catch (Exception e) {
-      stderr.writefln(
-        "Error: Failed to write backup file '%s': %s",
-        backupPath,
-        e.msg
-      );
-      return 1;
-    }
+  const BackupRequest bkpReq = BackupRequest(
+    ctx.dbPath, importArgs.noBackup, opts, "Import"
+  );
+  if (!backupIfRequested(ctx, bkpReq)) {
+    return 1;
   }
 
+  const ImportExecConfig execCfg = ImportExecConfig(
+    matchedRoots, importArgs.noUpdate
+  );
+  return runImportExecution(ctx, sourceDb, execCfg, opts);
+}
+
+private:
+
+enum size_t importBatchSize = 1000;
+
+struct ImportContext {
+  RootRepository dstRootRepo;
+  EntryRepository dstEntryRepo;
+  EntryRepository srcEntryRepo;
+  bool noUpdate;
+}
+
+struct ExistingRootPair {
+  Root srcRoot;
+  Root dstRoot;
+}
+
+int runImportExecution(
+  ref DbContext ctx,
+  ref Database sourceDb,
+  in ImportExecConfig execCfg,
+  in OutputOptions opts
+) {
   try {
-    const startMono = MonoTime.currTime;
-    const summary = executeImportRoots(
-      ctx.db, sourceDb, matchedRoots, importArgs.noUpdate
+    const MonoTime startMono = MonoTime.currTime;
+    const ImportSummary summary = executeImportRoots(
+      ctx.db, sourceDb, execCfg
     );
-    const elapsed = MonoTime.currTime - startMono;
-    printImportSummary(summary, elapsed, opts);
+    const Duration elapsed = MonoTime.currTime - startMono;
+    if (opts.format == OutputFormat.console) {
+      printImportSummary(summary, elapsed);
+    }
     return 0;
   } catch (Exception e) {
     stderr.writefln("Error importing database: %s", e.msg);
     return 1;
   }
-}
-
-private:
-
-struct ExistingRootPair {
-  Root srcRoot;
-  Root dstRoot;
 }
 
 string formatRootList(in string[] names) {
@@ -295,16 +276,15 @@ bool validateSourceDbPath(string targetDbPath, string sourceDbPath) {
 }
 
 bool openSourceDatabase(
+  in DbContext ctx,
   string sourceDbPath,
-  int targetSchemaVer,
-  uint busyTimeoutMs,
   out Database sourceDb
 ) {
   import std.format : format;
 
   try {
     sourceDb = Database(sourceDbPath);
-    sourceDb.execute(format("PRAGMA busy_timeout = %d;", busyTimeoutMs));
+    sourceDb.execute(format("PRAGMA busy_timeout = %d;", ctx.busyTimeoutMs));
     sourceDb.execute("PRAGMA query_only = ON;");
   } catch (Exception e) {
     stderr.writefln(
@@ -324,33 +304,51 @@ bool openSourceDatabase(
     return false;
   }
 
-  if (srcSchemaVer != targetSchemaVer) {
+  if (srcSchemaVer != ctx.dbSchemaVersion) {
     sourceDb.close();
     stderr.writefln(
       "Error: Cannot import '%s': schema version (%d) does not match " ~
       "current database schema version (%d).",
       sourceDbPath,
       srcSchemaVer,
-      targetSchemaVer
+      ctx.dbSchemaVersion
     );
     return false;
   }
   return true;
 }
 
-void importNewRoot(
-  ref RootRepository dstRootRepo,
+void copyRootEntriesBatched(
   ref EntryRepository dstEntryRepo,
-  ref EntryRepository srcEntryRepo,
-  in Root srcRoot,
+  long dstRootId,
+  in Entry[] srcEntries
+) {
+  dstEntryRepo.clearRootEntries(dstRootId);
+  for (size_t i = 0; i < srcEntries.length; i += importBatchSize) {
+    const size_t end = (i + importBatchSize < srcEntries.length)
+      ? (i + importBatchSize)
+      : srcEntries.length;
+    dstEntryRepo.upsertEntriesBatch(dstRootId, srcEntries[i .. end]);
+  }
+}
+
+void countNewEntries(
+  in Entry[] entries,
+  in bool[string] existingPaths,
   ref ImportSummary summary
 ) {
-  const newRootId = dstRootRepo.insertImportedRoot(srcRoot);
-  const srcEntries = srcEntryRepo.listEntriesByRootId(srcRoot.id);
-  dstEntryRepo.replaceRootEntries(newRootId, srcEntries);
-
-  foreach (ref e; srcEntries) {
+  size_t seenExisting = 0;
+  foreach (ref const e; entries) {
     if (e.relPath == ".") {
+      continue;
+    }
+    if (e.relPath in existingPaths) {
+      seenExisting++;
+      if (e.isDir) {
+        summary.updatedDirs++;
+      } else {
+        summary.updatedFiles++;
+      }
       continue;
     }
     if (e.isDir) {
@@ -359,23 +357,36 @@ void importNewRoot(
       summary.addedFiles++;
     }
   }
+  if (existingPaths.length > seenExisting) {
+    summary.removedEntries += (existingPaths.length - seenExisting);
+  }
+}
+
+void importNewRoot(
+  ref ImportContext ctx,
+  in Root srcRoot,
+  ref ImportSummary summary
+) {
+  const long newRootId = ctx.dstRootRepo.insertImportedRoot(srcRoot);
+  const Entry[] srcEntries = ctx.srcEntryRepo.listEntriesByRootId(srcRoot.id);
+  copyRootEntriesBatched(ctx.dstEntryRepo, newRootId, srcEntries);
+
+  bool[string] emptyExisting;
+  countNewEntries(srcEntries, emptyExisting, summary);
   summary.importedRoots ~= srcRoot.name;
 }
 
 void processExistingRoot(
-  ref RootRepository dstRootRepo,
-  ref EntryRepository dstEntryRepo,
-  ref EntryRepository srcEntryRepo,
+  ref ImportContext ctx,
   in ExistingRootPair pair,
-  bool noUpdate,
   ref ImportSummary summary
 ) {
-  if (noUpdate) {
+  if (ctx.noUpdate) {
     summary.skippedNoUpdateRoots ~= pair.srcRoot.name;
     return;
   }
 
-  const isMoreRecent = pair.srcRoot.hasLastSync && (
+  const bool isMoreRecent = pair.srcRoot.hasLastSync && (
     !pair.dstRoot.hasLastSync ||
     pair.srcRoot.lastSync > pair.dstRoot.lastSync
   );
@@ -384,29 +395,20 @@ void processExistingRoot(
     return;
   }
 
-  const existingPaths = dstEntryRepo.getEntryPathsSet(pair.dstRoot.id);
-  const srcEntries = srcEntryRepo.listEntriesByRootId(pair.srcRoot.id);
+  const existingPaths = ctx.dstEntryRepo.getEntryPathsSet(pair.dstRoot.id);
+  const Entry[] srcEntries = ctx.srcEntryRepo.listEntriesByRootId(
+    pair.srcRoot.id
+  );
 
-  foreach (ref e; srcEntries) {
-    if (e.relPath == "." || (e.relPath in existingPaths)) {
-      continue;
-    }
-    if (e.isDir) {
-      summary.addedDirs++;
-    } else {
-      summary.addedFiles++;
-    }
-  }
-
-  dstRootRepo.updateImportedRoot(pair.dstRoot.id, pair.srcRoot);
-  dstEntryRepo.replaceRootEntries(pair.dstRoot.id, srcEntries);
+  countNewEntries(srcEntries, existingPaths, summary);
+  ctx.dstRootRepo.updateImportedRoot(pair.dstRoot.id, pair.srcRoot);
+  copyRootEntriesBatched(ctx.dstEntryRepo, pair.dstRoot.id, srcEntries);
   summary.updatedRoots ~= pair.srcRoot.name;
 }
 
 unittest {
   import core.time : dur;
   import orglistremo.db.connection : openDatabase;
-  import orglistremo.db.schema_version : schemaVersion;
 
   // Test parseImportArgs
   ImportArgs args1;
@@ -444,9 +446,6 @@ unittest {
   RootRepository srcRoots = RootRepository(srcDb);
   EntryRepository srcEntries = EntryRepository(srcDb);
 
-  // Setup destination DB:
-  // - root_keep: synced at 5000 (newer than source)
-  // - root_update: synced at 2000 (older than source)
   const dstKeepId = dstRoots.addRoot("root_keep", "/dst/keep");
   dstEntries.saveSyncEntries(
     dstKeepId,
@@ -476,10 +475,6 @@ unittest {
     true
   );
 
-  // Setup source DB:
-  // - root_keep: synced at 3000 (older than dst 5000 -> skipped)
-  // - root_update: synced at 6000 (newer than dst 2000 -> updated)
-  // - root_new: synced at 4000 (not in dst -> imported)
   const srcKeepId = srcRoots.addRoot("root_keep", "/src/keep");
   srcEntries.saveSyncEntries(
     srcKeepId,
@@ -538,37 +533,41 @@ unittest {
   );
 
   Root[] matched;
-  assert(resolveImportSourceRoots(srcDb, ":memory:", [], matched));
+  ImportArgs resolveArgs;
+  resolveArgs.sourceDbPath = ":memory:";
+  assert(resolveImportSourceRoots(srcDb, resolveArgs, matched));
   assert(matched.length == 3);
 
-  // 1. Test with noUpdate = true first on a separate target DB
   {
     Database dstNoUpd = openDatabase(":memory:");
     RootRepository rRepo = RootRepository(dstNoUpd);
     const id1 = rRepo.addRoot("root_update", "/dst/old");
     rRepo.updateLastSync(id1, 1000);
 
-    const sumNoUpd = executeImportRoots(dstNoUpd, srcDb, matched, true);
+    const sumNoUpd = executeImportRoots(
+      dstNoUpd, srcDb, ImportExecConfig(matched, true)
+    );
     assert(sumNoUpd.importedRoots == ["root_keep", "root_new"]);
     assert(sumNoUpd.updatedRoots.length == 0);
     assert(sumNoUpd.skippedOlderSyncRoots.length == 0);
     assert(sumNoUpd.skippedNoUpdateRoots == ["root_update"]);
-    // root_keep (1 file, 0 dirs) + root_new (2 files, 1 dir) = 3 files, 1 dir
     assert(sumNoUpd.addedFiles == 3);
     assert(sumNoUpd.addedDirs == 1);
   }
 
-  // 2. Test full import with updates enabled on dstDb
-  const summary = executeImportRoots(dstDb, srcDb, matched, false);
+  const summary = executeImportRoots(
+    dstDb, srcDb, ImportExecConfig(matched, false)
+  );
   assert(summary.importedRoots == ["root_new"]);
   assert(summary.updatedRoots == ["root_update"]);
   assert(summary.skippedOlderSyncRoots == ["root_keep"]);
   assert(summary.skippedNoUpdateRoots.length == 0);
-  // root_new added 2 files + 1 dir; root_update added 1 new file + 1 new dir
   assert(summary.addedFiles == 3);
   assert(summary.addedDirs == 2);
+  assert(summary.updatedFiles == 1);
+  assert(summary.updatedDirs == 0);
+  assert(summary.removedEntries == 0);
 
-  // Verify root_new in dstDb has a new ID and all entries mapped properly
   Root dstNew;
   assert(dstRoots.findByName("root_new", dstNew));
   assert(dstNew.path == "/src/new_root");
@@ -577,7 +576,6 @@ unittest {
   const newEntriesList = dstEntries.listEntriesByRootId(dstNew.id);
   assert(newEntriesList.length == 4);
 
-  // Verify root_update was updated in dstDb
   Root dstUpdAfter;
   assert(dstRoots.findByName("root_update", dstUpdAfter));
   assert(dstUpdAfter.id == dstUpdId);
@@ -587,20 +585,16 @@ unittest {
   const updEntriesList = dstEntries.listEntriesByRootId(dstUpdId);
   assert(updEntriesList.length == 4);
 
-  // Verify root_keep was untouched
   Root dstKeepAfter;
   assert(dstRoots.findByName("root_keep", dstKeepAfter));
   assert(dstKeepAfter.path == "/dst/keep");
   assert(dstKeepAfter.lastSync == 5000);
   assert(dstEntries.listEntriesByRootId(dstKeepId).length == 2);
 
-  // Test printImportSummary output
   import orglistremo.internal.testutil : captureOutput;
 
-  OutputOptions outOpts;
-  outOpts.format = OutputFormat.console;
   const summaryText = captureOutput((File f) {
-    printImportSummary(summary, dur!"msecs"(120), outOpts, f);
+    printImportSummary(summary, dur!"msecs"(120), f);
   });
   import std.algorithm.searching : canFind;
   assert(canFind(summaryText, "New roots imported (1): root_new"));
@@ -613,12 +607,12 @@ unittest {
   );
   assert(canFind(summaryText, "Roots skipped (--no-update) (0): none"));
   assert(canFind(summaryText, "New entries added: 3 files, 2 dirs"));
+  assert(canFind(summaryText, "Updated entries: 1 files, 0 dirs (0 removed)"));
   assert(canFind(summaryText, "Total time: 120 ms"));
 }
 
 unittest {
   import orglistremo.db.connection : openDatabaseChecked;
-  import orglistremo.db.schema_version : schemaVersion;
   import orglistremo.internal.testutil : createLegacyV0Db, TempDir;
 
   TempDir testDir = TempDir("importer");
@@ -626,10 +620,8 @@ unittest {
   const srcPath = testDir.subPath("src.db");
   const oldVerPath = testDir.subPath("old_ver.db");
 
-  // Create old schema v0 database
   createLegacyV0Db(oldVerPath);
 
-  // Create source database (current schema version)
   {
     auto srcOpen = openDatabaseChecked(srcPath);
     scope (exit) {
@@ -679,28 +671,23 @@ unittest {
   OutputOptions opts;
   opts.styler.enabled = false;
 
-  // 1. Read-only target DB is rejected
   DbContext roCtx = DbContext(dstOpen.db, dstPath, 0, true);
   assert(handleImportCommand(roCtx, ["import", srcPath], opts) == 1);
 
-  // 2. Nonexistent source DB is rejected
   assert(
     handleImportCommand(
       ctx, ["import", testDir.subPath("missing.db"), "--no-backup"], opts
     ) == 1
   );
 
-  // 3. Importing from same DB path as target is rejected
   assert(
     handleImportCommand(ctx, ["import", dstPath, "--no-backup"], opts) == 1
   );
 
-  // 4. Mismatched schema version source DB is rejected
   assert(
     handleImportCommand(ctx, ["import", oldVerPath, "--no-backup"], opts) == 1
   );
 
-  // 5. Unmatched root pattern in source DB is rejected
   assert(
     handleImportCommand(
       ctx, ["import", srcPath, "nonexistent%", "--no-backup"], opts
@@ -712,7 +699,6 @@ unittest {
     ) == 1
   );
 
-  // 6. Selective import with pattern "alpha%" imports alpha_1 and alpha_2 only
   assert(
     handleImportCommand(
       ctx, ["import", srcPath, "alpha%", "--no-backup"], opts
@@ -724,8 +710,6 @@ unittest {
   assert(dstRoots.findByName("alpha_2", rCheck));
   assert(!dstRoots.findByName("beta", rCheck));
 
-  // 7. Re-running import of all roots with --no-update imports beta and skips
-  //    alpha_1 and alpha_2
   assert(
     handleImportCommand(
       ctx, ["import", srcPath, "--no-backup", "--no-update"], opts

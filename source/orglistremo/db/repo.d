@@ -364,6 +364,12 @@ struct EntryRepository {
     }
   }
 
+  void clearRootEntries(long rootId) {
+    Statement delStmt = db.prepare("DELETE FROM entries WHERE root_id = ?;");
+    delStmt.bind(1, rootId);
+    delStmt.execute();
+  }
+
   void upsertEntriesBatch(long rootId, in Entry[] batch) {
     if (batch.length == 0) {
       return;

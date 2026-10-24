@@ -11,11 +11,12 @@ import orglistremo.model :
   EntryType, groupDuplicates, makeEntry, Root, RootSummary,
   summarizeDuplicates;
 import orglistremo.output.console :
-  OutputOptions, printConsoleDuplicates, printConsoleEntries;
+  printConsoleDuplicates, printConsoleEntries;
 import orglistremo.output.csv :
   printCsvDuplicates, printCsvEntries;
 import orglistremo.output.html :
   printHtmlDuplicates, printHtmlEntries;
+import orglistremo.output.options : OutputOptions;
 import orglistremo.output.units :
   formatHash;
 import orglistremo.pattern :

@@ -16,18 +16,6 @@ enum SortField {
   mtime
 }
 
-enum OutputFormat {
-  console,
-  csv,
-  html
-}
-
-enum ColorMode {
-  autoMode,
-  always,
-  never
-}
-
 struct Root {
   long id;
   string name;

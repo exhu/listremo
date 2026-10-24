@@ -2,7 +2,6 @@ module orglistremo.db.backup;
 
 import d2sqlite3 : Database;
 import orglistremo.config : ensureDbDirectory;
-import std.stdio : stderr, stdout, writefln;
 
 package(orglistremo):
 
@@ -21,44 +20,6 @@ string proposeBackupPath(string dbPath) {
       return candidate;
     }
     idx++;
-  }
-}
-
-bool promptBackupPath(
-  string dbPath,
-  out string chosenPath,
-  string actionName = "Migration"
-) {
-  import std.file : exists;
-  import std.stdio : readln, writef;
-  import std.string : strip;
-
-  while (true) {
-    const proposed = proposeBackupPath(dbPath);
-    writef(
-      "Backup file path [%s] (Enter to accept, Ctrl-C to abort): ",
-      proposed
-    );
-    stdout.flush();
-
-    const line = readln();
-    if (line is null) {
-      stderr.writefln("\n%s aborted.", actionName);
-      return false;
-    }
-
-    const trimmed = line.strip();
-    const candidate = trimmed.length > 0 ? trimmed : proposed;
-    if (exists(candidate)) {
-      stderr.writefln(
-        "File '%s' already exists and will not be overwritten.",
-        candidate
-      );
-      continue;
-    }
-
-    chosenPath = candidate;
-    return true;
   }
 }
 

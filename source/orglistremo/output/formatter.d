@@ -1,13 +1,14 @@
 module orglistremo.output.formatter;
 
-import orglistremo.model : DuplicateGroup, Entry, OutputFormat, RootSummary;
+import orglistremo.model : DuplicateGroup, Entry, RootSummary;
 import orglistremo.output.console :
-  OutputOptions, printConsoleDuplicates, printConsoleEntries,
-  printConsoleRoots, printConsoleUnique;
+  printConsoleDuplicates, printConsoleEntries, printConsoleRoots,
+  printConsoleUnique;
 import orglistremo.output.csv :
   printCsvDuplicates, printCsvEntries, printCsvRoots, printCsvUnique;
 import orglistremo.output.html :
   printHtmlDuplicates, printHtmlEntries, printHtmlRoots, printHtmlUnique;
+import orglistremo.output.options : OutputFormat, OutputOptions;
 import std.stdio : stdout;
 
 void outputRoots(

@@ -6,12 +6,13 @@ import d2sqlite3 : Database;
 import orglistremo.db.connection : openDatabase;
 import orglistremo.db.repo : EntryRepository, RootRepository;
 import orglistremo.model : Entry, Root, RootSummary, SortField;
-import orglistremo.output.console : ConsoleProgressReporter, OutputOptions;
+import orglistremo.output.console : ConsoleProgressReporter;
 import orglistremo.output.html :
   escapeHtml, printHtmlEntries, printHtmlRoots;
+import orglistremo.output.options : OutputOptions;
 import orglistremo.output.units : formatLastSync, formatUnixTime;
-import orglistremo.sync.scanner :
-  isDiskDirEmpty, SyncPhase, SyncProgress;
+import orglistremo.sync.progress : SyncPhase, SyncProgress;
+import orglistremo.sync.scanner : isDiskDirEmpty;
 import std.algorithm.searching : canFind;
 import std.exception : assertThrown;
 import std.file : exists, mkdirRecurse, remove, rmdirRecurse, symlink, write;

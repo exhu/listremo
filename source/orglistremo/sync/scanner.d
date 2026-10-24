@@ -5,37 +5,13 @@ import orglistremo.db.repo : CachedFileEntry, EntryRepository;
 import orglistremo.internal.os : getDeviceFreeSpace;
 import orglistremo.model : Entry, Root;
 import orglistremo.sync.hasher : ChildRecord, hashDirectory, hashFile;
+import orglistremo.sync.progress :
+  SyncIssue, SyncIssueCallback, SyncPhase, SyncProgress, SyncProgressCallback;
 import std.datetime.systime : Clock;
 import std.file :
   dirEntries, DirEntry, exists, isDir, isFile, isSymlink, SpanMode,
   timeLastModified;
 import std.path : baseName, buildPath;
-
-enum SyncPhase {
-  scanning,
-  hashing,
-  saving
-}
-
-struct SyncIssue {
-  string path;
-  string message;
-  bool isDir;
-}
-
-alias SyncIssueCallback = void delegate(const ref SyncIssue issue);
-
-struct SyncProgress {
-  SyncPhase phase;
-  string currentPath;
-  ulong fileCount;
-  ulong dirCount;
-  ulong totalBytes;
-  ulong fileBytesHashed;
-  ulong fileBytesTotal;
-}
-
-alias SyncProgressCallback = void delegate(const ref SyncProgress progress);
 
 struct SyncResult {
   ulong fileCount;

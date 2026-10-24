@@ -1,7 +1,7 @@
 module orglistremo.output.html;
 
 import orglistremo.model : DuplicateGroup, Entry, RootSummary;
-import orglistremo.output.console : OutputOptions;
+import orglistremo.output.options : OutputOptions;
 import orglistremo.output.units :
   formatDuration, formatHash, formatIso8601, formatLastSync, formatSizeHuman,
   formatUnixTime;

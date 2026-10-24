@@ -4,55 +4,15 @@ import core.time : dur, Duration, MonoTime;
 import orglistremo.internal.os :
   getTerminalWidth, isStdoutTty, isTty;
 import orglistremo.model :
-  ColorMode, DuplicateGroup, Entry, OutputFormat, RootSummary;
+  DuplicateGroup, Entry, RootSummary;
+import orglistremo.output.options :
+  ColorMode, OutputFormat, OutputOptions, Styler;
 import orglistremo.output.units :
   formatDuration, formatHash, formatLastSync, formatSizeHuman, formatUnixTime;
-import orglistremo.sync.scanner :
+import orglistremo.sync.progress :
   SyncPhase, SyncProgress, SyncProgressCallback;
 import std.format : format;
 import std.stdio : File, stdout;
-
-struct Styler {
-  bool enabled;
-
-  string wrap(string text, string code) const {
-    return enabled ? "\033[" ~ code ~ "m" ~ text ~ "\033[0m" : text;
-  }
-
-  string bold(string s) const {
-    return wrap(s, "1");
-  }
-
-  string header(string s) const {
-    return wrap(s, "1;36");
-  }
-
-  string root(string s) const {
-    return wrap(s, "1;35");
-  }
-
-  string dir(string s) const {
-    return wrap(s, "1;34");
-  }
-
-  string size(string s) const {
-    return wrap(s, "33");
-  }
-
-  string hash(string s) const {
-    return wrap(s, "2;37");
-  }
-
-  string date(string s) const {
-    return wrap(s, "32");
-  }
-}
-
-struct OutputOptions {
-  OutputFormat format = OutputFormat.console;
-  Styler styler;
-  bool fullHash = false;
-}
 
 final class ConsoleProgressReporter {
 public:
