@@ -1,7 +1,9 @@
 module orglistremo.app;
 
 import d2sqlite3 : Database;
-import orglistremo.config : ensureDbDirectory, resolveDbPath;
+import orglistremo.config : resolveDbPath;
+import orglistremo.db.backup :
+  promptBackupPath, proposeBackupPath, writeDatabaseBackup;
 import orglistremo.db.connection :
   DbOpenResult, migrateDatabase, openDatabase, openDatabaseChecked;
 import orglistremo.db.repo :
@@ -9,6 +11,7 @@ import orglistremo.db.repo :
 import orglistremo.db.repo_locks :
   isPidAlive, SyncLockInfo, SyncLockRepository;
 import orglistremo.db.schema_version : schemaVersion;
+import orglistremo.importer : handleImportCommand;
 import orglistremo.model :
   ColorMode, Entry, EntryType, hasGlobWildcard, hasPatternWildcard,
   OutputFormat, Root, RootSummary, SortField, TargetSpec;
@@ -75,7 +78,7 @@ version (unittest) {
   }
 }
 
-private:
+package(orglistremo):
 
 struct DbContext {
   Database db;
@@ -84,6 +87,18 @@ struct DbContext {
   bool isReadOnly;
   uint busyTimeoutMs = 60_000;
 }
+
+void printReadOnlyError(int dbSchemaVer) {
+  stderr.writefln(
+    "Error: Command is not available in read-only mode " ~
+    "(database schema version %d, application schema version %d). " ~
+    "Run 'listremo migrate' first.",
+    dbSchemaVer,
+    schemaVersion
+  );
+}
+
+private:
 
 struct CliGlobalOptions {
   string cliDb;
@@ -137,16 +152,6 @@ void printSchemaMismatchWarning(int dbSchemaVer) {
   stderr.writeln(
     "Working in read-only mode. " ~
     "Run 'listremo migrate' to update the database."
-  );
-}
-
-void printReadOnlyError(int dbSchemaVer) {
-  stderr.writefln(
-    "Error: Command is not available in read-only mode " ~
-    "(database schema version %d, application schema version %d). " ~
-    "Run 'listremo migrate' first.",
-    dbSchemaVer,
-    schemaVersion
   );
 }
 
@@ -234,6 +239,7 @@ void printUsage() {
   writeln("  list [<target>...] [opts]    List files & dirs (alias: files)");
   writeln("  duplicates [<target>...]     Find duplicate files/dirs");
   writeln("  unique [<target>...]         Find unique files/dirs");
+  writeln("  import <db> [<pattern>...]   Import roots from another database");
   writeln("  migrate [--no-backup]        Migrate database schema\n");
   writeln("List Options & Target Syntax:");
   writeln(
@@ -294,6 +300,11 @@ void printUsage() {
     "  --progress-interval <ms>     Progress refresh interval " ~
     "(ms, def: 1000)\n"
   );
+  writeln("Import Options:");
+  writeln("  --no-backup                  Skip saving a database backup");
+  writeln(
+    "  --no-update                  Only import new roots; skip updates\n"
+  );
   writeln("Migrate Options:");
   writeln("  --no-backup                  Skip saving a database backup\n");
   writeln("Global Options:");
@@ -319,6 +330,8 @@ int dispatchCommand(
       return handleRootCommand(ctx, subArgs, opts);
     case "sync":
       return handleSyncCommand(ctx, subArgs, opts);
+    case "import":
+      return handleImportCommand(ctx, subArgs, opts);
     case "migrate":
       return handleMigrateCommand(ctx, subArgs, opts);
     case "list":
@@ -799,82 +812,6 @@ bool parseMigrateArgs(string[] args, out MigrateArgs parsed) {
     }
   }
   return true;
-}
-
-string proposeBackupPath(string dbPath) {
-  import std.algorithm.searching : endsWith;
-  import std.file : exists;
-  import std.format : format;
-
-  const prefix = dbPath.endsWith(".db")
-    ? dbPath[0 .. $ - 3]
-    : dbPath;
-  ulong idx = 1;
-  while (true) {
-    const candidate = format("%s-backup-%d.db", prefix, idx);
-    if (!exists(candidate)) {
-      return candidate;
-    }
-    idx++;
-  }
-}
-
-bool promptBackupPath(string dbPath, out string chosenPath) {
-  import std.file : exists;
-  import std.stdio : readln, stdout, writef;
-  import std.string : strip;
-
-  while (true) {
-    const proposed = proposeBackupPath(dbPath);
-    writef(
-      "Backup file path [%s] (Enter to accept, Ctrl-C to abort): ",
-      proposed
-    );
-    stdout.flush();
-
-    const line = readln();
-    if (line is null) {
-      stderr.writeln("\nMigration aborted.");
-      return false;
-    }
-
-    const trimmed = line.strip();
-    const candidate = trimmed.length > 0 ? trimmed : proposed;
-    if (exists(candidate)) {
-      stderr.writefln(
-        "File '%s' already exists and will not be overwritten.",
-        candidate
-      );
-      continue;
-    }
-
-    chosenPath = candidate;
-    return true;
-  }
-}
-
-bool writeDatabaseBackup(
-  string dbPath,
-  string backupPath,
-  in OutputOptions opts
-) {
-  import std.file : copy;
-
-  try {
-    ensureDbDirectory(backupPath);
-    copy(dbPath, backupPath);
-    if (opts.format == OutputFormat.console) {
-      writefln("Saved database backup to '%s'.", backupPath);
-    }
-    return true;
-  } catch (Exception e) {
-    stderr.writefln(
-      "Error: Failed to write backup file '%s': %s",
-      backupPath,
-      e.msg
-    );
-    return false;
-  }
 }
 
 int handleMigrateCommand(

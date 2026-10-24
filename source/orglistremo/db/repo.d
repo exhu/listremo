@@ -52,6 +52,54 @@ struct RootRepository {
     return db.lastInsertRowid;
   }
 
+  long insertImportedRoot(in Root srcRoot) {
+    assert(srcRoot.name.length > 0, "Root name cannot be empty");
+    assert(srcRoot.path.length > 0, "Root path cannot be empty");
+
+    auto stmt = db.prepare(`
+      INSERT INTO roots (name, path, created_at, last_sync, free_space)
+      VALUES (?, ?, ?, ?, ?);
+    `);
+    stmt.bind(1, srcRoot.name);
+    stmt.bind(2, srcRoot.path);
+    stmt.bind(3, srcRoot.createdAt);
+    if (srcRoot.hasLastSync) {
+      stmt.bind(4, srcRoot.lastSync);
+    } else {
+      stmt.bind(4, null);
+    }
+    if (srcRoot.hasFreeSpace) {
+      stmt.bind(5, srcRoot.freeSpace);
+    } else {
+      stmt.bind(5, null);
+    }
+    stmt.execute();
+    return db.lastInsertRowid;
+  }
+
+  void updateImportedRoot(long targetRootId, in Root srcRoot) {
+    assert(srcRoot.path.length > 0, "Root path cannot be empty");
+
+    auto stmt = db.prepare(`
+      UPDATE roots
+      SET path = ?, last_sync = ?, free_space = ?
+      WHERE id = ?;
+    `);
+    stmt.bind(1, srcRoot.path);
+    if (srcRoot.hasLastSync) {
+      stmt.bind(2, srcRoot.lastSync);
+    } else {
+      stmt.bind(2, null);
+    }
+    if (srcRoot.hasFreeSpace) {
+      stmt.bind(3, srcRoot.freeSpace);
+    } else {
+      stmt.bind(3, null);
+    }
+    stmt.bind(4, targetRootId);
+    stmt.execute();
+  }
+
   bool removeRoot(string name) {
     auto stmt = db.prepare("DELETE FROM roots WHERE name = ?;");
     stmt.bind(1, name);
@@ -285,6 +333,29 @@ struct EntryRepository {
     `);
     stmt.bind(1, rootId);
     return !stmt.execute().empty;
+  }
+
+  bool[string] getEntryPathsSet(long rootId) {
+    bool[string] paths;
+    auto stmt = db.prepare(`
+      SELECT rel_path
+      FROM entries
+      WHERE root_id = ? AND rel_path != '.';
+    `);
+    stmt.bind(1, rootId);
+    foreach (row; stmt.execute()) {
+      paths[row.peek!string(0)] = true;
+    }
+    return paths;
+  }
+
+  void replaceRootEntries(long rootId, in Entry[] entries) {
+    auto delStmt = db.prepare("DELETE FROM entries WHERE root_id = ?;");
+    delStmt.bind(1, rootId);
+    delStmt.execute();
+    if (entries.length > 0) {
+      upsertEntries(rootId, entries);
+    }
   }
 
   void upsertEntriesBatch(long rootId, in Entry[] batch) {

@@ -94,6 +94,10 @@ The application answers key questions about cataloged storage:
   `--type file|dir|all`, `--skip-empty`):
   Find unique files or directories across all roots or across the specified
   `<target>` patterns (`LIKE` or `GLOB`).
+- `listremo import <db_file> [<root_pattern>...] [--no-backup] [--no-update]`:
+  Import new storage roots and update existing roots (when the imported root
+  has a more recent synchronization date) from another database of the same
+  schema version.
 - `listremo migrate [--no-backup]`:
   Migrate database schema to the current application version (prompts to save a
   backup file unless `--no-backup` is specified).
