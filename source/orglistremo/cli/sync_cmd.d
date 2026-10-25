@@ -438,6 +438,15 @@ void reportSyncOutcome(in SyncResult stats, ref SyncRunContext runCtx) {
         stats.reusedHashes
       )
     );
+    if (stats.ignoredPaths.length > 0) {
+      info(
+        runCtx.opts,
+        format("  Ignored (%d):", stats.ignoredPaths.length)
+      );
+      foreach (ignoredPath; stats.ignoredPaths) {
+        info(runCtx.opts, format("    %s", ignoredPath));
+      }
+    }
     if (stats.errors.length > 0) {
       stderr.writefln("  Completed with %d error(s):", stats.errors.length);
       foreach (ref const err; stats.errors) {

@@ -98,6 +98,7 @@ ImportSummary executeImportRoots(
   withTransaction(targetDb, {
     ImportContext ctx = ImportContext(
       RootRepository(targetDb),
+      RootRepository(sourceDb),
       EntryRepository(targetDb),
       EntryRepository(sourceDb),
       cfg.noUpdate
@@ -225,6 +226,7 @@ struct ImportExecRequest {
 
 struct ImportContext {
   RootRepository dstRootRepo;
+  RootRepository srcRootRepo;
   EntryRepository dstEntryRepo;
   EntryRepository srcEntryRepo;
   bool noUpdate;
@@ -378,6 +380,8 @@ void importNewRoot(
   ref ImportSummary summary
 ) {
   const long newRootId = ctx.dstRootRepo.insertImportedRoot(srcRoot);
+  const string[] srcIgnores = ctx.srcRootRepo.listIgnorePatterns(srcRoot.id);
+  ctx.dstRootRepo.addIgnorePatterns(newRootId, srcIgnores);
   const Entry[] srcEntries = ctx.srcEntryRepo.listEntriesByRootId(srcRoot.id);
   copyRootEntriesBatched(ctx.dstEntryRepo, newRootId, srcEntries);
 
@@ -395,6 +399,11 @@ void processExistingRoot(
     summary.skippedNoUpdateRoots ~= pair.srcRoot.name;
     return;
   }
+
+  const string[] srcIgnores = ctx.srcRootRepo.listIgnorePatterns(
+    pair.srcRoot.id
+  );
+  ctx.dstRootRepo.addIgnorePatterns(pair.dstRoot.id, srcIgnores);
 
   const bool isMoreRecent = pair.srcRoot.hasLastSync && (
     !pair.dstRoot.hasLastSync ||
@@ -468,6 +477,7 @@ unittest {
   );
 
   const dstUpdId = dstRoots.addRoot("root_update", "/dst/old_path");
+  dstRoots.addIgnorePatterns(dstUpdId, ["*~", "*.bak"]);
   dstEntries.saveSyncEntries(
     SyncSaveParams(dstUpdId, 2000, 2048, true),
     [
@@ -492,6 +502,7 @@ unittest {
   );
 
   const srcUpdId = srcRoots.addRoot("root_update", "/src/new_path");
+  srcRoots.addIgnorePatterns(srcUpdId, ["*.bak", "build/"]);
   srcEntries.saveSyncEntries(
     SyncSaveParams(srcUpdId, 6000, 9999, true),
     [
@@ -512,6 +523,7 @@ unittest {
   );
 
   const srcNewId = srcRoots.addRoot("root_new", "/src/new_root");
+  srcRoots.addIgnorePatterns(srcNewId, ["*.tmp"]);
   srcEntries.saveSyncEntries(
     SyncSaveParams(srcNewId, 4000, 4096, true),
     [
@@ -573,6 +585,7 @@ unittest {
   assert(dstNew.hasFreeSpace && dstNew.freeSpace == 4096);
   const newEntriesList = dstEntries.listEntriesByRootId(dstNew.id);
   assert(newEntriesList.length == 4);
+  assert(dstRoots.listIgnorePatterns(dstNew.id) == ["*.tmp"]);
 
   Root dstUpdAfter;
   assert(dstRoots.findByName("root_update", dstUpdAfter));
@@ -582,6 +595,9 @@ unittest {
   assert(dstUpdAfter.freeSpace == 9999);
   const updEntriesList = dstEntries.listEntriesByRootId(dstUpdId);
   assert(updEntriesList.length == 4);
+  assert(
+    dstRoots.listIgnorePatterns(dstUpdId) == ["*~", "*.bak", "build/"]
+  );
 
   Root dstKeepAfter;
   assert(dstRoots.findByName("root_keep", dstKeepAfter));

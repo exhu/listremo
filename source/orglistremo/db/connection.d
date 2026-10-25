@@ -6,7 +6,7 @@ import orglistremo.config : ensureDbDirectory;
 import orglistremo.db.internal.schema : tableExists;
 import orglistremo.db.migration :
   addFreeSpaceColumn, applyWritePragmas, createCoreTablesV1,
-  createSyncLocksTable, insertVersionRow, VersionRow;
+  createRootIgnoresTable, createSyncLocksTable, insertVersionRow, VersionRow;
 import orglistremo.db.schema_version : schemaVersion;
 import std.datetime.systime : Clock;
 
@@ -101,6 +101,7 @@ void createCoreTables(ref Database db) {
   createCoreTablesV1(db);
   createSyncLocksTable(db);
   addFreeSpaceColumn(db);
+  createRootIgnoresTable(db);
 }
 
 void insertCurrentVersionRow(
@@ -117,7 +118,7 @@ unittest {
   DbOpenResult openRes = openDatabaseChecked(":memory:");
   assert(!openRes.isReadOnly);
   assert(openRes.dbSchemaVersion == schemaVersion);
-  assert(schemaVersion == 3);
+  assert(schemaVersion == 4);
 
   Database db = openRes.db;
   assert(readDbSchemaVersion(db) == schemaVersion);
@@ -147,20 +148,26 @@ unittest {
     );
   `, rootId);
 
-  // Verify sync_locks table exists
+  // Verify sync_locks and root_ignores tables exist
   db.execute(`
     INSERT INTO sync_locks (root_id, pid, started_at, hostname)
     VALUES (?, 1234, 1700000000, 'myhost');
   `, rootId);
+  db.execute(`
+    INSERT INTO root_ignores (root_id, pattern)
+    VALUES (?, '*~');
+  `, rootId);
 
-  // Verify entry and lock exist
+  // Verify entry, lock, and ignore pattern exist
   assert(db.execute("SELECT COUNT(*) FROM entries").oneValue!long == 1);
   assert(db.execute("SELECT COUNT(*) FROM sync_locks").oneValue!long == 1);
+  assert(db.execute("SELECT COUNT(*) FROM root_ignores").oneValue!long == 1);
 
   // Verify cascade deletion
   db.execute("DELETE FROM roots WHERE id = ?", rootId);
   assert(db.execute("SELECT COUNT(*) FROM entries").oneValue!long == 0);
   assert(db.execute("SELECT COUNT(*) FROM sync_locks").oneValue!long == 0);
+  assert(db.execute("SELECT COUNT(*) FROM root_ignores").oneValue!long == 0);
 }
 
 unittest {

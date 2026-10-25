@@ -66,8 +66,29 @@ void migrateFrom2to3(ref Database db, long now) {
   insertVersionRow(db, VersionRow(3, creationDate, now));
 }
 
+void migrateFrom3to4(ref Database db, long now) {
+  createRootIgnoresTable(db);
+  const creationDate = resolveDbCreationDate(db, now);
+  insertVersionRow(db, VersionRow(4, creationDate, now));
+}
+
 void addFreeSpaceColumn(ref Database db) {
   db.execute("ALTER TABLE roots ADD COLUMN free_space INTEGER;");
+}
+
+void createRootIgnoresTable(ref Database db) {
+  db.execute(`
+    CREATE TABLE IF NOT EXISTS root_ignores (
+      id       INTEGER PRIMARY KEY AUTOINCREMENT,
+      root_id  INTEGER NOT NULL REFERENCES roots(id) ON DELETE CASCADE,
+      pattern  TEXT NOT NULL,
+      UNIQUE(root_id, pattern)
+    );
+  `);
+  db.execute(`
+    CREATE INDEX IF NOT EXISTS idx_root_ignores_root_id
+    ON root_ignores(root_id);
+  `);
 }
 
 void createSyncLocksTable(ref Database db) {
@@ -174,6 +195,9 @@ void runMigrationSteps(ref Database db, int fromVersion) {
       case 2:
         migrateFrom2to3(db, now);
         break;
+      case 3:
+        migrateFrom3to4(db, now);
+        break;
       default:
         import std.format : format;
         throw new Exception(
@@ -238,7 +262,7 @@ unittest {
   createCoreTablesV1(db);
   insertVersionRow(db, VersionRow(1, 1600000000, 1600000000));
 
-  // Migrate from 1 to 3
+  // Migrate from 1 to 4
   migrateDatabase(db, 1);
 
   const ver = db.execute(
@@ -249,7 +273,7 @@ unittest {
   const versionCount = db.execute(
     "SELECT COUNT(*) FROM version"
   ).oneValue!long;
-  assert(versionCount == 3);
+  assert(versionCount == 4);
 }
 
 unittest {
@@ -264,13 +288,13 @@ unittest {
     VALUES ('r_v2', '/mnt/v2', 1600000000);
   `);
 
-  // Migrate from 2 to 3
+  // Migrate from 2 to 4
   migrateDatabase(db, 2);
 
   const ver = db.execute(
     "SELECT schema_version FROM version ORDER BY id DESC LIMIT 1"
   ).oneValue!int;
-  assert(ver == 3);
+  assert(ver == schemaVersion);
 
   // Verify free_space column is present and usable
   db.execute("UPDATE roots SET free_space = 5000000000 WHERE name = 'r_v2';");
@@ -278,6 +302,37 @@ unittest {
     "SELECT free_space FROM roots WHERE name = 'r_v2';"
   ).oneValue!long;
   assert(freeVal == 5000000000);
+}
+
+unittest {
+  Database db = Database(":memory:");
+  // Create v3 database
+  createCoreTablesV1(db);
+  createSyncLocksTable(db);
+  addFreeSpaceColumn(db);
+  insertVersionRow(db, VersionRow(3, 1600000000, 1600000000));
+
+  db.execute(`
+    INSERT INTO roots (name, path, created_at)
+    VALUES ('r_v3', '/mnt/v3', 1600000000);
+  `);
+
+  // Migrate from 3 to 4
+  migrateDatabase(db, 3);
+
+  const ver = db.execute(
+    "SELECT schema_version FROM version ORDER BY id DESC LIMIT 1"
+  ).oneValue!int;
+  assert(ver == 4);
+
+  db.execute(`
+    INSERT INTO root_ignores (root_id, pattern)
+    VALUES (1, '*~');
+  `);
+  const ignoreCount = db.execute(
+    "SELECT COUNT(*) FROM root_ignores WHERE root_id = 1;"
+  ).oneValue!long;
+  assert(ignoreCount == 1);
 }
 
 unittest {

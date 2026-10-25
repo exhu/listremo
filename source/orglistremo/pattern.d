@@ -138,6 +138,68 @@ string escapeLikeLiteral(string s) {
   return app.data;
 }
 
+string[] parseIgnorePatterns(string content) {
+  import std.string : splitLines, strip;
+
+  string[] result;
+  bool[string] seen;
+  foreach (line; content.splitLines()) {
+    const string trimmed = line.strip();
+    if (trimmed.length == 0) {
+      continue;
+    }
+    if (trimmed !in seen) {
+      seen[trimmed] = true;
+      result ~= trimmed;
+    }
+  }
+  return result;
+}
+
+bool matchesIgnoreList(
+  string relPath,
+  bool isDir,
+  in string[] patterns
+) {
+  if (relPath.length == 0 || relPath == "." || patterns.length == 0) {
+    return false;
+  }
+  foreach (pat; patterns) {
+    if (matchesSingleIgnoreGlob(relPath, isDir, pat)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+private:
+
+bool matchesSingleIgnoreGlob(string relPath, bool isDir, string rawPat) {
+  import std.path : globMatch;
+
+  string pat = rawPat;
+  while (pat.length >= 2 && pat[0 .. 2] == "./") {
+    pat = pat[2 .. $];
+  }
+  while (pat.length > 0 && pat[0] == '/') {
+    pat = pat[1 .. $];
+  }
+
+  bool dirOnly = false;
+  while (pat.length > 0 && pat[$ - 1] == '/') {
+    dirOnly = true;
+    pat = pat[0 .. $ - 1];
+  }
+
+  if (pat.length == 0) {
+    return false;
+  }
+  if (dirOnly && !isDir) {
+    return false;
+  }
+  return globMatch(relPath, pat);
+}
+
 unittest {
   // Test hasPatternWildcard
   assert(hasPatternWildcard("%"));
@@ -193,4 +255,23 @@ unittest {
   // Test escapeLikeLiteral
   assert(escapeLikeLiteral("100%_done\\") == "100\\%\\_done\\\\");
   assert(escapeLikeLiteral("normal") == "normal");
+
+  // Test parseIgnorePatterns
+  const parsedIgnores = parseIgnorePatterns(
+    "  *~  \n\n#*#\r\n*~ \n  build/ \n"
+  );
+  assert(parsedIgnores == ["*~", "#*#", "build/"]);
+  assert(parseIgnorePatterns("   \n\t\n").length == 0);
+
+  // Test matchesIgnoreList
+  const string[] globs = ["*~", "build/", "tmp/*"];
+  assert(matchesIgnoreList("abc.d~", false, globs));
+  assert(matchesIgnoreList("sub/abc.d~", false, globs));
+  assert(!matchesIgnoreList("abc.d", false, globs));
+  assert(matchesIgnoreList("build", true, globs));
+  assert(!matchesIgnoreList("build", false, globs));
+  assert(!matchesIgnoreList("tmp", true, globs));
+  assert(matchesIgnoreList("tmp/a.txt", false, globs));
+  assert(matchesIgnoreList("tmp/sub", true, globs));
+  assert(!matchesIgnoreList(".", true, globs));
 }

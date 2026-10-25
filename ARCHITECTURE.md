@@ -18,6 +18,8 @@
 - `source/orglistremo/cli/`: CLI subcommand parsing, options, and dispatch.
   - `context.d`: Database execution context (`DbContext`, `requireWritable`).
   - `root_cmd.d`: Storage root management (`add`, `remove`, `set-path`, `list`).
+  - `ignore_cmd.d`: Per-root ignore glob list management (`ignore`,
+    `ignore-delete`).
   - `sync_cmd.d`: Synchronization orchestration and concurrent worker pools.
   - `query_cmd.d`: Catalog browsing and queries (`list`, `duplicates`,
     `unique`).

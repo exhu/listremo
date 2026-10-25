@@ -2,9 +2,10 @@ module orglistremo.sync.scanner;
 
 import d2sqlite3 : Database;
 import orglistremo.db.repo :
-  CachedFileEntry, EntryRepository, SyncSaveParams;
+  CachedFileEntry, EntryRepository, RootRepository, SyncSaveParams;
 import orglistremo.internal.os : getDeviceFreeSpace;
 import orglistremo.model : deriveEntryPath, Entry, Root;
+import orglistremo.pattern : matchesIgnoreList;
 import orglistremo.sync.hasher :
   ChildRecord, DirectoryHashResult, hashDirectory, hashFile;
 import orglistremo.sync.progress :
@@ -20,6 +21,7 @@ struct SyncResult {
   ulong dirCount;
   ulong totalSize;
   ulong reusedHashes;
+  string[] ignoredPaths;
   SyncIssue[] errors;
 }
 
@@ -47,12 +49,14 @@ SyncResult syncRoot(
   validateSyncPreconditions(entryRepo, root, options.force);
 
   const cachedMap = entryRepo.getFileEntriesMap(root.id);
+  const ignorePatterns = RootRepository(db).listIgnorePatterns(root.id);
   ScannerContext ctx = ScannerContext(
     root.id,
     root.name,
     options.forceHash,
     options.batchSize,
     cachedMap,
+    ignorePatterns,
     options.onProgress,
     options.onIssue,
     &entryRepo
@@ -72,6 +76,10 @@ SyncResult syncRoot(
   }
 
   commitRootSync(entryRepo, root);
+  if (ctx.stats.ignoredPaths.length > 1) {
+    import std.algorithm.sorting : sort;
+    ctx.stats.ignoredPaths.sort();
+  }
   return ctx.stats;
 }
 
@@ -201,6 +209,12 @@ struct ScannerContext {
 
     const string childName = baseName(entry.name);
     const string childRelPath = joinRelPath(relPath, childName);
+    const bool isDirectory = entry.isDir;
+
+    if (matchesIgnoreList(childRelPath, isDirectory, ignorePatterns)) {
+      stats.ignoredPaths ~= isDirectory ? (childRelPath ~ "/") : childRelPath;
+      return;
+    }
 
     if (entry.isFile) {
       try {
@@ -208,7 +222,7 @@ struct ScannerContext {
       } catch (Exception e) {
         recordIssue(entry.name, e.msg, false);
       }
-    } else if (entry.isDir) {
+    } else if (isDirectory) {
       const ScanDirResult childRes = scanDir(entry.name, childRelPath);
       if (childRes.success) {
         children ~= childRes.record;
@@ -324,6 +338,7 @@ struct ScannerContext {
   const bool forceHash;
   const size_t batchSize;
   const(CachedFileEntry[string]) cachedMap;
+  const(string)[] ignorePatterns;
   SyncProgressCallback onProgress;
   SyncIssueCallback onIssue;
   EntryRepository* entryRepo;
@@ -529,6 +544,38 @@ unittest {
   const SyncResult batchRes = syncRoot(db, root, batchOpts);
   assert(batchRes.fileCount == 2);
   assert(entryRepo.listEntriesByRootId(rootId).length > 0);
+
+  // Test sync with per-root ignore patterns (files and directories)
+  TempDir ignoreBase = TempDir("sync_ignore");
+  mkdirRecurse(buildPath(ignoreBase, "ignored_dir", "sub"));
+  mkdirRecurse(buildPath(ignoreBase, "kept_dir"));
+  write(buildPath(ignoreBase, "abc.d"), "code");
+  write(buildPath(ignoreBase, "abc.d~"), "backup");
+  write(buildPath(ignoreBase, "ignored_dir", "inside.txt"), "skip");
+  write(buildPath(ignoreBase, "ignored_dir", "sub", "deep.d~"), "skip2");
+  write(buildPath(ignoreBase, "kept_dir", "keep.txt"), "keep");
+  write(buildPath(ignoreBase, "kept_dir", "temp.d~"), "skip3");
+
+  const long igRootId = rootRepo.addRoot("MYROOT", ignoreBase);
+  rootRepo.addIgnorePatterns(igRootId, ["*~", "ignored_dir"]);
+  Root igRoot;
+  assert(rootRepo.findById(igRootId, igRoot));
+
+  const SyncResult igRes = syncRoot(db, igRoot);
+  assert(igRes.fileCount == 2); // abc.d and kept_dir/keep.txt
+  assert(igRes.dirCount == 1);  // kept_dir
+  assert(
+    igRes.ignoredPaths == ["abc.d~", "ignored_dir/", "kept_dir/temp.d~"]
+  );
+
+  const Entry[] igEntries = entryRepo.listEntriesByRootId(igRootId);
+  string[] relPaths;
+  foreach (ref const e; igEntries) {
+    if (e.relPath != ".") {
+      relPaths ~= e.relPath;
+    }
+  }
+  assert(relPaths == ["abc.d", "kept_dir", "kept_dir/keep.txt"]);
 }
 
 unittest {

@@ -3,6 +3,8 @@ module orglistremo.app;
 import d2sqlite3 : Database;
 import orglistremo.cli;
 import orglistremo.cli.context : DbContext;
+import orglistremo.cli.ignore_cmd :
+  handleIgnoreCommand, handleIgnoreDeleteCommand;
 import orglistremo.cli.import_cmd : handleImportCommand;
 import orglistremo.cli.migrate_cmd : handleMigrateCommand;
 import orglistremo.cli.query_cmd :
@@ -77,6 +79,10 @@ int dispatchCommand(
   switch (subcmd) {
     case "root":
       return handleRootCommand(ctx, subArgs, opts);
+    case "ignore":
+      return handleIgnoreCommand(ctx, subArgs, opts);
+    case "ignore-delete":
+      return handleIgnoreDeleteCommand(ctx, subArgs, opts);
     case "sync":
       return handleSyncCommand(ctx, subArgs, opts);
     case "import":
@@ -604,4 +610,8 @@ unittest {
   assert(
     dispatchCommand(ctx, ["unique", "alpha%", "nonexistent"], opts) == 1
   );
+
+  // 7. Test ignore and ignore-delete commands
+  assert(dispatchCommand(ctx, ["ignore", "alpha%"], opts) == 0);
+  assert(dispatchCommand(ctx, ["ignore-delete", "alpha%"], opts) == 0);
 }

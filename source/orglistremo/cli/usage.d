@@ -13,6 +13,8 @@ Commands:
   root remove <name>           Remove a root and entries
   root set-path <name> <path>  Update mount path of a root
   root list [pattern]          List registered storage roots
+  ignore <pattern> [file]      View or add ignore globs for roots
+  ignore-delete <pattern>      Clear ignore globs for roots
   sync <name|pattern> [opts]   Synchronize a storage root
   sync --all [pattern] [opts]  Synchronize matching storage roots
   list [<target>...] [opts]    List files & dirs (alias: files)

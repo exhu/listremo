@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.17.0
+
+- Added per-root ignore list support (`root_ignores` table, schema v4) storing
+  unique relative glob patterns per storage root.
+- Added `listremo ignore <root-name-pattern> [ignore-list-file]` command to
+  display current ignore lists or append unique glob patterns from a file and
+  report added patterns per root.
+- Added `listremo ignore-delete <root-name-pattern>` command to clear ignore
+  lists for matching roots and report removed patterns.
+- Updated `sync` to skip directories and files matching root ignore globs and
+  list ignored paths upon completion.
+- Updated `import` to copy ignore patterns for newly imported roots and merge
+  unique ignore patterns into existing roots.
+
 ## 0.16.0
 
 - Replaced multiple overloads of `backupIfRequested()` in `cli/context.d` with

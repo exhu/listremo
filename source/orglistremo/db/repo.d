@@ -1,7 +1,7 @@
 module orglistremo.db.repo;
 
 import d2sqlite3 : Database, ResultRange, Row, SqliteType, Statement;
-import orglistremo.db.internal.schema : columnExists;
+import orglistremo.db.internal.schema : columnExists, tableExists;
 import orglistremo.db.internal.sql :
   bindNullable, bindSubpath, buildEntrySortSql, buildSubpathSql,
   buildTypeFilterSql, entrySelectSql, NullableValue, SubpathQuery;
@@ -239,6 +239,65 @@ struct RootRepository {
     return summaries;
   }
 
+  string[] listIgnorePatterns(long rootId) {
+    if (!hasRootIgnoresTable()) {
+      return null;
+    }
+    Statement stmt = db.prepare(`
+      SELECT pattern FROM root_ignores
+      WHERE root_id = ?
+      ORDER BY id ASC;
+    `);
+    stmt.bind(1, rootId);
+    string[] patterns;
+    ResultRange results = stmt.execute();
+    foreach (Row row; results) {
+      patterns ~= row.peek!string(0);
+    }
+    return patterns;
+  }
+
+  string[] addIgnorePatterns(long rootId, in string[] patterns) {
+    if (patterns.length == 0) {
+      return null;
+    }
+    string[] added;
+    withTransaction(db, {
+      Statement stmt = db.prepare(`
+        INSERT OR IGNORE INTO root_ignores (root_id, pattern)
+        VALUES (?, ?);
+      `);
+      foreach (p; patterns) {
+        if (p.length == 0) {
+          continue;
+        }
+        stmt.reset();
+        stmt.bind(1, rootId);
+        stmt.bind(2, p);
+        stmt.execute();
+        if (db.changes > 0) {
+          added ~= p;
+        }
+      }
+    });
+    return added;
+  }
+
+  string[] clearIgnorePatterns(long rootId) {
+    string[] removed;
+    withTransaction(db, {
+      removed = listIgnorePatterns(rootId);
+      if (removed.length > 0) {
+        Statement stmt = db.prepare(
+          "DELETE FROM root_ignores WHERE root_id = ?;"
+        );
+        stmt.bind(1, rootId);
+        stmt.execute();
+      }
+    });
+    return removed;
+  }
+
 private:
   enum ColumnCache : byte {
     unknown,
@@ -279,6 +338,14 @@ private:
     return freeSpaceCache == ColumnCache.present;
   }
 
+  bool hasRootIgnoresTable() {
+    if (ignoresTableCache == ColumnCache.unknown) {
+      const exists = tableExists(db, "root_ignores");
+      ignoresTableCache = exists ? ColumnCache.present : ColumnCache.absent;
+    }
+    return ignoresTableCache == ColumnCache.present;
+  }
+
   static Root readRootRow(Row row) {
     Root r;
     r.id = row.peek!long(0);
@@ -304,6 +371,7 @@ private:
 
   Database db;
   ColumnCache freeSpaceCache = ColumnCache.unknown;
+  ColumnCache ignoresTableCache = ColumnCache.unknown;
 }
 
 struct EntryRepository {
@@ -1183,4 +1251,19 @@ unittest {
   assert(updatedList.length == 2);
   assert(updatedList[0].relPath == "file2.txt" && updatedList[0].size == 250);
   assert(updatedList[1].relPath == "file3.txt" && updatedList[1].size == 300);
+
+  // Test ignore patterns CRUD and deduplication in RootRepository
+  assert(rootRepo.listIgnorePatterns(r1).length == 0);
+  const added1 = rootRepo.addIgnorePatterns(r1, ["*~", "#*#", "*~"]);
+  assert(added1 == ["*~", "#*#"]);
+  assert(rootRepo.listIgnorePatterns(r1) == ["*~", "#*#"]);
+
+  const added2 = rootRepo.addIgnorePatterns(r1, ["#*#", "build/*"]);
+  assert(added2 == ["build/*"]);
+  assert(rootRepo.listIgnorePatterns(r1) == ["*~", "#*#", "build/*"]);
+
+  const removed1 = rootRepo.clearIgnorePatterns(r1);
+  assert(removed1 == ["*~", "#*#", "build/*"]);
+  assert(rootRepo.listIgnorePatterns(r1).length == 0);
+  assert(rootRepo.clearIgnorePatterns(r1).length == 0);
 }

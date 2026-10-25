@@ -31,6 +31,8 @@ The application answers key questions about cataloged storage:
   - Update root mount paths (`set-path`).
   - Remove registered roots and their cataloged entries (`remove`).
   - List registered roots with total file count, directory count, and size.
+  - Configure per-root ignore lists of glob patterns (`ignore`, `ignore-delete`)
+    to skip matching files and directories during synchronization.
 - Filesystem synchronization:
   - Recursive scanning of storage roots.
   - Incremental sync: detects unchanged files by size and modification
@@ -80,6 +82,11 @@ The application answers key questions about cataloged storage:
 - `listremo root remove <name>`: Remove a root and its entries.
 - `listremo root set-path <name> <path>`: Update the mount path of a root.
 - `listremo root list`: List all registered storage roots and summary stats.
+- `listremo ignore <root-name-pattern> [ignore-list-file]`: Display current
+  ignore glob patterns for matching roots, or add unique glob patterns from a
+  newline-separated file to all matching roots and display the added patterns.
+- `listremo ignore-delete <root-name-pattern>`: Clear ignore glob lists for all
+  matching roots and display the removed patterns.
 - `listremo sync <name> [--force-hash]`: Synchronize a specific storage root.
 - `listremo sync --all [--force-hash]`: Synchronize all storage roots.
 - `listremo list [<target>...] [--hash <pattern>] [--glob]`
@@ -145,6 +152,26 @@ During synchronization, `listremo` scans files recursively, computes streaming
 SHA-256 hashes for files, computes Merkle hashes for directories, and saves the
 metadata to the catalog. Subsequent syncs run incrementally, reusing hashes for
 unchanged files based on size and modification timestamps.
+
+To exclude specific files or directories (such as backup files `*~` or build
+folders) from being scanned and cataloged on a root:
+
+```bash
+# Create a file with one glob pattern per line (relative to root path)
+printf "*~\nbuild/\n" > .listremo-ignore
+
+# Apply the ignore patterns to root backup1 (or use % wildcard for multiple)
+listremo ignore backup1 .listremo-ignore
+
+# View active ignore patterns for backup1
+listremo ignore backup1
+
+# Clear ignore patterns for backup1
+listremo ignore-delete backup1
+```
+
+When `sync` runs on a root with ignore patterns, matching directories and files
+are skipped and listed in the sync completion output.
 
 ### 3. Listing Entries and Subtrees
 
