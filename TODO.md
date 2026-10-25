@@ -1,6 +1,7 @@
-- ARCHITECTURE.md at the project root
-
 - add --backup option to `sync` command
+
+- support ignore list per root (does not depend on root source path)
+must list ignored directories after `sync`
 
 - in context.d backupIfRequested() with multiple overloads needs
 to be replaced
