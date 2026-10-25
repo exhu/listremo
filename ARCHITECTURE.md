@@ -50,10 +50,11 @@
   `CLI args` -> `app.runApp` -> `openDatabaseChecked` -> `cli/query_cmd.d` ->
   `repo.d (SQL query)` -> `output (console/csv/html)` -> `stdout`.
 - Sync Execution (`sync`):
-  `CLI args` -> `cli/sync_cmd.d` -> `SyncLockRepository.acquireLock` ->
-  `sync/scanner.d` -> `sync/hasher.d (SHA-256 / Merkle)` ->
-  `EntryRepository.stageBatch` -> `EntryRepository.commitSync` (atomic live
-  swap & stale deletion) -> `SyncLockRepository.releaseLock`.
+  `CLI args` -> `cli/sync_cmd.d` -> `writeDatabaseBackup (VACUUM INTO)` ->
+  `SyncLockRepository.acquireLock` -> `sync/scanner.d` ->
+  `sync/hasher.d (SHA-256 / Merkle)` -> `EntryRepository.stageBatch` ->
+  `EntryRepository.commitSync` (atomic live swap & stale deletion) ->
+  `SyncLockRepository.releaseLock`.
 - Database Migration (`migrate`):
   `CLI args` -> `cli/migrate_cmd.d` -> `writeDatabaseBackup (VACUUM INTO)` ->
   `db/migration.d (runMigrationSteps in transaction)` -> `applyWritePragmas`.

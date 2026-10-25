@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.15.0
+
+- Added database backup snapshot flow to `sync` command matching `migrate` and
+  `import`, creating an atomic `VACUUM INTO` backup before sync execution.
+- Added `--no-backup` CLI option to `sync` to bypass the interactive backup
+  prompt when syncing on-disk databases.
+
 ## 0.14.0
 
 - Externalized HTML report CSS and JavaScript into `assets/orglistremo/`

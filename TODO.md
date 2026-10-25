@@ -1,5 +1,3 @@
-- add --backup option to `sync` command
-
 - support ignore list per root (does not depend on root source path)
 must list ignored directories after `sync`
 

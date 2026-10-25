@@ -4,7 +4,8 @@ import core.sync.mutex : Mutex;
 import core.time : MonoTime;
 import d2sqlite3 : Database;
 import orglistremo.cli.args : ArgCursor;
-import orglistremo.cli.context : DbContext, requireWritable;
+import orglistremo.cli.context :
+  backupIfRequested, BackupRequest, DbContext, requireWritable;
 import orglistremo.cli.roots : resolveRoots;
 import orglistremo.db.connection : openWorkerDatabase;
 import orglistremo.db.repo : RootRepository;
@@ -32,6 +33,7 @@ struct SyncArgs {
   bool forceHash;
   bool noProgress;
   bool breakLock;
+  bool noBackup;
   uint jobs = 1;
   bool jobsPassed;
   uint progressIntervalMs = 1000;
@@ -54,6 +56,8 @@ bool parseSyncArgs(string[] args, out SyncArgs parsed) {
     string val;
     if (cur.matchFlag("--all")) {
       parsed.allFlag = true;
+    } else if (cur.matchFlag("--no-backup")) {
+      parsed.noBackup = true;
     } else if (cur.matchFlag("--force")) {
       parsed.forceFlag = true;
     } else if (cur.matchFlag("--force-hash")) {
@@ -103,6 +107,17 @@ int handleSyncCommand(
   RootRepository rootRepo = RootRepository(ctx.db);
   Root[] toSync;
   if (!resolveSyncTargets(rootRepo, syncArgs, toSync)) {
+    return 1;
+  }
+
+  if (toSync.length == 0) {
+    return 0;
+  }
+
+  const BackupRequest bkpReq = BackupRequest(
+    ctx.dbPath, syncArgs.noBackup, opts, "Sync"
+  );
+  if (!backupIfRequested(ctx, bkpReq)) {
     return 1;
   }
 
@@ -515,4 +530,12 @@ unittest {
   SyncArgs jobsArgs;
   assert(parseSyncArgs(["sync", "norm_root", "-j", "4"], jobsArgs));
   assert(jobsArgs.jobsPassed);
+
+  SyncArgs syncNoBackupArgs;
+  assert(
+    parseSyncArgs(["sync", "myroot", "--no-backup"], syncNoBackupArgs)
+  );
+  assert(syncNoBackupArgs.targetRoot == "myroot");
+  assert(syncNoBackupArgs.noBackup);
+  assert(!syncArgs.noBackup);
 }

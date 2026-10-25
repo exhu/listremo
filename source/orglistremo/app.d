@@ -447,10 +447,14 @@ unittest {
       existing
     )
   );
-  assert(dispatchCommand(roCtx, ["sync", "lock_root"], testOpts) == 1);
   assert(
     dispatchCommand(
-      roCtx, ["sync", "lock_root", "--break-lock"], testOpts
+      roCtx, ["sync", "lock_root", "--no-backup"], testOpts
+    ) == 1
+  );
+  assert(
+    dispatchCommand(
+      roCtx, ["sync", "lock_root", "--break-lock", "--no-backup"], testOpts
     ) == 0
   );
 
@@ -461,7 +465,11 @@ unittest {
         existing
       )
     );
-    assert(dispatchCommand(roCtx, ["sync", "lock_root"], testOpts) == 0);
+    assert(
+      dispatchCommand(
+        roCtx, ["sync", "lock_root", "--no-backup"], testOpts
+      ) == 0
+    );
   }
 
   roCtx.db.close();
