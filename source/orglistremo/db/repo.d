@@ -398,6 +398,23 @@ struct EntryRepository {
     return cache;
   }
 
+  long[string] getDirMtimesMap(long rootId) {
+    long[string] dirMtimes;
+    Statement stmt = db.prepare(`
+      SELECT rel_path, mtime
+      FROM entries
+      WHERE root_id = ? AND is_dir = 1 AND rel_path != '.';
+    `);
+    stmt.bind(1, rootId);
+    ResultRange results = stmt.execute();
+    foreach (Row row; results) {
+      const relPath = row.peek!string(0);
+      const mtime = row.peek!long(1);
+      dirMtimes[relPath] = mtime;
+    }
+    return dirMtimes;
+  }
+
   bool hasCatalogedEntries(long rootId) {
     Statement stmt = db.prepare(`
       SELECT 1 FROM entries
@@ -906,6 +923,11 @@ unittest {
     r1, ListEntriesFilter("photos")
   );
   assert(subList.length == 3);
+
+  const dirMtimes = entryRepo.getDirMtimesMap(r1);
+  assert("." !in dirMtimes);
+  assert("photos" in dirMtimes && dirMtimes["photos"] == 1000);
+  assert("empty_dir" in dirMtimes && dirMtimes["empty_dir"] == 1000);
 
   // Subpath with file only
   const fileSub = entryRepo.listEntriesByRootId(

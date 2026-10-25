@@ -41,6 +41,7 @@ Duplicates & Unique Options:
   --skip-empty                 Skip empty files and directories
 
 Sync Options:
+  --dry-run                    Preview paths to sync without modifying DB
   --no-backup                  Skip saving a database backup
   --force                      Sync when root path is empty but database is not
   --force-hash                 Recompute SHA-256 for all files

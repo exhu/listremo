@@ -1,8 +1,3 @@
-- support new feature: `sync` command new `--dry-run` option which only
-displays which paths will be synced (to see which paths are ignored)
-and does not modify database or calculate hashes, only directory tree
-is scanned and modification date and file names are compared.
-
 - separate app: support thumbnailer as external app to gradually or
 selectively add thumbnails, e.g. list a path to rescan adding missing or
 regenerating outdated (or forced) thumbnails, it's a good idea to have a

@@ -32,6 +32,7 @@ struct SyncArgs {
   bool allFlag;
   bool forceFlag;
   bool forceHash;
+  bool dryRun;
   bool noProgress;
   bool breakLock;
   bool noBackup;
@@ -63,6 +64,8 @@ bool parseSyncArgs(string[] args, out SyncArgs parsed) {
       parsed.forceFlag = true;
     } else if (cur.matchFlag("--force-hash")) {
       parsed.forceHash = true;
+    } else if (cur.matchFlag("--dry-run")) {
+      parsed.dryRun = true;
     } else if (cur.matchFlag("--no-progress")) {
       parsed.noProgress = true;
     } else if (cur.matchFlag("--break-lock")) {
@@ -96,12 +99,12 @@ int handleSyncCommand(
   string[] args,
   in OutputOptions opts
 ) {
-  if (!requireWritable(ctx)) {
+  SyncArgs syncArgs;
+  if (!parseSyncArgs(args, syncArgs)) {
     return 1;
   }
 
-  SyncArgs syncArgs;
-  if (!parseSyncArgs(args, syncArgs)) {
+  if (!syncArgs.dryRun && !requireWritable(ctx)) {
     return 1;
   }
 
@@ -115,28 +118,11 @@ int handleSyncCommand(
     return 0;
   }
 
-  const BackupRequest bkpReq = BackupRequestBuilder(ctx)
-    .withNoBackup(syncArgs.noBackup)
-    .withOptions(opts)
-    .withActionName("Sync")
-    .build();
-  if (!backupIfRequested(bkpReq)) {
+  if (!syncArgs.dryRun && !backupBeforeSync(ctx, syncArgs, opts)) {
     return 1;
   }
 
-  const MonoTime startMono = MonoTime.currTime;
-  const SyncRunConfig runCfg = SyncRunConfig(syncArgs, opts);
-  const SyncRunResult res = (syncArgs.allFlag && syncArgs.jobs != 1
-      && toSync.length > 1)
-    ? runParallelSync(ctx, toSync, runCfg)
-    : runSequentialSync(ctx, toSync, runCfg);
-
-  if (res.syncStarted) {
-    const elapsed = MonoTime.currTime - startMono;
-    info(opts, format("Total time: %s", formatDuration(elapsed)));
-  }
-
-  return res.hadError ? 1 : 0;
+  return executeSyncTargets(ctx, toSync, SyncRunConfig(syncArgs, opts));
 }
 
 SyncRunResult runParallelSync(
@@ -308,24 +294,60 @@ void syncLog(Mutex mtx, scope void delegate() action) {
   }
 }
 
+bool backupBeforeSync(
+  ref DbContext ctx,
+  in SyncArgs syncArgs,
+  in OutputOptions opts
+) {
+  const BackupRequest bkpReq = BackupRequestBuilder(ctx)
+    .withNoBackup(syncArgs.noBackup)
+    .withOptions(opts)
+    .withActionName("Sync")
+    .build();
+  return backupIfRequested(bkpReq);
+}
+
+int executeSyncTargets(
+  ref DbContext ctx,
+  in Root[] toSync,
+  in SyncRunConfig runCfg
+) {
+  const MonoTime startMono = MonoTime.currTime;
+  const SyncRunResult res = (runCfg.syncArgs.allFlag
+      && runCfg.syncArgs.jobs != 1 && toSync.length > 1)
+    ? runParallelSync(ctx, toSync, runCfg)
+    : runSequentialSync(ctx, toSync, runCfg);
+
+  if (res.syncStarted) {
+    const elapsed = MonoTime.currTime - startMono;
+    info(runCfg.opts, format("Total time: %s", formatDuration(elapsed)));
+  }
+
+  return res.hadError ? 1 : 0;
+}
+
 bool syncSingleRoot(
   ref Database db,
   const ref Root root,
   ref SyncRunContext runCtx
 ) {
+  const bool isDryRun = runCtx.syncArgs.dryRun;
   SyncLockRepository lockRepo = SyncLockRepository(db);
-  if (!acquireRootLock(lockRepo, root, runCtx)) {
+  if (!isDryRun && !acquireRootLock(lockRepo, root, runCtx)) {
     return false;
   }
   scope (exit) {
-    lockRepo.releaseLock(root.id, thisProcessID, getLocalHostName());
+    if (!isDryRun) {
+      lockRepo.releaseLock(root.id, thisProcessID, getLocalHostName());
+    }
   }
 
   runCtx.syncStarted = true;
+  const string action = isDryRun ? "Dry-run syncing" : "Syncing";
   syncLog(runCtx.logMutex, {
     info(
       runCtx.opts,
-      format("Syncing root '%s' (%s)...", root.name, root.path)
+      format("%s root '%s' (%s)...", action, root.name, root.path)
     );
   });
 
@@ -397,6 +419,7 @@ bool executeScan(
   SyncOptions syncOpts;
   syncOpts.force = runCtx.syncArgs.forceFlag;
   syncOpts.forceHash = runCtx.syncArgs.forceHash;
+  syncOpts.dryRun = runCtx.syncArgs.dryRun;
   if (runCtx.reporter !is null) {
     syncOpts.onProgress = &runCtx.reporter.update;
   }
@@ -438,14 +461,11 @@ void reportSyncOutcome(in SyncResult stats, ref SyncRunContext runCtx) {
         stats.reusedHashes
       )
     );
+    if (runCtx.syncArgs.dryRun) {
+      reportPathList(runCtx.opts, "Paths to sync", stats.syncedPaths);
+    }
     if (stats.ignoredPaths.length > 0) {
-      info(
-        runCtx.opts,
-        format("  Ignored (%d):", stats.ignoredPaths.length)
-      );
-      foreach (ignoredPath; stats.ignoredPaths) {
-        info(runCtx.opts, format("    %s", ignoredPath));
-      }
+      reportPathList(runCtx.opts, "Ignored", stats.ignoredPaths);
     }
     if (stats.errors.length > 0) {
       stderr.writefln("  Completed with %d error(s):", stats.errors.length);
@@ -454,6 +474,17 @@ void reportSyncOutcome(in SyncResult stats, ref SyncRunContext runCtx) {
       }
     }
   });
+}
+
+void reportPathList(
+  in OutputOptions opts,
+  string label,
+  in string[] paths
+) {
+  info(opts, format("  %s (%d):", label, paths.length));
+  foreach (p; paths) {
+    info(opts, format("    %s", p));
+  }
 }
 
 unittest {
@@ -550,4 +581,12 @@ unittest {
   assert(syncNoBackupArgs.targetRoot == "myroot");
   assert(syncNoBackupArgs.noBackup);
   assert(!syncArgs.noBackup);
+
+  SyncArgs syncDryRunArgs;
+  assert(
+    parseSyncArgs(["sync", "myroot", "--dry-run"], syncDryRunArgs)
+  );
+  assert(syncDryRunArgs.targetRoot == "myroot");
+  assert(syncDryRunArgs.dryRun);
+  assert(!syncArgs.dryRun);
 }

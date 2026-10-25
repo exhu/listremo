@@ -37,6 +37,8 @@ The application answers key questions about cataloged storage:
   - Recursive scanning of storage roots.
   - Incremental sync: detects unchanged files by size and modification
     timestamp to reuse existing hashes without re-reading file contents.
+  - Dry-run preview (`--dry-run`) to inspect which paths will be synced or
+    ignored without calculating hashes or modifying the database.
   - Force re-hashing support with `--force-hash`.
   - Synchronize an individual root or all roots at once (`--all`).
 - SHA-256 and Merkle directory hashing:
@@ -87,8 +89,10 @@ The application answers key questions about cataloged storage:
   newline-separated file to all matching roots and display the added patterns.
 - `listremo ignore-delete <root-name-pattern>`: Clear ignore glob lists for all
   matching roots and display the removed patterns.
-- `listremo sync <name> [--force-hash]`: Synchronize a specific storage root.
-- `listremo sync --all [--force-hash]`: Synchronize all storage roots.
+- `listremo sync <name> [--dry-run] [--force-hash]`: Synchronize a specific
+  storage root.
+- `listremo sync --all [--dry-run] [--force-hash]`: Synchronize all storage
+  roots.
 - `listremo list [<target>...] [--hash <pattern>] [--glob]`
   `[--type file|dir|all] [--sort path|size|mtime]`:
   List cataloged entries (alias: `files`). Target format is `<root>`,

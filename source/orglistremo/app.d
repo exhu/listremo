@@ -512,7 +512,17 @@ unittest {
   assert(dispatchCommand(ctx, ["sync", "alpha%", "--no-progress"], opts) == 1);
   assert(
     dispatchCommand(
+      ctx, ["sync", "--all", "alpha%", "--dry-run", "--no-progress"], opts
+    ) == 0
+  );
+  assert(
+    dispatchCommand(
       ctx, ["sync", "--all", "alpha%", "--no-progress"], opts
+    ) == 0
+  );
+  assert(
+    dispatchCommand(
+      ctx, ["sync", "beta", "--dry-run", "--no-progress"], opts
     ) == 0
   );
   assert(dispatchCommand(ctx, ["sync", "beta", "--no-progress"], opts) == 0);

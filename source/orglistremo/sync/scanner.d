@@ -4,7 +4,7 @@ import d2sqlite3 : Database;
 import orglistremo.db.repo :
   CachedFileEntry, EntryRepository, RootRepository, SyncSaveParams;
 import orglistremo.internal.os : getDeviceFreeSpace;
-import orglistremo.model : deriveEntryPath, Entry, Root;
+import orglistremo.model : deriveEntryPath, emptyHash, Entry, Root;
 import orglistremo.pattern : matchesIgnoreList;
 import orglistremo.sync.hasher :
   ChildRecord, DirectoryHashResult, hashDirectory, hashFile;
@@ -21,6 +21,7 @@ struct SyncResult {
   ulong dirCount;
   ulong totalSize;
   ulong reusedHashes;
+  string[] syncedPaths;
   string[] ignoredPaths;
   SyncIssue[] errors;
 }
@@ -28,6 +29,7 @@ struct SyncResult {
 struct SyncOptions {
   bool force;
   bool forceHash;
+  bool dryRun;
   size_t batchSize = 1000;
   SyncProgressCallback onProgress;
   SyncIssueCallback onIssue;
@@ -49,41 +51,64 @@ SyncResult syncRoot(
   validateSyncPreconditions(entryRepo, root, options.force);
 
   const cachedMap = entryRepo.getFileEntriesMap(root.id);
+  const cachedDirMtimes = options.dryRun
+    ? entryRepo.getDirMtimesMap(root.id)
+    : null;
   const ignorePatterns = RootRepository(db).listIgnorePatterns(root.id);
   ScannerContext ctx = ScannerContext(
     root.id,
     root.name,
     options.forceHash,
+    options.dryRun,
     options.batchSize,
     cachedMap,
+    cachedDirMtimes,
     ignorePatterns,
     options.onProgress,
     options.onIssue,
     &entryRepo
   );
   scope (failure) {
-    entryRepo.clearStagedEntries(root.id);
+    if (!options.dryRun) {
+      entryRepo.clearStagedEntries(root.id);
+    }
   }
 
   ctx.scanDir(root.path, ".");
-  if (ctx.pendingBatch.length > 0) {
-    ctx.flushBatch();
+  if (!options.dryRun) {
+    finalizeSync(ctx, entryRepo, root);
   }
-
-  if (options.onProgress !is null) {
-    const SyncProgress p = ctx.makeProgress(SyncPhase.saving, "");
-    options.onProgress(p);
-  }
-
-  commitRootSync(entryRepo, root);
-  if (ctx.stats.ignoredPaths.length > 1) {
-    import std.algorithm.sorting : sort;
-    ctx.stats.ignoredPaths.sort();
-  }
+  sortResultPaths(ctx.stats);
   return ctx.stats;
 }
 
 private:
+
+void finalizeSync(
+  ref ScannerContext ctx,
+  ref EntryRepository entryRepo,
+  const ref Root root
+) {
+  if (ctx.pendingBatch.length > 0) {
+    ctx.flushBatch();
+  }
+  if (ctx.onProgress !is null) {
+    const SyncProgress p = ctx.makeProgress(SyncPhase.saving, "");
+    ctx.onProgress(p);
+  }
+  commitRootSync(entryRepo, root);
+}
+
+void sortResultPaths(ref SyncResult stats) {
+  import std.algorithm.sorting : sort;
+
+  if (stats.syncedPaths.length > 1) {
+    stats.syncedPaths.sort();
+  }
+  if (stats.ignoredPaths.length > 1) {
+    stats.ignoredPaths.sort();
+  }
+}
 
 void validateSyncPreconditions(
   ref EntryRepository entryRepo,
@@ -149,6 +174,9 @@ struct ScannerContext {
   }
 
   void appendEntry(in Entry entry) {
+    if (dryRun) {
+      return;
+    }
     pendingBatch ~= entry;
     if (batchSize > 0 && pendingBatch.length >= batchSize) {
       flushBatch();
@@ -275,6 +303,10 @@ struct ScannerContext {
         }
       }
     }
+    if (dryRun) {
+      stats.syncedPaths ~= childRelPath;
+      return emptyHash;
+    }
     return computeFileHash(diskPath, childRelPath, meta.size);
   }
 
@@ -307,12 +339,28 @@ struct ScannerContext {
     return hashFile(diskPath, size, &onChunk);
   }
 
+  void recordDryRunDir(string relPath, long dirMtime) {
+    if (!dryRun) {
+      return;
+    }
+    if (!forceHash) {
+      if (const cachedMtime = relPath in cachedDirMtimes) {
+        if (*cachedMtime == dirMtime) {
+          return;
+        }
+      }
+    }
+    stats.syncedPaths ~= relPath ~ "/";
+  }
+
   ChildRecord buildDirEntry(
     string diskPath,
     string relPath,
     ChildRecord[] children
   ) {
-    const DirectoryHashResult hashRes = hashDirectory(children);
+    const DirectoryHashResult hashRes = dryRun
+      ? sumDirChildren(children)
+      : hashDirectory(children);
     const long dirMtime = readDirMtime(diskPath);
 
     Entry dirEntry;
@@ -327,6 +375,7 @@ struct ScannerContext {
 
     if (relPath != ".") {
       stats.dirCount++;
+      recordDryRunDir(relPath, dirMtime);
     }
 
     appendEntry(dirEntry);
@@ -336,14 +385,24 @@ struct ScannerContext {
   const long rootId;
   const string rootName;
   const bool forceHash;
+  const bool dryRun;
   const size_t batchSize;
   const(CachedFileEntry[string]) cachedMap;
+  const(long[string]) cachedDirMtimes;
   const(string)[] ignorePatterns;
   SyncProgressCallback onProgress;
   SyncIssueCallback onIssue;
   EntryRepository* entryRepo;
   Entry[] pendingBatch;
   SyncResult stats;
+}
+
+DirectoryHashResult sumDirChildren(in ChildRecord[] children) {
+  ulong totalSize = 0;
+  foreach (ref const child; children) {
+    totalSize += child.size;
+  }
+  return DirectoryHashResult(emptyHash, totalSize);
 }
 
 struct FileMeta {
@@ -576,6 +635,67 @@ unittest {
     }
   }
   assert(relPaths == ["abc.d", "kept_dir", "kept_dir/keep.txt"]);
+
+  // Test dryRun mode: no DB modifications, no hashing, reports synced & ignored
+  TempDir dryBase = TempDir("sync_dry");
+  mkdirRecurse(buildPath(dryBase, "dir_a"));
+  mkdirRecurse(buildPath(dryBase, "skip_dir"));
+  write(buildPath(dryBase, "f1.txt"), "hello");
+  write(buildPath(dryBase, "f1.txt~"), "ignored");
+  write(buildPath(dryBase, "dir_a", "f2.txt"), "world");
+
+  const long dryRootId = rootRepo.addRoot("DRYROOT", dryBase);
+  rootRepo.addIgnorePatterns(dryRootId, ["*~", "skip_dir"]);
+  Root dryRoot;
+  assert(rootRepo.findById(dryRootId, dryRoot));
+
+  int dryHashEvents = 0;
+  int drySaveEvents = 0;
+  SyncOptions dryOpts;
+  dryOpts.dryRun = true;
+  dryOpts.onProgress = (const ref SyncProgress p) {
+    if (p.phase == SyncPhase.hashing) {
+      dryHashEvents++;
+    } else if (p.phase == SyncPhase.saving) {
+      drySaveEvents++;
+    }
+  };
+
+  // 1. Dry-run on unsynced root: all non-ignored paths listed, DB untouched
+  const SyncResult dryRes1 = syncRoot(db, dryRoot, dryOpts);
+  assert(dryRes1.fileCount == 2);
+  assert(dryRes1.dirCount == 1);
+  assert(dryRes1.reusedHashes == 0);
+  assert(dryRes1.syncedPaths == ["dir_a/", "dir_a/f2.txt", "f1.txt"]);
+  assert(dryRes1.ignoredPaths == ["f1.txt~", "skip_dir/"]);
+  assert(dryHashEvents == 0);
+  assert(drySaveEvents == 0);
+  assert(!entryRepo.hasCatalogedEntries(dryRootId));
+
+  // 2. Real sync populates DB
+  const SyncResult realRes = syncRoot(db, dryRoot);
+  assert(realRes.fileCount == 2);
+  assert(entryRepo.hasCatalogedEntries(dryRootId));
+
+  // 3. Dry-run when nothing changed: syncedPaths is empty, 2 reused hashes
+  const SyncResult dryRes2 = syncRoot(db, dryRoot, dryOpts);
+  assert(dryRes2.fileCount == 2);
+  assert(dryRes2.reusedHashes == 2);
+  assert(dryRes2.syncedPaths.length == 0);
+  assert(dryRes2.ignoredPaths == ["f1.txt~", "skip_dir/"]);
+
+  // 4. Modify a file and add a new dir + file -> dry-run reports only changes
+  write(buildPath(dryBase, "f1.txt"), "hello modified content");
+  mkdirRecurse(buildPath(dryBase, "dir_b"));
+  write(buildPath(dryBase, "dir_b", "f3.txt"), "new");
+
+  const SyncResult dryRes3 = syncRoot(db, dryRoot, dryOpts);
+  assert(dryRes3.fileCount == 3);
+  assert(dryRes3.dirCount == 2);
+  assert(dryRes3.reusedHashes == 1); // dir_a/f2.txt reused
+  assert(dryRes3.syncedPaths == ["dir_b/", "dir_b/f3.txt", "f1.txt"]);
+  // Verify DB still has only the 2 files from realRes
+  assert(entryRepo.getFileEntriesMap(dryRootId).length == 2);
 }
 
 unittest {

@@ -26,7 +26,8 @@
   - `import_cmd.d`: Inter-catalog database root import and merging.
   - `migrate_cmd.d`: Schema migration command execution.
 - `source/orglistremo/sync/`: Filesystem traversal and cryptographic hashing.
-  - `scanner.d`: Directory recursion, mtime/size checks, and staged syncing.
+  - `scanner.d`: Directory recursion, mtime/size checks, dry-run, and staged
+    syncing.
   - `hasher.d`: Streaming SHA-256 file hashing and Merkle directory hashing.
   - `progress.d`: Progress reporting types and error event accumulation.
 - `source/orglistremo/db/`: SQLite persistence, schema management, and locks.

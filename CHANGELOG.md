@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.18.0
+
+- Added `--dry-run` option to `sync` command to scan storage roots and display
+  paths that would be synced (new or modified files and directories) along with
+  ignored paths without calculating hashes or modifying the database.
+
 ## 0.17.0
 
 - Added per-root ignore list support (`root_ignores` table, schema v4) storing
