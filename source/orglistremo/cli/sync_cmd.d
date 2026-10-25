@@ -5,7 +5,8 @@ import core.time : MonoTime;
 import d2sqlite3 : Database;
 import orglistremo.cli.args : ArgCursor;
 import orglistremo.cli.context :
-  backupIfRequested, BackupRequest, DbContext, requireWritable;
+  backupIfRequested, BackupRequest, BackupRequestBuilder, DbContext,
+  requireWritable;
 import orglistremo.cli.roots : resolveRoots;
 import orglistremo.db.connection : openWorkerDatabase;
 import orglistremo.db.repo : RootRepository;
@@ -114,10 +115,12 @@ int handleSyncCommand(
     return 0;
   }
 
-  const BackupRequest bkpReq = BackupRequest(
-    ctx.dbPath, syncArgs.noBackup, opts, "Sync"
-  );
-  if (!backupIfRequested(ctx, bkpReq)) {
+  const BackupRequest bkpReq = BackupRequestBuilder(ctx)
+    .withNoBackup(syncArgs.noBackup)
+    .withOptions(opts)
+    .withActionName("Sync")
+    .build();
+  if (!backupIfRequested(bkpReq)) {
     return 1;
   }
 

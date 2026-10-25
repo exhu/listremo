@@ -4,7 +4,8 @@ import core.time : Duration, MonoTime;
 import d2sqlite3 : Database;
 import orglistremo.cli.args : ArgCursor;
 import orglistremo.cli.context :
-   backupIfRequested, BackupRequest, DbContext, requireWritable;
+  backupIfRequested, BackupRequest, BackupRequestBuilder, DbContext,
+  requireWritable;
 import orglistremo.cli.roots :
   MultiRootQuery, resolveRoots, RootLookupOptions;
 import orglistremo.db.connection : readDbSchemaVersion;
@@ -198,10 +199,12 @@ int handleImportCommand(
     return 1;
   }
 
-  const BackupRequest bkpReq = BackupRequest(
-    ctx.dbPath, importArgs.noBackup, opts, "Import"
-  );
-  if (!backupIfRequested(ctx, bkpReq)) {
+  const BackupRequest bkpReq = BackupRequestBuilder(ctx)
+    .withNoBackup(importArgs.noBackup)
+    .withOptions(opts)
+    .withActionName("Import")
+    .build();
+  if (!backupIfRequested(bkpReq)) {
     return 1;
   }
 

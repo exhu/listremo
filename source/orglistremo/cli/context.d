@@ -73,19 +73,53 @@ bool promptBackupPath(
 }
 
 struct BackupRequest {
+  Database* db;
   string dbPath;
   bool noBackup;
   OutputOptions opts;
   string actionName = "Migration";
 }
 
-bool backupIfRequested(
-  ref Database db,
-  in BackupRequest req
-) {
+struct BackupRequestBuilder {
+  this(ref DbContext ctx) {
+    this.db = &ctx.db;
+    this.dbPath = ctx.dbPath;
+  }
+
+  ref BackupRequestBuilder withNoBackup(bool val) return {
+    this.noBackup = val;
+    return this;
+  }
+
+  ref BackupRequestBuilder withOptions(in OutputOptions val) return {
+    this.opts = val;
+    return this;
+  }
+
+  ref BackupRequestBuilder withActionName(string val) return {
+    this.actionName = val;
+    return this;
+  }
+
+  BackupRequest build() {
+    return BackupRequest(
+      db, dbPath, noBackup, opts, actionName
+    );
+  }
+
+private:
+  Database* db;
+  string dbPath;
+  bool noBackup;
+  OutputOptions opts;
+  string actionName = "Migration";
+}
+
+bool backupIfRequested(in BackupRequest req) {
   if (req.noBackup || req.dbPath == ":memory:") {
     return true;
   }
+  assert(req.db !is null, "Database pointer must not be null");
 
   string backupPath;
   if (!promptBackupPath(req.dbPath, backupPath, req.actionName)) {
@@ -93,7 +127,7 @@ bool backupIfRequested(
   }
 
   try {
-    writeDatabaseBackup(db, backupPath);
+    writeDatabaseBackup(*cast(Database*) req.db, backupPath);
     import std.format : format;
     info(req.opts, format("Saved database backup to '%s'.", backupPath));
     return true;
@@ -107,28 +141,20 @@ bool backupIfRequested(
   }
 }
 
-bool backupIfRequested(
-  ref DbContext ctx,
-  in BackupRequest req
-) {
-  return backupIfRequested(ctx.db, req);
-}
-
-bool backupIfRequested(
-  ref DbContext ctx,
-  bool noBackup,
-  in OutputOptions opts
-) {
-  return backupIfRequested(
-    ctx.db, BackupRequest(ctx.dbPath, noBackup, opts, "Migration")
-  );
-}
-
 unittest {
   DbContext rwCtx = DbContext(Database.init, ":memory:", schemaVersion, false);
   assert(requireWritable(rwCtx));
 
   OutputOptions opts;
-  assert(backupIfRequested(rwCtx, true, opts));
-  assert(backupIfRequested(rwCtx, false, opts));
+  const BackupRequest req1 = BackupRequestBuilder(rwCtx)
+    .withNoBackup(true)
+    .withOptions(opts)
+    .build();
+  assert(backupIfRequested(req1));
+
+  const BackupRequest req2 = BackupRequestBuilder(rwCtx)
+    .withNoBackup(false)
+    .withOptions(opts)
+    .build();
+  assert(backupIfRequested(req2));
 }

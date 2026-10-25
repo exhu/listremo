@@ -1,9 +1,6 @@
 - support ignore list per root (does not depend on root source path)
 must list ignored directories after `sync`
 
-- in context.d backupIfRequested() with multiple overloads needs
-to be replaced
-
 - separate app: support thumbnailer as external app to gradually or
 selectively add thumbnails, e.g. list a path to rescan adding missing or
 regenerating outdated (or forced) thumbnails, it's a good idea to have a

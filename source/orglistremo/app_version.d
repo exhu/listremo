@@ -1,3 +1,3 @@
 module orglistremo.app_version;
 
-enum appVersion = "0.15.0";
+enum appVersion = "0.16.0";

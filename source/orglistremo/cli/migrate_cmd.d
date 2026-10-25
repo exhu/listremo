@@ -2,7 +2,7 @@ module orglistremo.cli.migrate_cmd;
 
 import orglistremo.cli.args : ArgCursor;
 import orglistremo.cli.context :
-  backupIfRequested, DbContext;
+  backupIfRequested, BackupRequest, BackupRequestBuilder, DbContext;
 import orglistremo.db.migration : migrateDatabase;
 import orglistremo.db.schema_version : schemaVersion;
 import orglistremo.output.options : info, OutputOptions;
@@ -61,7 +61,11 @@ int handleMigrateCommand(
     return 1;
   }
 
-  if (!backupIfRequested(ctx, migrateArgs.noBackup, opts)) {
+  const BackupRequest bkpReq = BackupRequestBuilder(ctx)
+    .withNoBackup(migrateArgs.noBackup)
+    .withOptions(opts)
+    .build();
+  if (!backupIfRequested(bkpReq)) {
     return 1;
   }
 

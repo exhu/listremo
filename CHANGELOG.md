@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.16.0
+
+- Replaced multiple overloads of `backupIfRequested()` in `cli/context.d` with
+  the `BackupRequestBuilder` pattern.
+- Included borrowed `Database*` pointer in `BackupRequest` to avoid copying
+  database connection handles, and consolidated backup execution into a
+  single `backupIfRequested(in BackupRequest req)` function.
+- Standardized backup prompt handling across `migrate`, `sync`, and `import`
+  CLI commands.
+
 ## 0.15.0
 
 - Added database backup snapshot flow to `sync` command matching `migrate` and
