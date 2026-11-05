@@ -1,3 +1,8 @@
+- duplicates: check file size as well as hash
+
+- does sync display which files changed? need to check hash recalculation and
+  reporting
+
 - separate app: support thumbnailer as external app to gradually or
 selectively add thumbnails, e.g. list a path to rescan adding missing or
 regenerating outdated (or forced) thumbnails, it's a good idea to have a
